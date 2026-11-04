@@ -831,6 +831,23 @@ bool CartesianTracker::line_build(
       }
     }
   }
+  // Prefer the existing fixed-waist successor candidates. Only when all of
+  // them fail, prove the next straight segment with the same constrained
+  // whole-body solver that will execute it. Arm-only failure is not evidence
+  // that a task permitting waist motion is unreachable.
+  bool cascade_full_body=false;
+  if(!ok && line_tip_ && !upper_.waist_locked) {
+    const auto& tip=*line_tip_;
+    std::vector<Vec18,Eigen::aligned_allocator<Vec18>> trial,next;
+    bool trial_locked=false,next_locked=false;
+    if(line_fit(q0,arm,target,quat,ori_on,false,frame,trial,trial_locked,false) &&
+       (!recovering_pitch || std::abs(trial.back().head<3>().sum())<=torso_pitch_max_+1e-7) &&
+       line_fit(trial.back(),arm,tip.xyz,tip.ori_on?&tip.quat_xyzw:nullptr,
+                tip.ori_on,false,frame,next,next_locked)) {
+      samples=std::move(trial);locked=trial_locked;forced=true;ok=true;
+      cascade_full_body=true;
+    }
+  }
   const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
   if (!ok || samples.empty()) { if(recovering_pitch) line_.reason="pitch_recovery_infeasible"; line_.build_ms=ms; return false; }
   LineRun built;
@@ -839,6 +856,7 @@ bool CartesianTracker::line_build(
   built.length_m=dist; built.samples=std::move(samples); built.build_ms=ms;
   built.cascade_checked=line_tip_.has_value(); built.cascade_passed=line_tip_.has_value();
   built.cascade_forced_waist=forced;
+  built.cascade_full_body=cascade_full_body;
   built.frozen=dist<=kLineBrakeM;
   line_=std::move(built); line_q_=q0; line_rate_=0.0; ++line_gen_;
   return true;

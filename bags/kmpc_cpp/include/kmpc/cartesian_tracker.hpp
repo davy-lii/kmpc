@@ -105,6 +105,7 @@ class CartesianTracker {
   bool line_cascade_checked() const { return line_.cascade_checked; }
   bool line_cascade_passed() const { return line_.cascade_passed; }
   bool line_cascade_forced_waist() const { return line_.cascade_forced_waist; }
+  bool line_cascade_full_body() const { return line_.cascade_full_body; }
   bool line_waist_locked() const { return line_.waist_locked; }
   const std::string& line_reason() const { return line_.reason; }
   double line_build_ms() const { return line_.build_ms; }
@@ -203,6 +204,7 @@ class CartesianTracker {
     bool cascade_checked = false;
     bool cascade_passed = false;
     bool cascade_forced_waist = false;
+    bool cascade_full_body = false;
     std::string reason;
     double build_ms = 0.0;
     Vec3 target = Vec3::Zero();

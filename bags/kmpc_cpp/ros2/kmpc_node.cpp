@@ -1474,6 +1474,7 @@ class KmpcNode : public rclcpp::Node {
         " reason=" + (tracker_->line_reason().empty()?"none":tracker_->line_reason()) +
         " cascade=" + (tracker_->line_cascade_checked()?(tracker_->line_cascade_passed()?"passed":"failed"):"not_provided") +
         " forced_waist=" + std::to_string(tracker_->line_cascade_forced_waist()) +
+        " cascade_full_body=" + std::to_string(tracker_->line_cascade_full_body()) +
         " line_build_ms=" + std::to_string(tracker_->line_build_ms()) +
         " line_samples=" + std::to_string(tracker_->line_sample_count()) +
         " line_length_m=" + std::to_string(tracker_->line_length()) +

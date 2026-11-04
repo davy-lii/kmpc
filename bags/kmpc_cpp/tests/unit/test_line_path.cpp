@@ -411,3 +411,48 @@ TEST_F(LineFixture, ArrivalRequiresMeasuredEndpoint) {
   EXPECT_TRUE(tracker.line_measured_arrived(q));
   EXPECT_FALSE(tracker.line_measured_arrived(seed));
 }
+
+// Recorded robot03 placement, 2026-11-04 09:17 (nearest 50 Hz feedback).
+TEST(LinePath, Robot03PlacementAllowsConstrainedWaistInSuccessor) {
+  const auto cfg_all = kmpc::Config::load(cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+  kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
+  const double raw[18] = {0.3490765030,-0.3490645188,0.0000119842,-0.0261495787,
+    -2.7666263299,-0.9360718783,1.8643084504,-1.8100975694,-2.2360289068,-0.0828512611,-0.2502804704,
+    2.3432958190,-0.7873355632,-2.0792978952,-2.0668200400,1.8853904997,-0.7787832308,-0.0953469727};
+  kmpc::Vec18 q; for (int i=0;i<18;++i) q[i]=raw[i];
+  const kmpc::Vec18 initial=q;
+  const kmpc::Vec3 goal(0.245839,0.343452,0.520);
+  const auto quat=kmpc::tool_to_flange_quat_xyzw(kmpc::Vec4(0.914958163,-0.014254729,-0.343611299,0.211138909));
+  kmpc::LineTarget tip; tip.xyz=kmpc::Vec3(0.485839,0.343452,0.520); tip.quat_xyzw=quat; tip.ori_on=true;
+  kmpc::CartesianTracker tracker(kin,cfg_all); tracker.rearm_line(1,tip);
+  tracker.set_line_pace(0.3,0.8);
+  q+=tracker.compute(q,cfg_all.q_pref,&goal,nullptr,&quat,nullptr).dq;
+  ASSERT_FALSE(tracker.line_refused()) << tracker.line_reason();
+  EXPECT_TRUE(tracker.line_cascade_passed());
+  EXPECT_TRUE(tracker.line_cascade_full_body());
+  for (const auto& p : {goal, tip.xyz}) {
+    kmpc::CartesianTracker single(kin,cfg_all); single.rearm_line(1);
+    single.compute(q,cfg_all.q_pref,&p,nullptr,&quat,nullptr);
+    EXPECT_FALSE(single.line_refused()) << p.transpose() << " " << single.line_reason();
+  }
+  tracker.set_line_pace(0.3,0.8);
+  for(const auto& p : {goal,tip.xyz}) {
+    if((p-tip.xyz).norm()<1e-9) { ASSERT_TRUE(tracker.rearm_line(2)); }
+    bool arrived=false;
+    for(int i=0;i<3000;++i) {
+      const auto step=tracker.compute(q,cfg_all.q_pref,&p,nullptr,&quat,nullptr);
+      ASSERT_FALSE(tracker.line_refused()) << tracker.line_reason();
+      q+=step.dq;
+      EXPECT_LE(std::abs(q.head<3>().sum()),cfg_all.params.torso_pitch_max_deg*kmpc::kPi/180+1e-6);
+      if(tracker.last_arrived()) {arrived=true;break;}
+    }
+    EXPECT_TRUE(arrived);
+    EXPECT_LT((kin.fk_pos(q,kmpc::kEeFrameLeft)-p).norm(),0.003);
+  }
+  kmpc::CartesianTracker locked(kin,cfg_all);
+  kmpc::UpperCommand upper; upper.waist_locked=true;
+  locked.set_upper_commands(upper);locked.rearm_line(1,tip);
+  locked.compute(initial,cfg_all.q_pref,&goal,nullptr,&quat,nullptr);
+  EXPECT_TRUE(locked.line_refused());
+  EXPECT_FALSE(locked.line_cascade_full_body());
+}
