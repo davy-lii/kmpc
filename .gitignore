@@ -1,0 +1,14 @@
+# Generated artifacts and machine-specific dependency overlays
+.deps/
+install/
+kmpc_cpp/
+**/build*/
+**/install/
+**/log/
+**/logs/
+**/__pycache__/
+*.pyc
+*.log
+# bags also contains the maintained C++ source
+/bags/*
+!/bags/kmpc_cpp/

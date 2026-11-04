@@ -1,0 +1,98 @@
+# 真机快照：2026-09-04 去算法 HOME 之前。
+# 来源：docker 内 ros2 topic echo /joint_states
+# stamp: 1788514116.395794883  frame_id: base_link
+# 单位：弧度（与 /joint_states、/kmpc/q_target 一致）
+# 头不进 MPC，回放时头会留在当时角度。
+#
+# 回放（enable 已经是 true 时，这一条就会让机器人朝本姿态走）：
+#   ros2 topic pub --once /kmpc/q_target sensor_msgs/msg/JointState "{
+#     name: [Chassis_Y_Joint1, Chassis_Y_Joint2, Chassis_Y_Joint3, Chassis_Z_Joint4,
+#            RightArm_Z_Joint1, RightArm_Z_Joint2, RightArm_Z_Joint3, RightArm_Z_Joint4,
+#            RightArm_Z_Joint5, RightArm_Z_Joint6, RightArm_Z_Joint7,
+#            LeftArm_Z_Joint1, LeftArm_Z_Joint2, LeftArm_Z_Joint3, LeftArm_Z_Joint4,
+#            LeftArm_Z_Joint5, LeftArm_Z_Joint6, LeftArm_Z_Joint7],
+#     position: [0.6257877953130836, -1.2701459460653441, 0.23905773978933811, -0.05918411550104945,
+#                -0.32436942550417963, -0.3156078918339279, -0.1289100212820413, -1.5523482104497541,
+#                1.2593248567660797, -0.07162831409974393, -0.06955136886105079,
+#                -0.002286381272258896, -0.6811845420429581, 0.15095352993446676, -1.0173349932613212,
+#                1.2165992307657205, -0.3090279864391555, 0.2503849295642585]
+#   }"
+
+stamp_sec: 1788514116
+stamp_nanosec: 395794883
+frame_id: base_link
+
+# /joint_states 原顺序（含头）
+joint_states:
+  names:
+    - Chassis_Y_Joint1
+    - Chassis_Y_Joint2
+    - Chassis_Y_Joint3
+    - Chassis_Z_Joint4
+    - Head_Z_Joint
+    - HeadCamera_Y_Joint
+    - LeftArm_Z_Joint1
+    - LeftArm_Z_Joint2
+    - LeftArm_Z_Joint3
+    - LeftArm_Z_Joint4
+    - LeftArm_Z_Joint5
+    - LeftArm_Z_Joint6
+    - LeftArm_Z_Joint7
+    - RightArm_Z_Joint1
+    - RightArm_Z_Joint2
+    - RightArm_Z_Joint3
+    - RightArm_Z_Joint4
+    - RightArm_Z_Joint5
+    - RightArm_Z_Joint6
+    - RightArm_Z_Joint7
+  position_rad:
+    - 0.6257877953130836
+    - -1.2701459460653441
+    - 0.23905773978933811
+    - -0.05918411550104945
+    - 0.016999506514950607
+    - 9.492455081395643e-07
+    - -0.002286381272258896
+    - -0.6811845420429581
+    - 0.15095352993446676
+    - -1.0173349932613212
+    - 1.2165992307657205
+    - -0.3090279864391555
+    - 0.2503849295642585
+    - -0.32436942550417963
+    - -0.3156078918339279
+    - -0.1289100212820413
+    - -1.5523482104497541
+    - 1.2593248567660797
+    - -0.07162831409974393
+    - -0.06955136886105079
+
+# MPC 18 维：腰4 + 右臂7 + 左臂7（无头）
+q_mpc_rad:
+  [0.6257877953130836, -1.2701459460653441, 0.23905773978933811, -0.05918411550104945,
+   -0.32436942550417963, -0.3156078918339279, -0.1289100212820413, -1.5523482104497541,
+   1.2593248567660797, -0.07162831409974393, -0.06955136886105079,
+   -0.002286381272258896, -0.6811845420429581, 0.15095352993446676, -1.0173349932613212,
+   1.2165992307657205, -0.3090279864391555, 0.2503849295642585]
+
+deg_approx:
+  Chassis_Y_Joint1: 35.86
+  Chassis_Y_Joint2: -72.77
+  Chassis_Y_Joint3: 13.70
+  Chassis_Z_Joint4: -3.39
+  Head_Z_Joint: 0.97
+  HeadCamera_Y_Joint: 0.00
+  LeftArm_Z_Joint1: -0.13
+  LeftArm_Z_Joint2: -39.03
+  LeftArm_Z_Joint3: 8.65
+  LeftArm_Z_Joint4: -58.29
+  LeftArm_Z_Joint5: 69.71
+  LeftArm_Z_Joint6: -17.71
+  LeftArm_Z_Joint7: 14.35
+  RightArm_Z_Joint1: -18.59
+  RightArm_Z_Joint2: -18.08
+  RightArm_Z_Joint3: -7.39
+  RightArm_Z_Joint4: -88.94
+  RightArm_Z_Joint5: 72.15
+  RightArm_Z_Joint6: -4.10
+  RightArm_Z_Joint7: -3.99

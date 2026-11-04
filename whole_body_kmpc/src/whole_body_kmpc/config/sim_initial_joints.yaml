@@ -1,0 +1,19 @@
+# Sim / 复位初值（弧度）。键名与真机 /joint_states 一致。
+Chassis_Y_Joint1: 0.13962634016
+Chassis_Y_Joint2: -0.20943951024
+Chassis_Y_Joint3: 0.0
+Chassis_Z_Joint4: 0.0
+RightArm_Z_Joint1: 0.0
+RightArm_Z_Joint2: -0.61086523820
+RightArm_Z_Joint3: 0.0
+RightArm_Z_Joint4: -1.30899693899
+RightArm_Z_Joint5: 0.0
+RightArm_Z_Joint6: 0.0
+RightArm_Z_Joint7: 0.0
+LeftArm_Z_Joint1: 0.0
+LeftArm_Z_Joint2: -0.61086523820
+LeftArm_Z_Joint3: 0.0
+LeftArm_Z_Joint4: -1.30899693899
+LeftArm_Z_Joint5: 0.0
+LeftArm_Z_Joint6: 0.0
+LeftArm_Z_Joint7: 0.0

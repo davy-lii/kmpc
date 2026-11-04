@@ -1,0 +1,1825 @@
+<?xml version="1.0"?>
+<robot name="Light_duty_wheeled_robot" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <!-- Body: CAD Light-duty V3.1.4.0821 (inner V3.1.3.0818).
+       Joint names: match live /joint_states (Chassis_Y_Joint1..3 pitch, Chassis_Z_Joint4 yaw).
+       Gripper: keep KMPC r_/l_hand + fingers; parent = RightArm_Z_Link7 / LeftArm_Z_Link7.
+       Link7_R / Link7_L are identity aliases of the CAD flanges. -->
+
+  <material name="yellow">
+      <color rgba="1.00000000 1.00000000 0.50196078 1.00000000" />
+    </material>
+    
+  <material name="silver">
+      <color rgba="0.85000000 0.85000000 0.85000000 1.00000000" />
+    </material>
+    
+  <material name="gray">
+      <color rgba="0.79215686 0.79215686 0.79215686 1.00000000" />
+    </material>
+    
+  <material name="black">
+      <color rgba="0.00000000 0.00000000 0.00000000 1.00000000" />
+    </material>
+    
+  <material name="green">
+      <color rgba="0.00000000 1.00000000 0.00000000 1.00000000" />
+    </material>
+    
+  <material name="red">
+      <color rgba="1.00000000 0.00000000 0.00000000 1.00000000" />
+    </material>
+    
+  <material name="orange">
+      <color rgba="1.00000000 0.60000000 0.00000000 1.00000000" />
+    </material>
+    
+  <material name="blue">
+      <color rgba="0.00000000 0.00000000 1.00000000 1.00000000" />
+    </material>
+    
+  <material name="dark_blue">
+      <color rgba="0.16470588 0.28235294 0.44313725 1.00000000" />
+    </material>
+    
+  <material name="skin">
+      <color rgba="0.98039216 0.78039216 0.62745098 1.00000000" />
+    </material>
+    
+  <material name="triflex_gray">
+      <color rgba="0.45 0.45 0.45 1" />
+    </material>
+  
+  
+  
+  <link name="world" />
+  <joint name="world_to_base" type="fixed">
+    <parent link="world" />
+    <child link="base_link" />
+    <origin xyz="0 0 0" rpy="0 0 0" />
+  </joint>
+
+<link name="base_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/base_link.STL" />
+      </geometry>
+      <material>
+        <color rgba="1.00000000 1.00000000 0.50196078 1.00000000"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/base_link.STL" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="-0.0631191 0.0004713 -0.0850397" rpy="0 0 0" />
+      <mass value="104.6" />
+      <inertia ixx="3.3314419" ixy="-0.0573615" ixz="-0.0067188" iyy="4.2281911" iyz="0.0156894" izz="6.1233001" />
+    </inertial>
+  </link>
+
+  <link name="Leg_Y_Link1">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/Leg_Y_Link1.STL" />
+      </geometry>
+      <material>
+        <color rgba="1.00000000 1.00000000 0.50196000 1.00000000"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/Leg_Y_Link1.STL" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0.0034149 0.002973 0.17499" rpy="0 0 0" />
+      <mass value="10.56" />
+      <inertia ixx="0.2384034" ixy="-0.0001602" ixz="0.0016025" iyy="0.231828" iyz="0.0157697" izz="0.0429398" />
+    </inertial>
+  </link>
+
+  <link name="Leg_Y_Link2">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/Leg_Y_Link2.STL" />
+      </geometry>
+      <material>
+        <color rgba="1.00000000 1.00000000 0.50196000 1.00000000"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/Leg_Y_Link2.STL" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="-0.0085792 0.0038872 0.21417" rpy="0 0 0" />
+      <mass value="11.1" />
+      <inertia ixx="0.3778008" ixy="-0.0006794" ixz="0.009809" iyy="0.3440105" iyz="0.0248781" izz="0.0658544" />
+    </inertial>
+  </link>
+
+  <link name="Leg_Y_Link3">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/Leg_Y_Link3.STL" />
+      </geometry>
+      <material>
+        <color rgba="1.00000000 1.00000000 0.50196078 1.00000000"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/Leg_Y_Link3.STL" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="-0.0001457 0.0074324 0.0394944" rpy="0 0 0" />
+      <mass value="5.6" />
+      <inertia ixx="0.0396077" ixy="0.0000066" ixz="-0.0001315" iyy="0.0419776" iyz="0.0019193" izz="0.0223914" />
+    </inertial>
+  </link>
+
+  <link name="RightFrontWheelShaft_Z_Link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/RightFrontWheelShaft_Z_Link.STL" />
+      </geometry>
+      <material>
+        <color rgba="1.00000000 1.00000000 0.50196000 1.00000000"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/RightFrontWheelShaft_Z_Link.STL" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="-0.0000001 0.029255 -0.056383" rpy="0 0 0" />
+      <mass value="0.8" />
+      <inertia ixx="0.0021737" ixy="0" ixz="0" iyy="0.0016258" iyz="0.0007533" izz="0.0009385" />
+    </inertial>
+  </link>
+<joint name="BodyCamera_Joint" type="fixed">
+  <origin xyz="0.116387 -0.045 0.27475" rpy="0 0 0"/>
+  <parent link="Body_Link"/>
+  <child link="BodyCamera_Link"/>
+</joint>
+<link name="BodyCamera_Link">
+  <inertial>
+    <origin xyz="0.010687682133569673 0.047770489298570855 -0.0060514645224098995" rpy="0 0 0"/>
+    <mass value="0.1261789751313303"/>
+    <inertia ixx="0.000163" iyy="1.6e-05" izz="0.000161" ixy="-0.0" iyz="0.0" ixz="-1e-06"/>
+  </inertial>
+  <visual>
+    <origin xyz="-0.116386 0.044001 -1.21555" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="meshes/BodyCamera_Link.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="-0.116386 0.044001 -1.21555" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="meshes/BodyCamera_Link.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+
+<link name="HeadCamera_Link">
+  <inertial>
+    <origin xyz="0.012281138254048272 0.04777044047097051 0.00010312566678760682" rpy="0 0 0"/>
+    <mass value="0.1261789751313303"/>
+    <inertia ixx="0.000163" iyy="1.6e-05" izz="0.00016" ixy="-0.0" iyz="0.0" ixz="0.0"/>
+  </inertial>
+  <visual>
+    <origin xyz="-0.058999 0.041755 -1.5028" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="meshes/HeadCamera_Link.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+    <material name="silver"/>
+  </visual>
+  <collision>
+    <origin xyz="-0.058999 0.041755 -1.5028" rpy="0 0 0"/>
+    <geometry>
+      <mesh filename="meshes/HeadCamera_Link.stl" scale="0.001 0.001 0.001"/>
+    </geometry>
+  </collision>
+</link>
+<joint name="fixed_joint_2" type="fixed">
+  <origin xyz="0.059 -0.070254 0.0635" rpy="0 0 0"/>
+  <parent link="Head_Y_Link02"/>
+  <child link="HeadCamera_Link"/>
+</joint>
+  <link name="RightFrontWheel_Y_Link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/RightFrontWheel_Y_Link.STL" />
+      </geometry>
+      <material>
+        <color rgba="1.00000000 1.00000000 0.50196000 1.00000000"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/RightFrontWheel_Y_Link.STL" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0.0000003 -0.039883 -0.0000001" rpy="0 0 0" />
+      <mass value="4.3" />
+      <inertia ixx="0.0070879" ixy="0" ixz="0.0000001" iyy="0.0094499" iyz="0" izz="0.0070872" />
+    </inertial>
+  </link>
+
+  <link name="LeftFrontWheelShaft_Z_Link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/LeftFrontWheelShaft_Z_Link.STL" />
+      </geometry>
+      <material>
+        <color rgba="1.00000000 1.00000000 0.50196000 1.00000000"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/LeftFrontWheelShaft_Z_Link.STL" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="-0.0000002 -0.029255 -0.056383" rpy="0 0 0" />
+      <mass value="0.8" />
+      <inertia ixx="0.0021737" ixy="0" ixz="0" iyy="0.0016258" iyz="-0.0007533" izz="0.0009385" />
+    </inertial>
+  </link>
+
+  <link name="LeftFrontWheel_Y_Link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/LeftFrontWheel_Y_Link.STL" />
+      </geometry>
+      <material>
+        <color rgba="1.00000000 1.00000000 0.50196000 1.00000000"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/LeftFrontWheel_Y_Link.STL" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="-0.0000003 0.039883 -0.0000001" rpy="0 0 0" />
+      <mass value="4.3" />
+      <inertia ixx="0.0070879" ixy="0" ixz="-0.0000001" iyy="0.0094499" iyz="0" izz="0.0070872" />
+    </inertial>
+  </link>
+
+  <link name="RightRearWheelShaft_Z_Link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/RightRearWheelShaft_Z_Link.STL" />
+      </geometry>
+      <material>
+        <color rgba="1.00000000 1.00000000 0.50196078 1.00000000"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/RightRearWheelShaft_Z_Link.STL" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="-0.0000001 0.0292547 -0.0563834" rpy="0 0 0" />
+      <mass value="0.8" />
+      <inertia ixx="0.0021737" ixy="0" ixz="0" iyy="0.0016258" iyz="0.0007533" izz="0.0009385" />
+    </inertial>
+  </link>
+
+  <link name="RightRearWheel_Y_Link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/RightRearWheel_Y_Link.STL" />
+      </geometry>
+      <material>
+        <color rgba="1.00000000 1.00000000 0.50196000 1.00000000"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/RightRearWheel_Y_Link.STL" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0.0000003 -0.039883 -0.0000001" rpy="0 0 0" />
+      <mass value="4.3" />
+      <inertia ixx="0.0070879" ixy="0" ixz="0.0000001" iyy="0.0094499" iyz="0" izz="0.0070872" />
+    </inertial>
+  </link>
+
+  <link name="LeftRearWheelShaft_Z_Link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/LeftRearWheelShaft_Z_Link.STL" />
+      </geometry>
+      <material>
+        <color rgba="1.00000000 1.00000000 0.50196000 1.00000000"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/LeftRearWheelShaft_Z_Link.STL" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <mass value="0.8" />
+      <inertia ixx="0.0021737" ixy="0" ixz="0" iyy="0.0016258" iyz="-0.0007533" izz="0.0009385" />
+    </inertial>
+  </link>
+
+  <link name="LeftRearWheel_Y_Link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 3.14159 0" />
+      <geometry>
+        <mesh filename="meshes/LeftRearWheel_Y_Link.STL" />
+      </geometry>
+      <material>
+        <color rgba="1.00000000 1.00000000 0.50196000 1.00000000"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/LeftRearWheel_Y_Link.STL" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="-0.0000003 0.039883 -0.0000001" rpy="0 0 0" />
+      <mass value="4.3" />
+      <inertia ixx="0.0070879" ixy="0" ixz="-0.0000001" iyy="0.0094499" iyz="0" izz="0.0070872" />
+    </inertial>
+  </link>
+
+  <link name="Body_Link">
+    <visual>
+      <origin xyz="0.000001 -0.000999 -0.9408" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/Body_Link.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="silver">
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0.000001 -0.000999 -0.9408" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/Body_Link.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0.0014021 -0.0000022 0.2241306" rpy="0 0 0" />
+      <mass value="12.8424132" />
+      <inertia ixx="0.296757" ixy="0" ixz="0.001321" iyy="0.220263" iyz="0.000006" izz="0.156018" />
+    </inertial>
+  </link>
+
+  <link name="Head_Z_Link01">
+    <visual>
+      <origin xyz="0.000001 -0.000999 -1.3983" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/Head_Z_Link01.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="silver">
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0.000001 -0.000999 -1.3983" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/Head_Z_Link01.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0.0000023 -0.0007487 0.0364556" rpy="0 0 0" />
+      <mass value="0.36776" />
+      <inertia ixx="0.000217" ixy="0" ixz="0" iyy="0.000176" iyz="0.000011" izz="0.000177" />
+    </inertial>
+  </link>
+
+  <link name="Head_Y_Link02">
+    <visual>
+      <origin xyz="0.000001 -0.028499 -1.4393" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/Head_Y_Link02.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="silver">
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0.000001 -0.028499 -1.4393" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/Head_Y_Link02.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0.0174479 -0.0208703 0.0605331" rpy="0 0 0" />
+      <mass value="0.2424708" />
+      <inertia ixx="0.000376" ixy="0.000017" ixz="-0.000049" iyy="0.000329" iyz="0.000042" izz="0.000253" />
+    </inertial>
+  </link>
+
+ 
+
+  
+
+
+
+  <link name="LeftArm_Z_Link1">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/LeftArm_Z_Link1.STL" />
+      </geometry>
+      <material>
+        <color rgba="0.00000000 1.00000000 0.00000000 1.00000000"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/LeftArm_Z_Link1.STL" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0.0000235 0.0055715 -0.03076" rpy="0 0 0" />
+      <mass value="1.9705" />
+      <inertia ixx="0.0049229" ixy="0.0000055" ixz="0.0000019" iyy="0.0052651" iyz="0.0003323" izz="0.0018811" />
+    </inertial>
+  </link>
+
+  <link name="LeftArm_Z_Link2">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/LeftArm_Z_Link2.STL" />
+      </geometry>
+      <material>
+        <color rgba="0.00000000 0.00000000 1.00000000 1.00000000"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/LeftArm_Z_Link2.STL" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0.0001348 0.0617046 0.0095064" rpy="0 0 0" />
+      <mass value="2.24398" />
+      <inertia ixx="0.0119493" ixy="0.0000034" ixz="0.0000009" iyy="0.0036158" iyz="-0.001328" izz="0.0109836" />
+    </inertial>
+  </link>
+
+  <link name="LeftArm_Z_Link3">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/LeftArm_Z_Link3.STL" />
+      </geometry>
+      <material>
+        <color rgba="1.00000000 0.00000000 0.00000000 1.00000000"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/LeftArm_Z_Link3.STL" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0.0096856 0.002466 -0.046273" rpy="0 0 0" />
+      <mass value="1.9242" />
+      <inertia ixx="0.0071822" ixy="0.0000441" ixz="0.0008955" iyy="0.0076256" iyz="0.000221" izz="0.001786" />
+    </inertial>
+  </link>
+
+  <link name="LeftArm_Z_Link4">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/LeftArm_Z_Link4.STL" />
+      </geometry>
+      <material>
+        <color rgba="0.00000000 1.00000000 0.00000000 1.00000000"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/LeftArm_Z_Link4.STL" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0.0085041 -0.0471822 0.0094151" rpy="0 0 0" />
+      <mass value="1.6085" />
+      <inertia ixx="0.0058048" ixy="-0.0006667" ixz="-0.0001272" iyy="0.0022381" iyz="0.0007052" izz="0.0053306" />
+    </inertial>
+  </link>
+
+  <link name="LeftArm_Z_Link5">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/LeftArm_Z_Link5.STL" />
+      </geometry>
+      <material>
+        <color rgba="0.00000000 0.00000000 1.00000000 1.00000000"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/LeftArm_Z_Link5.STL" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0.0005113 0.0010106 -0.1127174" rpy="0 0 0" />
+      <mass value="2.0883" />
+      <inertia ixx="0.006266" ixy="0.0000401" ixz="0.0000534" iyy="0.0056439" iyz="-0.0000619" izz="0.0024363" />
+    </inertial>
+  </link>
+
+  <link name="LeftArm_Z_Link6">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/LeftArm_Z_Link6.STL" />
+      </geometry>
+      <material>
+        <color rgba="1.00000000 0.00000000 0.00000000 1.00000000"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/LeftArm_Z_Link6.STL" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0.0003266 0.0053134 -0.0003018" rpy="0 0 0" />
+      <mass value="0.72496" />
+      <inertia ixx="0.0004604" ixy="0.0000019" ixz="0.0000008" iyy="0.0005172" iyz="-0.0000035" izz="0.0004252" />
+    </inertial>
+  </link>
+
+  <link name="LeftArm_Z_Link7">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/LeftArm_Z_Link7.STL" />
+      </geometry>
+      <material>
+        <color rgba="0.00000000 1.00000000 0.00000000 1.00000000"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/LeftArm_Z_Link7.STL" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="-0.0000911 -0.0315325 0.0088937" rpy="0 0 0" />
+      <mass value="0.68606" />
+      <inertia ixx="0.0017369" ixy="-0.0000035" ixz="-0.0000012" iyy="0.0008904" iyz="0.0003068" izz="0.0013941" />
+    </inertial>
+  </link>
+
+  <link name="RightArm_Z_Link1">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/RightArm_Z_Link1.STL" />
+      </geometry>
+      <material>
+        <color rgba="0.00000000 1.00000000 0.00000000 1.00000000"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/RightArm_Z_Link1.STL" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0.0000235 0.0055715 -0.03076" rpy="0 0 0" />
+      <mass value="1.9705" />
+      <inertia ixx="0.0049229" ixy="0.0000055" ixz="0.0000019" iyy="0.0052651" iyz="0.0003323" izz="0.0018811" />
+    </inertial>
+  </link>
+
+  <link name="RightArm_Z_Link2">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/RightArm_Z_Link2.STL" />
+      </geometry>
+      <material>
+        <color rgba="0.00000000 0.00000000 1.00000000 1.00000000"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/RightArm_Z_Link2.STL" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0.0001348 0.0617046 0.0095064" rpy="0 0 0" />
+      <mass value="2.24398" />
+      <inertia ixx="0.0119493" ixy="0.0000034" ixz="0.0000009" iyy="0.0036158" iyz="-0.001328" izz="0.0109836" />
+    </inertial>
+  </link>
+
+  <link name="RightArm_Z_Link3">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/RightArm_Z_Link3.STL" />
+      </geometry>
+      <material>
+        <color rgba="1.00000000 0.00000000 0.00000000 1.00000000"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/RightArm_Z_Link3.STL" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0.0096856 0.002466 -0.046273" rpy="0 0 0" />
+      <mass value="1.9242" />
+      <inertia ixx="0.0071822" ixy="0.0000441" ixz="0.0008955" iyy="0.0076256" iyz="0.000221" izz="0.001786" />
+    </inertial>
+  </link>
+
+  <link name="RightArm_Z_Link4">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/RightArm_Z_Link4.STL" />
+      </geometry>
+      <material>
+        <color rgba="0.00000000 1.00000000 0.00000000 1.00000000"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/RightArm_Z_Link4.STL" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0.0085041 -0.0471822 0.0094151" rpy="0 0 0" />
+      <mass value="1.6085" />
+      <inertia ixx="0.0058048" ixy="-0.0006667" ixz="-0.0001272" iyy="0.0022381" iyz="0.0007052" izz="0.0053306" />
+    </inertial>
+  </link>
+
+  <link name="RightArm_Z_Link5">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/RightArm_Z_Link5.STL" />
+      </geometry>
+      <material>
+        <color rgba="0.00000000 0.00000000 1.00000000 1.00000000"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/RightArm_Z_Link5.STL" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="-0.0005113 -0.0010106 -0.1127174" rpy="0 0 0" />
+      <mass value="2.0883" />
+      <inertia ixx="0.006266" ixy="0.0000401" ixz="-0.0000534" iyy="0.0056439" iyz="0.0000619" izz="0.0024363" />
+    </inertial>
+  </link>
+
+  <link name="RightArm_Z_Link6">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/RightArm_Z_Link6.STL" />
+      </geometry>
+      <material>
+        <color rgba="1.00000000 0.00000000 0.00000000 1.00000000"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/RightArm_Z_Link6.STL" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0.0003266 -0.0053134 0.0003018" rpy="0 0 0" />
+      <mass value="0.72496" />
+      <inertia ixx="0.0004604" ixy="-0.0000019" ixz="-0.0000008" iyy="0.0005172" iyz="-0.0000035" izz="0.0004252" />
+    </inertial>
+  </link>
+
+  <link name="RightArm_Z_Link7">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/RightArm_Z_Link7.STL" />
+      </geometry>
+      <material>
+        <color rgba="0.00000000 1.00000000 0.00000000 1.00000000"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/RightArm_Z_Link7.STL" />
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="-0.0000911 -0.0315325 0.0088937" rpy="0 0 0" />
+      <mass value="0.68606" />
+      <inertia ixx="0.0017369" ixy="-0.0000035" ixz="-0.0000012" iyy="0.0008904" iyz="0.0003068" izz="0.0013941" />
+    </inertial>
+  </link>
+
+  <joint name="Chassis_Y_Joint1" type="revolute">
+    <parent link="base_link" />
+    <child link="Leg_Y_Link1" />
+    <origin xyz="0 0 0" rpy="0 0 0" />
+    <axis xyz="0 -1 0" />
+    <limit lower="0.0" upper="1.0472" effort="550" velocity="1.15" />
+  </joint>
+
+  <joint name="Chassis_Y_Joint2" type="revolute">
+    <parent link="Leg_Y_Link1" />
+    <child link="Leg_Y_Link2" />
+    <origin xyz="0 0 0.35" rpy="0 0 0" />
+    <axis xyz="0 -1 0" />
+    <limit lower="-2.7" upper="0.44" effort="550" velocity="1.15" />
+  </joint>
+
+  <joint name="Chassis_Y_Joint3" type="revolute">
+    <parent link="Leg_Y_Link2" />
+    <child link="Leg_Y_Link3" />
+    <origin xyz="0 0 0.45069" rpy="0 0 0" />
+    <axis xyz="0 -1 0" />
+    <limit lower="-1.57" upper="1.57" effort="550" velocity="1.15" />
+  </joint>
+
+  <joint name="RightFrontWheelShaft_Z_Joint" type="revolute">
+    <parent link="base_link" />
+    <child link="RightFrontWheelShaft_Z_Link" />
+    <origin xyz="0.1383 -0.235 -0.035024" rpy="0 0 0" />
+    <axis xyz="0 0 -1" />
+    <limit lower="-2.09" upper="2.09" effort="44" velocity="7.33" />
+  </joint>
+
+  <joint name="RightFrontWheel_Y_Joint" type="continuous">
+    <parent link="RightFrontWheelShaft_Z_Link" />
+    <child link="RightFrontWheel_Y_Link" />
+    <origin xyz="0 0.0355 -0.1225" rpy="0 0 0" />
+    <axis xyz="0 -1 0" />
+    <limit effort="25" velocity="20.94" />
+  </joint>
+
+  <joint name="LeftFrontWheelShaft_Z_Joint" type="revolute">
+    <parent link="base_link" />
+    <child link="LeftFrontWheelShaft_Z_Link" />
+    <origin xyz="0.1383 0.235 -0.035024" rpy="0 0 0" />
+    <axis xyz="0 0 -1" />
+    <limit lower="-2.09" upper="2.09" effort="44" velocity="7.33" />
+  </joint>
+
+  <joint name="LeftFrontWheel_Y_Joint" type="continuous">
+    <parent link="LeftFrontWheelShaft_Z_Link" />
+    <child link="LeftFrontWheel_Y_Link" />
+    <origin xyz="0 -0.0355 -0.1225" rpy="0 0 3.14159" />
+    <axis xyz="0 1 0" />
+    <limit effort="25" velocity="20.94" />
+  </joint>
+
+  <joint name="RightRearWheelShaft_Z_Joint" type="revolute">
+    <parent link="base_link" />
+    <child link="RightRearWheelShaft_Z_Link" />
+    <origin xyz="-0.3217 -0.235 -0.035024" rpy="0 0 0" />
+    <axis xyz="0 0 -1" />
+    <limit lower="-2.09" upper="2.09" effort="44" velocity="7.33" />
+  </joint>
+
+  <joint name="RightRearWheel_Y_Joint" type="continuous">
+    <parent link="RightRearWheelShaft_Z_Link" />
+    <child link="RightRearWheel_Y_Link" />
+    <origin xyz="0 0.0355 -0.1225" rpy="0 0 0" />
+    <axis xyz="0 -1 0" />
+    <limit effort="25" velocity="20.94" />
+  </joint>
+
+  <joint name="LeftRearWheelShaft_Z_Joint" type="revolute">
+    <parent link="base_link" />
+    <child link="LeftRearWheelShaft_Z_Link" />
+    <origin xyz="-0.3217 0.235 -0.035024" rpy="0 0 0" />
+    <axis xyz="0 0 -1" />
+    <limit lower="-2.09" upper="2.09" effort="44" velocity="7.33" />
+  </joint>
+
+  <joint name="LeftRearWheel_Y_Joint" type="continuous">
+    <parent link="LeftRearWheelShaft_Z_Link" />
+    <child link="LeftRearWheel_Y_Link" />
+    <origin xyz="0 -0.0355 -0.1225" rpy="0 0 3.14159" />
+    <axis xyz="0 1 0" />
+    <limit effort="25" velocity="20.94" />
+  </joint>
+
+  <joint name="Chassis_Z_Joint4" type="revolute">
+    <parent link="Leg_Y_Link3" />
+    <child link="Body_Link" />
+    <origin xyz="0 0.000999 0.1408" rpy="0 0 0" />
+    <axis xyz="0 0 1" />
+    <limit lower="-3.106686" upper="3.106686" effort="300" velocity="1.884956" />
+  </joint>
+
+  <joint name="Head_Z_Joint" type="revolute">
+    <parent link="Body_Link" />
+    <child link="Head_Z_Link01" />
+    <origin xyz="0 0 0.4575" rpy="0 0 0" />
+    <axis xyz="0 0 -1" />
+    <limit lower="-3.106686" upper="3.106686" effort="11" velocity="3.1416" />
+  </joint>
+
+  <joint name="HeadCamera_Y_Joint" type="revolute">
+    <parent link="Head_Z_Link01" />
+    <child link="Head_Y_Link02" />
+    <origin xyz="0 0.0275 0.041" rpy="0 0 0" />
+    <axis xyz="0 -1 0" />
+    <limit lower="-1.570796" upper="1.047198" effort="11" velocity="3.1416" />
+  </joint>
+
+  <joint name="RightArm_Z_Joint1" type="revolute">
+    <parent link="Body_Link" />
+    <child link="RightArm_Z_Link1" />
+    <origin xyz="0 -0.279 0.302348" rpy="1.5708 0 0" />
+    <axis xyz="0 0 1" />
+    <limit lower="-3.054326" upper="3.054326" effort="108" velocity="3.1416" />
+  </joint>
+
+  <joint name="LeftArm_Z_Joint1" type="revolute">
+    <parent link="Body_Link" />
+    <child link="LeftArm_Z_Link1" />
+    <origin xyz="0 0.279 0.302348" rpy="-1.5708 0 0" />
+    <axis xyz="0 0 1" />
+    <limit lower="-3.054326" upper="3.054326" effort="108" velocity="3.1416" />
+  </joint>
+
+  <joint name="LeftArm_Z_Joint2" type="revolute">
+    <parent link="LeftArm_Z_Link1" />
+    <child link="LeftArm_Z_Link2" />
+    <origin xyz="0 0 0" rpy="1.5708 0 0" />
+    <axis xyz="0 0 1" />
+    <limit lower="-2.059489" upper="2.059489" effort="108" velocity="3.1416" />
+  </joint>
+
+  <joint name="LeftArm_Z_Joint3" type="revolute">
+    <parent link="LeftArm_Z_Link2" />
+    <child link="LeftArm_Z_Link3" />
+    <origin xyz="0 0.287 0" rpy="-1.5708 0 0" />
+    <axis xyz="0 0 1" />
+    <limit lower="-3.054326" upper="3.054326" effort="66" velocity="3.1416" />
+  </joint>
+
+  <joint name="LeftArm_Z_Joint4" type="revolute">
+    <parent link="LeftArm_Z_Link3" />
+    <child link="LeftArm_Z_Link4" />
+    <origin xyz="0.018 0 0" rpy="-1.5708 0 3.1416" />
+    <axis xyz="0 0 1" />
+    <limit lower="-2.443461" upper="0.994838" effort="66" velocity="3.1416" />
+  </joint>
+
+  <joint name="LeftArm_Z_Joint5" type="revolute">
+    <parent link="LeftArm_Z_Link4" />
+    <child link="LeftArm_Z_Link5" />
+    <origin xyz="0.018 -0.314 0" rpy="-1.5708 0 3.1416" />
+    <axis xyz="0 0 1" />
+    <limit lower="-3.089233" upper="3.089233" effort="18" velocity="3.1416" />
+  </joint>
+
+  <joint name="LeftArm_Z_Joint6" type="revolute">
+    <parent link="LeftArm_Z_Link5" />
+    <child link="LeftArm_Z_Link6" />
+    <origin xyz="0 0 0" rpy="1.5708 -1.5708 0" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.029744" upper="1.029744" effort="18" velocity="3.1416" />
+  </joint>
+
+  <joint name="LeftArm_Z_Joint7" type="revolute">
+    <parent link="LeftArm_Z_Link6" />
+    <child link="LeftArm_Z_Link7" />
+    <origin xyz="0 0 0" rpy="1.5708 -1.5708 0" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.553343" upper="1.553343" effort="18" velocity="3.1416" />
+  </joint>
+
+  <joint name="RightArm_Z_Joint2" type="revolute">
+    <parent link="RightArm_Z_Link1" />
+    <child link="RightArm_Z_Link2" />
+    <origin xyz="0 0 0" rpy="1.5708 0 0" />
+    <axis xyz="0 0 1" />
+    <limit lower="-2.059489" upper="2.059489" effort="108" velocity="3.1416" />
+  </joint>
+
+  <joint name="RightArm_Z_Joint3" type="revolute">
+    <parent link="RightArm_Z_Link2" />
+    <child link="RightArm_Z_Link3" />
+    <origin xyz="0 0.287 0" rpy="-1.5708 0 0" />
+    <axis xyz="0 0 1" />
+    <limit lower="-3.054326" upper="3.054326" effort="66" velocity="3.1416" />
+  </joint>
+
+  <joint name="RightArm_Z_Joint4" type="revolute">
+    <parent link="RightArm_Z_Link3" />
+    <child link="RightArm_Z_Link4" />
+    <origin xyz="0.018 0 0" rpy="-1.5708 0 3.1416" />
+    <axis xyz="0 0 1" />
+    <limit lower="-2.443461" upper="0.994838" effort="66" velocity="3.1416" />
+  </joint>
+
+  <joint name="RightArm_Z_Joint5" type="revolute">
+    <parent link="RightArm_Z_Link4" />
+    <child link="RightArm_Z_Link5" />
+    <origin xyz="0.018 -0.314 0" rpy="-1.5708 0 3.1416" />
+    <axis xyz="0 0 1" />
+    <limit lower="-3.089233" upper="3.089233" effort="18" velocity="3.1416" />
+  </joint>
+
+  <joint name="RightArm_Z_Joint6" type="revolute">
+    <parent link="RightArm_Z_Link5" />
+    <child link="RightArm_Z_Link6" />
+    <origin xyz="0 0 0" rpy="1.5708 -1.5708 0" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.029744" upper="1.029744" effort="18" velocity="3.1416" />
+  </joint>
+
+  <joint name="RightArm_Z_Joint7" type="revolute">
+    <parent link="RightArm_Z_Link6" />
+    <child link="RightArm_Z_Link7" />
+    <origin xyz="0 0 0" rpy="1.5708 -1.5708 0" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.553343" upper="1.553343" effort="18" velocity="3.1416" />
+  </joint>
+
+  <link name="Link7_R" />
+  <joint name="alias_Link7_R" type="fixed">
+    <parent link="RightArm_Z_Link7" />
+    <child link="Link7_R" />
+    <origin xyz="0 0 0" rpy="0 0 0" />
+  </joint>
+  <link name="Link7_L" />
+  <joint name="alias_Link7_L" type="fixed">
+    <parent link="LeftArm_Z_Link7" />
+    <child link="Link7_L" />
+    <origin xyz="0 0 0" rpy="0 0 0" />
+  </joint>
+
+  <!-- KMPC gripper (unchanged kinematics); mounted on CAD Link7 -->
+  <link name="r_hand_link">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/base_link.STL" />
+        </geometry>
+        <material name="triflex_gray" />
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/base_link.STL" />
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="-0.00174540691807867 -0.0169538993947926 0.00031707733755312" rpy="0 0 0" />
+        <mass value="0.817637151923004" />
+        <inertia ixx="0.00046685497321455" ixy="2.56237123527592E-06" ixz="-1.62817479739346E-06" iyy="0.000506714019712864" iyz="4.2314677378657E-07" izz="0.000415531674904082" />
+      </inertial>
+    </link>
+  
+    
+  <link name="r_hand_link01">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link01.STL" />
+        </geometry>
+        <material name="triflex_gray" />
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link01.STL" />
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="-0.0238185834637119 4.98324485766824E-05 -0.00789938861731746" rpy="0 0 0" />
+        <mass value="0.0470886164123968" />
+        <inertia ixx="4.23231441215304E-06" ixy="-3.88010820246284E-11" ixz="1.24818285930654E-07" iyy="3.77421676999601E-06" iyz="1.12798102616843E-08" izz="2.07184805322536E-06" />
+      </inertial>
+    </link>
+  
+    
+  <link name="r_hand_link02">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link02.STL" />
+        </geometry>
+        <material name="triflex_gray" />
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link02.STL" />
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="0.000469544838902297 0.00012663056930257 -0.0169923035972263" rpy="0 0 0" />
+        <mass value="0.0216828110716218" />
+        <inertia ixx="9.96809785213017E-07" ixy="5.95593622223084E-14" ixz="-9.46436133573578E-10" iyy="9.87932659934699E-07" iyz="-1.34778807302702E-08" izz="1.2639847934051E-06" />
+      </inertial>
+    </link>
+  
+    
+  <link name="r_hand_link03">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link03.STL" />
+        </geometry>
+        <material name="triflex_gray" />
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link03.STL" />
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="-6.1490011422291E-05 -0.00120293028310913 -0.0145208781782102" rpy="0 0 0" />
+        <mass value="0.0381563848354264" />
+        <inertia ixx="3.20069037367271E-06" ixy="-4.08860859062779E-11" ixz="1.12817050220179E-08" iyy="3.93315424131991E-06" iyz="-2.02742381879104E-08" izz="1.30816088826119E-06" />
+      </inertial>
+    </link>
+  
+    
+  <link name="r_hand_link04">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link04.STL" />
+        </geometry>
+        <material name="triflex_gray" />
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link04.STL" />
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="-0.000209896332263676 -0.00104927433743601 -0.0225942034429138" rpy="0 0 0" />
+        <mass value="0.055403802201202" />
+        <inertia ixx="4.15704847918931E-06" ixy="-7.49664619506624E-11" ixz="-4.16627961443364E-08" iyy="4.60843868318125E-06" iyz="2.49926381760577E-09" izz="2.5487541746523E-06" />
+      </inertial>
+    </link>
+  
+    
+  <link name="r_hand_link05">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link05.STL" />
+        </geometry>
+        <material name="triflex_gray" />
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link05.STL" />
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="0.0238185834637119 -4.98324485766789E-05 -0.00789938861731746" rpy="0 0 0" />
+        <mass value="0.0470886164123967" />
+        <inertia ixx="4.23231441215304E-06" ixy="-3.88010820245222E-11" ixz="-1.24818285930654E-07" iyy="3.77421676999601E-06" iyz="-1.1279810261685E-08" izz="2.07184805322536E-06" />
+      </inertial>
+    </link>
+  
+    
+  <link name="r_hand_link06">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link06.STL" />
+        </geometry>
+        <material name="triflex_gray" />
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link06.STL" />
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="-0.000469544838902297 -0.000126630569302569 -0.0169923035972263" rpy="0 0 0" />
+        <mass value="0.0216828110716218" />
+        <inertia ixx="9.96809785213017E-07" ixy="5.95593623191167E-14" ixz="9.46436133573797E-10" iyy="9.87932659934698E-07" iyz="1.347788073027E-08" izz="1.2639847934051E-06" />
+      </inertial>
+    </link>
+  
+    
+  <link name="r_hand_link07">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link07.STL" />
+        </geometry>
+        <material name="triflex_gray" />
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link07.STL" />
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="6.1490011422291E-05 0.00120293028310913 -0.0145208781782102" rpy="0 0 0" />
+        <mass value="0.0381563848354265" />
+        <inertia ixx="3.20069037367272E-06" ixy="-4.08860859059867E-11" ixz="-1.12817050220186E-08" iyy="3.93315424131991E-06" iyz="2.02742381879105E-08" izz="1.30816088826119E-06" />
+      </inertial>
+    </link>
+  
+    
+  <link name="r_hand_link08">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link08.STL" />
+        </geometry>
+        <material name="triflex_gray" />
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link08.STL" />
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="0.00020989633217991 0.00104927433710873 -0.0225942034432835" rpy="0 0 0" />
+        <mass value="0.0554038022019902" />
+        <inertia ixx="4.15704847920387E-06" ixy="-7.49665940239037E-11" ixz="4.16627961511624E-08" iyy="4.60843868321401E-06" iyz="-2.49926380107679E-09" izz="2.54875417471884E-06" />
+      </inertial>
+    </link>
+  
+    
+  <link name="r_hand_link09">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link09.STL" />
+        </geometry>
+        <material name="triflex_gray" />
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link09.STL" />
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="0.0238185834637119 -4.98324485766824E-05 -0.00789938861731746" rpy="0 0 0" />
+        <mass value="0.0470886164123967" />
+        <inertia ixx="4.23231441215304E-06" ixy="-3.8801082024393E-11" ixz="-1.24818285930654E-07" iyy="3.77421676999601E-06" iyz="-1.12798102616846E-08" izz="2.07184805322536E-06" />
+      </inertial>
+    </link>
+  
+    
+  <link name="r_hand_link10">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link10.STL" />
+        </geometry>
+        <material name="triflex_gray" />
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link10.STL" />
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="-0.000469544838902304 -0.000126630569302569 -0.0169923035972263" rpy="0 0 0" />
+        <mass value="0.0216828110716218" />
+        <inertia ixx="9.96809785213017E-07" ixy="5.95593622996295E-14" ixz="9.46436133573708E-10" iyy="9.87932659934699E-07" iyz="1.34778807302701E-08" izz="1.2639847934051E-06" />
+      </inertial>
+    </link>
+  
+    
+  <link name="r_hand_link11">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link11.STL" />
+        </geometry>
+        <material name="triflex_gray" />
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link11.STL" />
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="6.14900114222772E-05 0.00120293028310913 -0.0145208781782103" rpy="0 0 0" />
+        <mass value="0.0381563848354265" />
+        <inertia ixx="3.20069037367272E-06" ixy="-4.0886085906228E-11" ixz="-1.12817050220186E-08" iyy="3.93315424131991E-06" iyz="2.02742381879106E-08" izz="1.30816088826119E-06" />
+      </inertial>
+    </link>
+  
+    
+  <link name="r_hand_link12">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link12.STL" />
+        </geometry>
+        <material name="triflex_gray" />
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link12.STL" />
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="0.000209896331990915 0.00104927433733329 -0.02259420344418" rpy="0 0 0" />
+        <mass value="0.0554038022038379" />
+        <inertia ixx="4.15704847927005E-06" ixy="-7.49665140648894E-11" ixz="4.16627961577392E-08" iyy="4.60843868331915E-06" iyz="-2.49926380968366E-09" izz="2.54875417487706E-06" />
+      </inertial>
+    </link>
+  
+    
+  
+    
+  <link name="l_hand_link">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/base_link.STL" />
+        </geometry>
+        <material name="triflex_gray" />
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/base_link.STL" />
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="-0.00174540691807867 -0.0169538993947926 0.00031707733755312" rpy="0 0 0" />
+        <mass value="0.817637151923004" />
+        <inertia ixx="0.00046685497321455" ixy="2.56237123527592E-06" ixz="-1.62817479739346E-06" iyy="0.000506714019712864" iyz="4.2314677378657E-07" izz="0.000415531674904082" />
+      </inertial>
+    </link>
+  
+    
+  <link name="l_hand_link01">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link01.STL" />
+        </geometry>
+        <material name="triflex_gray" />
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link01.STL" />
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="-0.0238185834637119 4.98324485766824E-05 -0.00789938861731746" rpy="0 0 0" />
+        <mass value="0.0470886164123968" />
+        <inertia ixx="4.23231441215304E-06" ixy="-3.88010820246284E-11" ixz="1.24818285930654E-07" iyy="3.77421676999601E-06" iyz="1.12798102616843E-08" izz="2.07184805322536E-06" />
+      </inertial>
+    </link>
+  
+    
+  <link name="l_hand_link02">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link02.STL" />
+        </geometry>
+        <material name="triflex_gray" />
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link02.STL" />
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="0.000469544838902297 0.00012663056930257 -0.0169923035972263" rpy="0 0 0" />
+        <mass value="0.0216828110716218" />
+        <inertia ixx="9.96809785213017E-07" ixy="5.95593622223084E-14" ixz="-9.46436133573578E-10" iyy="9.87932659934699E-07" iyz="-1.34778807302702E-08" izz="1.2639847934051E-06" />
+      </inertial>
+    </link>
+  
+    
+  <link name="l_hand_link03">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link03.STL" />
+        </geometry>
+        <material name="triflex_gray" />
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link03.STL" />
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="-6.1490011422291E-05 -0.00120293028310913 -0.0145208781782102" rpy="0 0 0" />
+        <mass value="0.0381563848354264" />
+        <inertia ixx="3.20069037367271E-06" ixy="-4.08860859062779E-11" ixz="1.12817050220179E-08" iyy="3.93315424131991E-06" iyz="-2.02742381879104E-08" izz="1.30816088826119E-06" />
+      </inertial>
+    </link>
+  
+    
+  <link name="l_hand_link04">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link04.STL" />
+        </geometry>
+        <material name="triflex_gray" />
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link04.STL" />
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="-0.000209896332263676 -0.00104927433743601 -0.0225942034429138" rpy="0 0 0" />
+        <mass value="0.055403802201202" />
+        <inertia ixx="4.15704847918931E-06" ixy="-7.49664619506624E-11" ixz="-4.16627961443364E-08" iyy="4.60843868318125E-06" iyz="2.49926381760577E-09" izz="2.5487541746523E-06" />
+      </inertial>
+    </link>
+  
+    
+  <link name="l_hand_link05">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link05.STL" />
+        </geometry>
+        <material name="triflex_gray" />
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link05.STL" />
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="0.0238185834637119 -4.98324485766789E-05 -0.00789938861731746" rpy="0 0 0" />
+        <mass value="0.0470886164123967" />
+        <inertia ixx="4.23231441215304E-06" ixy="-3.88010820245222E-11" ixz="-1.24818285930654E-07" iyy="3.77421676999601E-06" iyz="-1.1279810261685E-08" izz="2.07184805322536E-06" />
+      </inertial>
+    </link>
+  
+    
+  <link name="l_hand_link06">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link06.STL" />
+        </geometry>
+        <material name="triflex_gray" />
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link06.STL" />
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="-0.000469544838902297 -0.000126630569302569 -0.0169923035972263" rpy="0 0 0" />
+        <mass value="0.0216828110716218" />
+        <inertia ixx="9.96809785213017E-07" ixy="5.95593623191167E-14" ixz="9.46436133573797E-10" iyy="9.87932659934698E-07" iyz="1.347788073027E-08" izz="1.2639847934051E-06" />
+      </inertial>
+    </link>
+  
+    
+  <link name="l_hand_link07">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link07.STL" />
+        </geometry>
+        <material name="triflex_gray" />
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link07.STL" />
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="6.1490011422291E-05 0.00120293028310913 -0.0145208781782102" rpy="0 0 0" />
+        <mass value="0.0381563848354265" />
+        <inertia ixx="3.20069037367272E-06" ixy="-4.08860859059867E-11" ixz="-1.12817050220186E-08" iyy="3.93315424131991E-06" iyz="2.02742381879105E-08" izz="1.30816088826119E-06" />
+      </inertial>
+    </link>
+  
+    
+  <link name="l_hand_link08">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link08.STL" />
+        </geometry>
+        <material name="triflex_gray" />
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link08.STL" />
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="0.00020989633217991 0.00104927433710873 -0.0225942034432835" rpy="0 0 0" />
+        <mass value="0.0554038022019902" />
+        <inertia ixx="4.15704847920387E-06" ixy="-7.49665940239037E-11" ixz="4.16627961511624E-08" iyy="4.60843868321401E-06" iyz="-2.49926380107679E-09" izz="2.54875417471884E-06" />
+      </inertial>
+    </link>
+  
+    
+  <link name="l_hand_link09">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link09.STL" />
+        </geometry>
+        <material name="triflex_gray" />
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link09.STL" />
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="0.0238185834637119 -4.98324485766824E-05 -0.00789938861731746" rpy="0 0 0" />
+        <mass value="0.0470886164123967" />
+        <inertia ixx="4.23231441215304E-06" ixy="-3.8801082024393E-11" ixz="-1.24818285930654E-07" iyy="3.77421676999601E-06" iyz="-1.12798102616846E-08" izz="2.07184805322536E-06" />
+      </inertial>
+    </link>
+  
+    
+  <link name="l_hand_link10">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link10.STL" />
+        </geometry>
+        <material name="triflex_gray" />
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link10.STL" />
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="-0.000469544838902304 -0.000126630569302569 -0.0169923035972263" rpy="0 0 0" />
+        <mass value="0.0216828110716218" />
+        <inertia ixx="9.96809785213017E-07" ixy="5.95593622996295E-14" ixz="9.46436133573708E-10" iyy="9.87932659934699E-07" iyz="1.34778807302701E-08" izz="1.2639847934051E-06" />
+      </inertial>
+    </link>
+  
+    
+  <link name="l_hand_link11">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link11.STL" />
+        </geometry>
+        <material name="triflex_gray" />
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link11.STL" />
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="6.14900114222772E-05 0.00120293028310913 -0.0145208781782103" rpy="0 0 0" />
+        <mass value="0.0381563848354265" />
+        <inertia ixx="3.20069037367272E-06" ixy="-4.0886085906228E-11" ixz="-1.12817050220186E-08" iyy="3.93315424131991E-06" iyz="2.02742381879106E-08" izz="1.30816088826119E-06" />
+      </inertial>
+    </link>
+  
+    
+  <link name="l_hand_link12">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link12.STL" />
+        </geometry>
+        <material name="triflex_gray" />
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <geometry>
+          <mesh filename="package://light_duty_robot_description/meshes/triflex/link12.STL" />
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="0.000209896331990915 0.00104927433733329 -0.02259420344418" rpy="0 0 0" />
+        <mass value="0.0554038022038379" />
+        <inertia ixx="4.15704847927005E-06" ixy="-7.49665140648894E-11" ixz="4.16627961577392E-08" iyy="4.60843868331915E-06" iyz="-2.49926380968366E-09" izz="2.54875417487706E-06" />
+      </inertial>
+    </link>
+  
+    
+  <joint name="r_hand_joint" type="fixed">
+      <parent link="RightArm_Z_Link7" />
+      <child link="r_hand_link" />
+      <origin xyz="0 -0.165 0" rpy="3.14159 0.785 0" />
+    </joint>
+  
+    
+  <joint name="r_finger_1_rotate" type="revolute">
+      <parent link="r_hand_link" />
+      <child link="r_hand_link01" />
+      <origin xyz="-0.027713 -0.0124 0" rpy="1.5708 0 0" />
+      <axis xyz="0 0 -1" />
+      <limit lower="-1.5637" upper="1.5779" effort="20" velocity="1" />
+    </joint>
+  
+    
+  <joint name="r_finger_1_swing" type="revolute">
+      <parent link="r_hand_link01" />
+      <child link="r_hand_link02" />
+      <origin xyz="-0.0284 0 -0.02345" rpy="0 0 0" />
+      <axis xyz="1 0 0" />
+      <limit lower="-1.5637" upper="1.5779" effort="20" velocity="1" />
+    </joint>
+  
+    
+  <joint name="r_finger_1_bend_1" type="revolute">
+      <parent link="r_hand_link02" />
+      <child link="r_hand_link03" />
+      <origin xyz="-0.0006 0.0009 -0.034" rpy="0 0 0" />
+      <axis xyz="0 -1 0" />
+      <limit lower="-1.5637" upper="1.5779" effort="20" velocity="1" />
+    </joint>
+  
+    
+  <joint name="r_finger_1_bend_2" type="revolute">
+      <parent link="r_hand_link03" />
+      <child link="r_hand_link04" />
+      <origin xyz="0 0 -0.0441" rpy="0 0 0" />
+      <axis xyz="0 -1 0" />
+      <limit lower="-1.5637" upper="1.5779" effort="20" velocity="1" />
+    </joint>
+  
+    
+  <joint name="r_finger_2_rotate" type="revolute">
+      <parent link="r_hand_link" />
+      <child link="r_hand_link05" />
+      <origin xyz="0.013856 -0.0124 -0.024" rpy="1.5708 0 0" />
+      <axis xyz="0 0 -1" />
+      <limit lower="-0.785" upper="1.5779" effort="20" velocity="1" />
+    </joint>
+  
+    
+  <joint name="r_finger_2_swing" type="revolute">
+      <parent link="r_hand_link05" />
+      <child link="r_hand_link06" />
+      <origin xyz="0.0284 0 -0.02345" rpy="0 0 0" />
+      <axis xyz="-1 0 0" />
+      <limit lower="-1.5637" upper="1.5779" effort="20" velocity="1" />
+    </joint>
+  
+    
+  <joint name="r_finger_2_bend_1" type="revolute">
+      <parent link="r_hand_link06" />
+      <child link="r_hand_link07" />
+      <origin xyz="0.0006 -0.0009 -0.034" rpy="0 0 0" />
+      <axis xyz="0 1 0" />
+      <limit lower="-1.5637" upper="1.5779" effort="20" velocity="1" />
+    </joint>
+  
+    
+  <joint name="r_finger_2_bend_2" type="revolute">
+      <parent link="r_hand_link07" />
+      <child link="r_hand_link08" />
+      <origin xyz="0 0 -0.0441" rpy="0 0 0" />
+      <axis xyz="0 1 0" />
+      <limit lower="-1.5637" upper="1.5779" effort="20" velocity="1" />
+    </joint>
+  
+    
+  <joint name="r_finger_3_rotate" type="revolute">
+      <parent link="r_hand_link" />
+      <child link="r_hand_link09" />
+      <origin xyz="0.013856 -0.0124 0.024" rpy="1.5708 0 0" />
+      <axis xyz="0 0 -1" />
+      <limit lower="-1.5637" upper="0.786" effort="20" velocity="1" />
+    </joint>
+  
+    
+  <joint name="r_finger_3_swing" type="revolute">
+      <parent link="r_hand_link09" />
+      <child link="r_hand_link10" />
+      <origin xyz="0.0284 0 -0.02345" rpy="0 0 0" />
+      <axis xyz="-1 0 0" />
+      <limit lower="-1.5637" upper="1.5779" effort="20" velocity="1" />
+    </joint>
+  
+    
+  <joint name="r_finger_3_bend_1" type="revolute">
+      <parent link="r_hand_link10" />
+      <child link="r_hand_link11" />
+      <origin xyz="0.0006 -0.0009 -0.034" rpy="0 0 0" />
+      <axis xyz="0 1 0" />
+      <limit lower="-1.5637" upper="1.5779" effort="20" velocity="1" />
+    </joint>
+  
+    
+  <joint name="r_finger_3_bend_2" type="revolute">
+      <parent link="r_hand_link11" />
+      <child link="r_hand_link12" />
+      <origin xyz="0 0 -0.0441" rpy="0 0 0" />
+      <axis xyz="0 1 0" />
+      <limit lower="-1.5637" upper="1.5779" effort="20" velocity="1" />
+    </joint>
+  
+    
+  
+    
+  <joint name="l_hand_joint" type="fixed">
+      <parent link="LeftArm_Z_Link7" />
+      <child link="l_hand_link" />
+      <origin xyz="0 -0.165 0" rpy="3.14159 2.36 0" />
+    </joint>
+  
+    
+  <joint name="l_finger_1_rotate" type="revolute">
+      <parent link="l_hand_link" />
+      <child link="l_hand_link01" />
+      <origin xyz="-0.027713 -0.0124 0" rpy="1.5708 0 0" />
+      <axis xyz="0 0 -1" />
+      <limit lower="-1.5637" upper="1.5779" effort="20" velocity="1" />
+    </joint>
+  
+    
+  <joint name="l_finger_1_swing" type="revolute">
+      <parent link="l_hand_link01" />
+      <child link="l_hand_link02" />
+      <origin xyz="-0.0284 0 -0.02345" rpy="0 0 0" />
+      <axis xyz="1 0 0" />
+      <limit lower="-1.5637" upper="1.5779" effort="20" velocity="1" />
+    </joint>
+  
+    
+  <joint name="l_finger_1_bend_1" type="revolute">
+      <parent link="l_hand_link02" />
+      <child link="l_hand_link03" />
+      <origin xyz="-0.0006 0.0009 -0.034" rpy="0 0 0" />
+      <axis xyz="0 -1 0" />
+      <limit lower="-1.5637" upper="1.5779" effort="20" velocity="1" />
+    </joint>
+  
+    
+  <joint name="l_finger_1_bend_2" type="revolute">
+      <parent link="l_hand_link03" />
+      <child link="l_hand_link04" />
+      <origin xyz="0 0 -0.0441" rpy="0 0 0" />
+      <axis xyz="0 -1 0" />
+      <limit lower="-1.5637" upper="1.5779" effort="20" velocity="1" />
+    </joint>
+  
+    
+  <joint name="l_finger_2_rotate" type="revolute">
+      <parent link="l_hand_link" />
+      <child link="l_hand_link05" />
+      <origin xyz="0.013856 -0.0124 -0.024" rpy="1.5708 0 0" />
+      <axis xyz="0 0 -1" />
+      <limit lower="-0.785" upper="1.5779" effort="20" velocity="1" />
+    </joint>
+  
+    
+  <joint name="l_finger_2_swing" type="revolute">
+      <parent link="l_hand_link05" />
+      <child link="l_hand_link06" />
+      <origin xyz="0.0284 0 -0.02345" rpy="0 0 0" />
+      <axis xyz="-1 0 0" />
+      <limit lower="-1.5637" upper="1.5779" effort="20" velocity="1" />
+    </joint>
+  
+    
+  <joint name="l_finger_2_bend_1" type="revolute">
+      <parent link="l_hand_link06" />
+      <child link="l_hand_link07" />
+      <origin xyz="0.0006 -0.0009 -0.034" rpy="0 0 0" />
+      <axis xyz="0 1 0" />
+      <limit lower="-1.5637" upper="1.5779" effort="20" velocity="1" />
+    </joint>
+  
+    
+  <joint name="l_finger_2_bend_2" type="revolute">
+      <parent link="l_hand_link07" />
+      <child link="l_hand_link08" />
+      <origin xyz="0 0 -0.0441" rpy="0 0 0" />
+      <axis xyz="0 1 0" />
+      <limit lower="-1.5637" upper="1.5779" effort="20" velocity="1" />
+    </joint>
+  
+    
+  <joint name="l_finger_3_rotate" type="revolute">
+      <parent link="l_hand_link" />
+      <child link="l_hand_link09" />
+      <origin xyz="0.013856 -0.0124 0.024" rpy="1.5708 0 0" />
+      <axis xyz="0 0 -1" />
+      <limit lower="-1.5637" upper="0.786" effort="20" velocity="1" />
+    </joint>
+  
+    
+  <joint name="l_finger_3_swing" type="revolute">
+      <parent link="l_hand_link09" />
+      <child link="l_hand_link10" />
+      <origin xyz="0.0284 0 -0.02345" rpy="0 0 0" />
+      <axis xyz="-1 0 0" />
+      <limit lower="-1.5637" upper="1.5779" effort="20" velocity="1" />
+    </joint>
+  
+    
+  <joint name="l_finger_3_bend_1" type="revolute">
+      <parent link="l_hand_link10" />
+      <child link="l_hand_link11" />
+      <origin xyz="0.0006 -0.0009 -0.034" rpy="0 0 0" />
+      <axis xyz="0 1 0" />
+      <limit lower="-1.5637" upper="1.5779" effort="20" velocity="1" />
+    </joint>
+  
+    
+  <joint name="l_finger_3_bend_2" type="revolute">
+      <parent link="l_hand_link11" />
+      <child link="l_hand_link12" />
+      <origin xyz="0 0 -0.0441" rpy="0 0 0" />
+      <axis xyz="0 1 0" />
+      <limit lower="-1.5637" upper="1.5779" effort="20" velocity="1" />
+    </joint>
+  
+  
+</robot>

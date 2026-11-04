@@ -1,0 +1,36 @@
+# xoip robot_id → URDF 活动关节（顺序与 stream 数组下标一致）
+# 输入单位：度；内部 /joint_states：弧度
+# 名字与真机聚合 /joint_states 一致。
+robots:
+  1:
+    name: right_arm
+    joints:
+      - RightArm_Z_Joint1
+      - RightArm_Z_Joint2
+      - RightArm_Z_Joint3
+      - RightArm_Z_Joint4
+      - RightArm_Z_Joint5
+      - RightArm_Z_Joint6
+      - RightArm_Z_Joint7
+  2:
+    name: left_arm
+    joints:
+      - LeftArm_Z_Joint1
+      - LeftArm_Z_Joint2
+      - LeftArm_Z_Joint3
+      - LeftArm_Z_Joint4
+      - LeftArm_Z_Joint5
+      - LeftArm_Z_Joint6
+      - LeftArm_Z_Joint7
+  3:
+    name: waist
+    joints:
+      - Chassis_Y_Joint1
+      - Chassis_Y_Joint2
+      - Chassis_Y_Joint3
+      - Chassis_Z_Joint4
+  4:
+    name: head
+    joints:
+      - Head_Z_Joint
+      - HeadCamera_Y_Joint

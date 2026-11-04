@@ -1,0 +1,113 @@
+# 代价：时域跟可行终点 qa=q0+y_{N-1}；球只进终端 Vo。
+# 笛卡尔路径：全 J 跟踪，R=λ diag(M(q0))，终端 V_com + 支撑域硬盒。
+# N 只定终端盒走多远；QP 决策量是 (y0, y_{N-1}) 两端点。
+# W 全轴 w_joint；R 由腕对角标定到 r_arm。
+kmpc_node:
+  ros__parameters:
+    dt: 0.02
+    control_rate: 50.0
+    n_horizon: 15
+    # 硬限位内侧 0.3°。慢速可以规划到这里。快的时候由插补器按刹车距离提前减速。
+    q_limit_margin: 0.005236
+    auto_enable: false
+    demo_wave_waist: false
+    demo_wave_amp: 0.5
+    demo_wave_period: 8.0
+    # 关节角超过 0.1 秒没有新包就停发。反馈大约几十到 250 Hz，0.5 秒太晚。
+    state_timeout_sec: 0.1
+    hold_deadband: 0.01
+    w_joint: 8.0
+    # 腕对角标定尺：λ 使 HOME 附近腕 R ≈ r_arm。
+    r_arm: 0.05
+    # 路径参考 β_k=1-(1-α)^{k+1}；β_{N-1} 强制为 1，使时域跟踪对准 qa。
+    # e0<1cm 到位停（含腰）。
+    track_alpha: 0.20
+    arrived_err: 0.01
+    arrived_exit: 0.02
+    # 进度耗尽：最近 arrived_stall_ticks 拍 |Δe0| 均值 < arrived_stall_mm 则 ARRIVED。
+    arrived_stall_mm: 0.5
+    arrived_stall_ticks: 25
+    s_joint: 0.5
+    q_pos: 400.0
+    q_offset: 400.0
+    # Vo 侧向（y）弱于 xz，避免为最后一毫米去换腰。
+    q_offset_y: 150.0
+    # 掌心姿态（rad^{-2}）。单位四元数 = 不跟姿态。第一拍禁止 200。
+    q_ori: 20.0
+    vo_clamp_ori_rad: 0.35
+    arrived_ori_rad: 0.087
+    q_com: 40.0
+    com_margin: 0.025
+    com_xmin: -0.322
+    com_xmax: 0.138
+    com_ymin: -0.235
+    com_ymax: 0.235
+    # 工作墙相对「外墙±com_margin」再缩的边。0 = 墙位回到现码内墙，rhs/双节点仍是工作墙语义。
+    com_work_m: 0.06
+    # 躯干绝对俯仰 q1+q2+q3：上升硬盒 ±torso_pitch_max_deg，
+    # 下降钉当前 θ0（|Δθ|≤torso_hold_deg），高度走 J1+/J2-。
+    # 深下降：球高低于 HOME FK 减 torso_drop_m 且 e_z<0；贴下墙后俯仰残差进 J3。
+    # torso_rise_hold：升降 θ_des=clip(θ0)；false 才恢复 κ e_z 起身换边。
+    # torso_reach_pitch_follow（20261015）：下降方向 θ_des=clip(κ e_z) 跟高度走，
+    # 不再钉死；深下降分支不受影响。false = 旧行为。华成实测够点俯仰和 -20.2°。
+    q_torso: 250.0
+    # 20261015：15→22。华成实测安全姿势俯仰和 -20.2°，15 盒会削掉它；22 留余量。
+    torso_pitch_max_deg: 22.0
+    torso_hold_deg: 2.0
+    torso_step_deg: 0.08
+    torso_drop_m: 0.40
+    torso_k_per_m: 0.327
+    torso_rise_hold: true
+    torso_reach_pitch_follow: true
+    # 腕状态屏障（20261015 方案第一刀）：轴进警戒区后价格按分段二次上抬，
+    # 弹簧打在状态（q0+y）上往 d_warn 边界回拉，单拍回拉限幅 0.5×cmd_reset_rad，
+    # w_b 封顶 barrier_w_max_ratio×r_i 保 Hessian 条件数。barrier_alpha=0 关闭。
+    barrier_joints: [8, 15]
+    barrier_warn_deg: 20.0
+    barrier_floor_deg: 5.0
+    barrier_alpha: 2.0
+    barrier_w_max_ratio: 50.0
+    # |e_z| 大于此值时 V_com 的 x 靶跟当前 p_com.x；0 = 关闭。
+    com_hold_ez_m: 0.03
+    # J1/J2 Z 蹲：路径 W_syn 仅 e_z≥0（起身）。下降由俯仰硬钉代替。
+    q_syn: 80.0
+    alpha_syn: 1.75
+    # J4 头朝前：终端 (q4-q_pref)^2 + 路径对角；硬盒 ±yaw_max_deg。
+    q_yaw: 80.0
+    yaw_max_deg: 35.0
+    w_idle_arm: 40.0
+    w_o_arm: 1.0
+    track_gamma: 0.1
+    # Vo 臂任务：xz 按轴 ClampMag；高度未送到时用 vo_arm_floor_m，
+    # η=|e_{w,z}/e_{0,z}| 再放到 vo_clamp_m。y 用 vo_clamp_y_m（0=不封顶）。
+    # J_w 只含 J1–J3；J4 进臂块。下降 DLS 禁 J3。
+    vo_clamp_m: 0.12
+    vo_clamp_y_m: 0.40
+    vo_arm_floor_m: 0.03
+    vo_arm_gamma: 0.3
+    waist_gamma: 0.3
+    # 俯仰 DLS 阻尼，HOME / 折 Z 共线时防止 ŷ_w 爆炸。下降用 J1/J2 两列。
+    waist_pred_lambda: 0.05
+    # 双层 Planner：腰锁速度盒 ε；标定臂 mean 收敛阈值。
+    waist_lock_eps: 1.0e-5
+    calib_tol_rad: 0.02
+    # 测量与 q_cmd 的 inf 范数超此值则 seed 测量并清热启动。
+    cmd_reset_rad: 0.15
+    # 透传。一条消息里腰和两臂，控制器按 stream_control_rate 取最新一包，
+    # PluseMultiToServo，没有每包加减速。stream_hz 必须和网关 yaml 的 250 一致。
+    stream_topic: /xoip/robot/multi_joint_servo_cmd
+    stream_hz: 250.0
+    interp_catch_s: 0.02
+    interp_accel_s: 0.50
+    interp_jerk_s: 0.08
+    joint_states_topic: /joint_states
+    enable_topic: /kmpc/enable
+    mode_topic: /kmpc/mode
+    q_target_topic: /kmpc/q_target
+    target_left_topic: /kmpc/target_left
+    target_right_topic: /kmpc/target_right
+    clear_targets_topic: /kmpc/clear_targets
+    waist_locked_topic: /kmpc/waist_locked
+    tracking_state_topic: /kmpc/tracking_state
+    q_calib_topic: /kmpc/q_calib
+    require_xoip: true
