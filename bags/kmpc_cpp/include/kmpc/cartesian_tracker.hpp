@@ -108,12 +108,77 @@ class CartesianTracker {
   bool line_cascade_full_body() const { return line_.cascade_full_body; }
   bool line_waist_locked() const { return line_.waist_locked; }
   const std::string& line_reason() const { return line_.reason; }
+  const std::string& line_candidate() const { return line_.candidate; }
+  const std::string& line_pose_pref_decision() const { return line_.pose_pref_decision; }
+  double line_max_arm_fold() const { return line_.max_arm_fold; }
   double line_build_ms() const { return line_.build_ms; }
   double line_progress() const { return line_.prog; }
   double line_length() const { return line_.length_m; }
   size_t line_sample_count() const { return line_.samples.size(); }
   const auto& line_samples() const { return line_.samples; }
   int line_qp_solves() const { return line_qp_solves_; }
+  // Default-off posture candidate for straight-line builds. Uses loaded q_pref.
+  // Does not change baseline selection when enable=false.
+  void set_line_pose_pref(bool enable) { line_pose_pref_enable_ = enable; }
+  bool line_pose_pref_enabled() const { return line_pose_pref_enable_; }
+  void set_line_pose_pref_q(const Vec18& q_pref) { line_q_pref_ = q_pref; }
+
+  // Default-off: reuse the last successful nominal LineRun.samples in reverse for a
+  // matching immediate return. Not a servo-time-series reverse.
+  void set_reverse_last_line_enable(bool enable) { reverse_last_line_enable_ = enable; }
+  bool reverse_last_line_enabled() const { return reverse_last_line_enable_; }
+  const std::string& reverse_line_decision() const { return reverse_decision_; }
+  void clear_last_line_cache();
+  // Snapshot/import so async prepare_line workers can see the main-tracker cache.
+  struct LastLineCache {
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    bool valid = false;
+    bool left = true;
+    bool ori_on = false;
+    std::string frame;
+    Vec3 start_xyz = Vec3::Zero();
+    Vec3 end_xyz = Vec3::Zero();
+    Vec4 start_quat = Vec4(0, 0, 0, 1);
+    Vec4 end_quat = Vec4(0, 0, 0, 1);
+    Vec18 q_start = Vec18::Zero();
+    Vec18 q_end = Vec18::Zero();
+    std::vector<Vec18, Eigen::aligned_allocator<Vec18>> samples;
+    uint64_t generation = 0;
+  };
+  LastLineCache last_line_cache() const { return last_line_cache_; }
+  void import_last_line_cache(const LastLineCache& cache) { last_line_cache_ = cache; }
+  // Call once when the active line first reaches measured/command hold.
+  void maybe_commit_last_line_cache(const Vec18& q_meas);
+
+  // Default-off layered diagnostics. RT path only writes a preallocated ring.
+  enum class LineDiagLayer : uint8_t {
+    Build = 0,
+    FollowQp,
+    FollowCommit,
+    Feedback,
+  };
+  struct LineDiagEvent {
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    LineDiagLayer layer = LineDiagLayer::Build;
+    uint64_t goal_generation = 0;
+    int line_gen = 0;
+    double t_steady_s = 0.0;
+    double prog = 0.0;
+    double build_ms = 0.0;
+    char candidate[32]{};
+    char decision[48]{};
+    Vec18 q = Vec18::Zero();
+    Vec18 q_aux = Vec18::Zero();  // QP from / feedback, depending on layer
+  };
+  void set_line_diag_enable(bool enable);
+  bool line_diag_enabled() const { return line_diag_enable_; }
+  size_t line_diag_overflows() const { return line_diag_overflows_; }
+  size_t line_diag_size() const;
+  // Oldest→newest copy; safe to call off the RT thread when diag is paused/off.
+  std::vector<LineDiagEvent> line_diag_snapshot() const;
+  void line_diag_clear();
+  void line_diag_push_feedback(const Vec18& q_meas, double source_stamp_s);
+
   bool line_needs_build(bool left, const Vec3& target, const Vec4* quat) const;
   bool line_measured_arrived(const Vec18& q) const;
   bool line_stream_segment_ok(const Vec18& from, const Vec18& to) const;
@@ -205,6 +270,14 @@ class CartesianTracker {
     bool cascade_passed = false;
     bool cascade_forced_waist = false;
     bool cascade_full_body = false;
+    // arm_only | free_fit | tip_seed | cascade_full_body | pose_pref |
+    // reverse_cache | qa_seed | none
+    std::string candidate = "none";
+    // skipped | accepted | rejected_<reason> | disabled
+    std::string pose_pref_decision = "disabled";
+    // disabled | skipped | accepted | rejected_<reason>
+    std::string reverse_decision = "disabled";
+    double max_arm_fold = 0.0;
     std::string reason;
     double build_ms = 0.0;
     Vec3 target = Vec3::Zero();
@@ -221,9 +294,11 @@ class CartesianTracker {
     return line_;
   }
   void adopt_line(LineRun plan) {
+    reverse_decision_ = plan.reverse_decision.empty() ? reverse_decision_ : plan.reverse_decision;
     line_ = std::move(plan);
     if (!line_.samples.empty()) line_q_=line_.samples.front();
     line_rate_=0; ++line_gen_; last_arrived_=false;
+    last_line_cache_committed_ = false;
   }
  private:
   void line_clear();
@@ -242,7 +317,8 @@ class CartesianTracker {
       const Vec18& q0, int arm_begin, const Vec3& target, const Vec4* quat,
       bool ori_on, bool lock_waist, const std::string& frame,
       std::vector<Vec18, Eigen::aligned_allocator<Vec18>>& samples,
-      bool& waist_locked, bool allow_relock = true, const Vec18* goal_seed = nullptr) const;
+      bool& waist_locked, bool allow_relock = true, const Vec18* goal_seed = nullptr,
+      const Vec18* pose_pref = nullptr) const;
   bool line_validate(const std::vector<Vec18, Eigen::aligned_allocator<Vec18>>& samples,
       const Vec3& target, const Vec4* quat, bool ori_on, const std::string& frame) const;
   bool line_path_qp(const Vec18& from, double next_prog, const Vec18& cap, Vec18& to);
@@ -261,6 +337,33 @@ class CartesianTracker {
   double line_speed_scale_ = 1.0;
   double line_accel_s_ = 0.0;
   double line_rate_ = 0.0;
+  bool line_pose_pref_enable_ = false;
+  Vec18 line_q_pref_ = Vec18::Zero();
+  // Soft posture pull and acceptance budgets (radians unless noted).
+  double line_pose_pref_w_ = 0.35;
+  double line_pose_pref_min_improve_ = 5.0 * kPi / 180.0;
+  // Calibrated from offline left/right place-exit fixtures (20261105): pose_pref
+  // trials improved elbow ~14° with ~26–31° extra waist path; keep margin.
+  double line_pose_pref_waist_budget_ = 35.0 * kPi / 180.0;
+  double line_pose_pref_wrist_budget_ = 25.0 * kPi / 180.0;
+
+  bool reverse_last_line_enable_ = false;
+  std::string reverse_decision_ = "disabled";
+  LastLineCache last_line_cache_{};
+  bool last_line_cache_committed_ = false;
+  // Joint-space match for reverse start (~2°/axis) and Cartesian end match (3 mm).
+  double reverse_q_tol_ = 2.0 * kPi / 180.0;
+  double reverse_xyz_tol_ = 0.003;
+
+  bool line_diag_enable_ = false;
+  static constexpr size_t kLineDiagCap = 4096;
+  std::vector<LineDiagEvent> line_diag_ring_;
+  size_t line_diag_begin_ = 0;
+  size_t line_diag_count_ = 0;
+  size_t line_diag_overflows_ = 0;
+  void line_diag_push(LineDiagLayer layer, const Vec18& q, const Vec18& q_aux,
+                      double prog, double build_ms, const char* candidate,
+                      const char* decision);
 
   Kinematics& kin_;
   JointVelocityLimits limits_;

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <chrono>
 
 #include <Eigen/Cholesky>
@@ -127,6 +128,113 @@ void CartesianTracker::line_clear() {
   line_rate_ = 0.0;
   line_tip_.reset();
   line_reference_.reset();
+  last_line_cache_committed_ = false;
+  reverse_decision_ = reverse_last_line_enable_ ? "skipped" : "disabled";
+}
+
+void CartesianTracker::clear_last_line_cache() {
+  last_line_cache_ = LastLineCache{};
+  last_line_cache_committed_ = false;
+}
+
+void CartesianTracker::set_line_diag_enable(bool enable) {
+  line_diag_enable_ = enable;
+  if (enable && line_diag_ring_.empty()) {
+    line_diag_ring_.assign(kLineDiagCap, LineDiagEvent{});
+  }
+  if (!enable) {
+    line_diag_begin_ = 0;
+    line_diag_count_ = 0;
+    line_diag_overflows_ = 0;
+  }
+}
+
+size_t CartesianTracker::line_diag_size() const { return line_diag_count_; }
+
+void CartesianTracker::line_diag_clear() {
+  line_diag_begin_ = 0;
+  line_diag_count_ = 0;
+  line_diag_overflows_ = 0;
+}
+
+std::vector<CartesianTracker::LineDiagEvent> CartesianTracker::line_diag_snapshot() const {
+  std::vector<LineDiagEvent> out;
+  out.reserve(line_diag_count_);
+  for (size_t i = 0; i < line_diag_count_; ++i) {
+    out.push_back(line_diag_ring_[(line_diag_begin_ + i) % kLineDiagCap]);
+  }
+  return out;
+}
+
+void CartesianTracker::line_diag_push(
+    LineDiagLayer layer, const Vec18& q, const Vec18& q_aux, double prog,
+    double build_ms, const char* candidate, const char* decision) {
+  if (!line_diag_enable_) return;
+  if (line_diag_ring_.empty()) {
+    line_diag_ring_.assign(kLineDiagCap, LineDiagEvent{});
+  }
+  LineDiagEvent ev;
+  ev.layer = layer;
+  ev.goal_generation = goal_generation_;
+  ev.line_gen = line_gen_;
+  ev.t_steady_s = std::chrono::duration<double>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count();
+  ev.prog = prog;
+  ev.build_ms = build_ms;
+  ev.q = q;
+  ev.q_aux = q_aux;
+  if (candidate) {
+    std::snprintf(ev.candidate, sizeof(ev.candidate), "%s", candidate);
+  }
+  if (decision) {
+    std::snprintf(ev.decision, sizeof(ev.decision), "%s", decision);
+  }
+  if (line_diag_count_ < kLineDiagCap) {
+    line_diag_ring_[(line_diag_begin_ + line_diag_count_) % kLineDiagCap] = ev;
+    ++line_diag_count_;
+  } else {
+    line_diag_ring_[line_diag_begin_] = ev;
+    line_diag_begin_ = (line_diag_begin_ + 1) % kLineDiagCap;
+    ++line_diag_overflows_;
+  }
+}
+
+void CartesianTracker::line_diag_push_feedback(const Vec18& q_meas, double source_stamp_s) {
+  if (!line_diag_enable_ || !q_meas.allFinite()) return;
+  Vec18 aux = Vec18::Zero();
+  aux[0] = source_stamp_s;
+  line_diag_push(LineDiagLayer::Feedback, q_meas, aux, line_.prog, 0.0,
+                 line_.candidate.c_str(), "feedback");
+}
+
+void CartesianTracker::maybe_commit_last_line_cache(const Vec18& q_meas) {
+  if (!reverse_last_line_enable_ || last_line_cache_committed_ || !line_.on ||
+      line_.samples.size() < 2 || !line_.hold) {
+    return;
+  }
+  if (!q_meas.allFinite()) return;
+  // Only cache after the measured tip is inside the tube of the commanded end.
+  if (!line_measured_arrived(q_meas) &&
+      (kin_.fk_pos(q_meas, line_.frame) - line_.target).norm() > reverse_xyz_tol_) {
+    return;
+  }
+  LastLineCache cache;
+  cache.valid = true;
+  cache.left = line_.left;
+  cache.ori_on = line_.ori_on;
+  cache.frame = line_.frame;
+  cache.start_xyz = kin_.fk_pos(line_.samples.front(), line_.frame);
+  cache.end_xyz = line_.target;
+  cache.start_quat = rot_to_quat_xyzw(
+      kin_.fk(line_.samples.front(), line_.frame).block<3, 3>(0, 0));
+  cache.end_quat = line_.quat;
+  cache.q_start = line_.samples.front();
+  cache.q_end = line_.samples.back();
+  cache.samples = line_.samples;
+  cache.generation = goal_generation_;
+  last_line_cache_ = std::move(cache);
+  last_line_cache_committed_ = true;
 }
 
 bool CartesianTracker::line_target_far(const Vec3& target, const Vec4* quat) const {
@@ -272,7 +380,8 @@ bool CartesianTracker::line_fit(
     const Vec18& q0, int arm_begin, const Vec3& target, const Vec4* quat, bool ori_on,
     bool lock_waist, const std::string& frame,
     std::vector<Vec18, Eigen::aligned_allocator<Vec18>>& samples,
-    bool& waist_locked, bool allow_relock, const Vec18* goal_seed) const {
+    bool& waist_locked, bool allow_relock, const Vec18* goal_seed,
+    const Vec18* pose_pref) const {
   const Vec3 p0 = kin_.fk_pos(q0, frame);
   const double dist = (target - p0).norm();
   int n = 1;
@@ -338,7 +447,6 @@ bool CartesianTracker::line_fit(
     }
     return w;
   };
-
   Vec4 q_ori0(0.0, 0.0, 0.0, 1.0);
   Vec4 q_ori1 = q_ori0;
   if (ori_on && quat != nullptr) {
@@ -420,6 +528,54 @@ bool CartesianTracker::line_fit(
     return next;
   };
 
+  // Task-priority nullspace pull toward shoulder J2 / elbow J4 preferences.
+  // Accept a step only when Cartesian residual stays within the solve tolerance.
+  auto refine_pose = [&](Red& y, int index) {
+    if (pose_pref == nullptr) {
+      return;
+    }
+    constexpr int kJ2 = 1;
+    constexpr int kJ4 = 3;
+    for (int it = 0; it < 24; ++it) {
+      Eigen::Matrix<double, 6, kRed> jac;
+      Eigen::Matrix<double, 6, 1> err;
+      double ori_rad = 0.0;
+      task(y, index, jac, err, ori_rad);
+      if (err.head<3>().norm() > kLineSolveTolM || (ori_on && ori_rad > 0.08)) {
+        break;
+      }
+      Red desire = Red::Zero();
+      desire[kNWaist + kJ2] = (*pose_pref)[arm_begin + kJ2] - y[kNWaist + kJ2];
+      desire[kNWaist + kJ4] = (*pose_pref)[arm_begin + kJ4] - y[kNWaist + kJ4];
+      if (desire.norm() < 1e-4) {
+        break;
+      }
+      Eigen::Matrix<double, 6, 6> jjt = jac * jac.transpose();
+      jjt.diagonal().array() += 1e-6;
+      const Eigen::LDLT<Eigen::Matrix<double, 6, 6>> ldlt(jjt);
+      if (ldlt.info() != Eigen::Success) {
+        break;
+      }
+      const Eigen::Matrix<double, kRed, 6> j_pinv =
+          jac.transpose() * ldlt.solve(Eigen::Matrix<double, 6, 6>::Identity());
+      // Allow waist in the nullspace; acceptance still gates waist path budget.
+      const Red dy =
+          j_pinv * err + (MatR::Identity() - j_pinv * jac) * (line_pose_pref_w_ * desire);
+      const Red next = limited_step(y, dy);
+      Eigen::Matrix<double, 6, kRed> jac2;
+      Eigen::Matrix<double, 6, 1> err2;
+      double ori2 = 0.0;
+      task(next, index, jac2, err2, ori2);
+      if (err2.head<3>().norm() > kLineSolveTolM || (ori_on && ori2 > 0.08)) {
+        break;
+      }
+      if ((next - y).norm() < 1e-5) {
+        break;
+      }
+      y = next;
+    }
+  };
+
   Red y_goal = pack(goal_seed?*goal_seed:q0);
   clamp_y(y_goal);
   double w_scale = 1.0;
@@ -463,6 +619,7 @@ bool CartesianTracker::line_fit(
     }
     y_goal = next;
   }
+  refine_pose(y_goal, n);
   {
     const double goal_err =
         (p_des[static_cast<std::size_t>(n)] - kin_.fk_pos(expand(y_goal), frame)).norm();
@@ -515,6 +672,7 @@ bool CartesianTracker::line_fit(
       }
       path[static_cast<std::size_t>(i)] = next;
     }
+    refine_pose(path[static_cast<std::size_t>(i)], i);
   }
   keep_com(path);
   if (worst_pos(path) > kLineSampleTolM) {
@@ -703,6 +861,7 @@ void CartesianTracker::refuse_line(const std::string& reason) {
   line_.reason = reason;
   last_arrived_ = false;
   line_rate_ = 0.0;
+  clear_last_line_cache();
 }
 
 bool CartesianTracker::line_needs_build(bool left, const Vec3& target, const Vec4* quat) const {
@@ -777,6 +936,7 @@ bool CartesianTracker::line_build(
   line_.reason = "geometry_or_orientation";
   line_.cascade_checked=line_tip_.has_value();
   line_.cascade_passed=false;
+  reverse_decision_=reverse_last_line_enable_ ? "skipped" : "disabled";
   if(torso_pitch_max_>0 && std::abs(q0.head<3>().sum())>torso_pitch_max_+0.001) {
     line_.reason="start_pitch_outside"; return false;
   }
@@ -794,24 +954,95 @@ bool CartesianTracker::line_build(
   };
   std::vector<Vec18,Eigen::aligned_allocator<Vec18>> samples;
   bool locked=true;
+  std::string candidate="none";
+  std::string pose_decision="disabled";
+  std::string reverse_decision=reverse_last_line_enable_ ? "skipped" : "disabled";
   const bool recovering_pitch=torso_pitch_max_>0 && std::abs(q0.head<3>().sum())>torso_pitch_max_+1e-6;
   if (recovering_pitch && upper_.waist_locked) { line_.reason="waist_locked_outside"; return false; }
-  bool ok=line_arm_only(q0,arm,target,quat,ori_on,frame,samples);
-  constexpr double fold_ok=16.0*kPi/180.0;
-  const bool locked_pass=!recovering_pitch && ok && max_arm_fold(samples,arm)<fold_ok && probe(samples);
-  bool forced=false;
-  if (!locked_pass) {
-    std::vector<Vec18,Eigen::aligned_allocator<Vec18>> free_samples;
-    bool free_locked=false;
-    const Vec18* recovery_seed=(recovering_pitch && ok && !samples.empty()) ? &samples.back() : nullptr;
-    const bool free_ok=!upper_.waist_locked && line_fit(q0,arm,target,quat,ori_on,false,
-        frame,free_samples,free_locked,!line_tip_.has_value() && !recovering_pitch,recovery_seed);
-    if (free_ok && (!recovering_pitch || (!free_locked && std::abs(free_samples.back().head<3>().sum())<=torso_pitch_max_+1e-7)) && probe(free_samples)) {
-      samples=std::move(free_samples); locked=free_locked; ok=true;
-      forced=line_tip_.has_value();
+
+  auto q_near=[&](const Vec18& a,const Vec18& b){
+    return (a-b).cwiseAbs().maxCoeff()<=reverse_q_tol_;
+  };
+  auto reverse_intent=[&](){
+    if(!reverse_last_line_enable_ || !last_line_cache_.valid || line_tip_.has_value()) return false;
+    const auto& c=last_line_cache_;
+    if(c.left!=left || c.frame!=frame || c.ori_on!=ori_on) return false;
+    if((target-c.start_xyz).norm()>reverse_xyz_tol_) return false;
+    if(ori_on && quat &&
+       ori_error_xyzw(*quat,c.start_quat).norm()>arrived_ori_rad_) return false;
+    return true;
+  };
+  bool ok=false;
+  if(reverse_intent()) {
+    const auto& c=last_line_cache_;
+    if(!q_near(q0,c.q_end)) {
+      reverse_decision="rejected_qb_mismatch";
+      clear_last_line_cache();
+    } else if(c.samples.size()<2) {
+      reverse_decision="rejected_empty_cache";
+      clear_last_line_cache();
     } else {
-      ok=false;
-      if (line_tip_) line_.reason="cascade_unreachable";
+      std::vector<Vec18,Eigen::aligned_allocator<Vec18>> rev;
+      rev.reserve(c.samples.size());
+      for(auto it=c.samples.rbegin(); it!=c.samples.rend(); ++it) rev.push_back(*it);
+      // Re-anchor endpoints to the live q0 / Cartesian target while keeping the
+      // interior nominal samples (equal Cartesian progress, not servo timing).
+      rev.front()=q0;
+      if(!line_validate(rev,target,quat,ori_on,frame) || !probe(rev)) {
+        reverse_decision="rejected_validate";
+      } else {
+        const bool waist_moves=(rev.back().head<kNWaist>()-rev.front().head<kNWaist>())
+                                   .cwiseAbs().maxCoeff()>waist_lock_eps_;
+        if(upper_.waist_locked && waist_moves) {
+          reverse_decision="rejected_waist_locked";
+        } else {
+          samples=std::move(rev); locked=!waist_moves; ok=true;
+          candidate="reverse_cache"; reverse_decision="accepted";
+        }
+      }
+      if(!ok) {
+        // Second candidate: re-solve B→A with terminal seed = cached qA.
+        std::vector<Vec18,Eigen::aligned_allocator<Vec18>> seeded;
+        bool seed_locked=false;
+        if(!upper_.waist_locked &&
+           line_fit(q0,arm,target,quat,ori_on,false,frame,seeded,seed_locked,true,&c.q_start) &&
+           (!recovering_pitch || (!seed_locked && !seeded.empty() &&
+             std::abs(seeded.back().head<3>().sum())<=torso_pitch_max_+1e-7)) &&
+           probe(seeded) && line_validate(seeded,target,quat,ori_on,frame)) {
+          samples=std::move(seeded); locked=seed_locked; ok=true;
+          candidate="qa_seed";
+          reverse_decision="qa_seed_accepted;reverse_rejected_validate";
+        } else {
+          reverse_decision=reverse_decision+";qa_seed_rejected";
+        }
+      }
+    }
+  } else if(reverse_last_line_enable_) {
+    reverse_decision="skipped_no_match";
+  }
+
+  if(!ok) ok=line_arm_only(q0,arm,target,quat,ori_on,frame,samples);
+  constexpr double fold_ok=16.0*kPi/180.0;
+  bool forced=false;
+  if(candidate!="reverse_cache" && candidate!="qa_seed") {
+    const double arm_fold=ok?max_arm_fold(samples,arm):0.0;
+    const bool locked_pass=!recovering_pitch && ok && arm_fold<fold_ok && probe(samples);
+    if (locked_pass) {
+      candidate="arm_only";
+    } else {
+      std::vector<Vec18,Eigen::aligned_allocator<Vec18>> free_samples;
+      bool free_locked=false;
+      const Vec18* recovery_seed=(recovering_pitch && ok && !samples.empty()) ? &samples.back() : nullptr;
+      const bool free_ok=!upper_.waist_locked && line_fit(q0,arm,target,quat,ori_on,false,
+          frame,free_samples,free_locked,!line_tip_.has_value() && !recovering_pitch,recovery_seed);
+      if (free_ok && (!recovering_pitch || (!free_locked && std::abs(free_samples.back().head<3>().sum())<=torso_pitch_max_+1e-7)) && probe(free_samples)) {
+        samples=std::move(free_samples); locked=free_locked; ok=true;
+        forced=line_tip_.has_value();
+        candidate="free_fit";
+      } else {
+        ok=false;
+        if (line_tip_) line_.reason="cascade_unreachable";
+      }
     }
   }
   // A bounded second seed is derived from the real next pose: solve the tip,
@@ -828,6 +1059,7 @@ bool CartesianTracker::line_build(
       if(line_fit(q0,arm,target,quat,ori_on,false,frame,trial,trial_locked,false,&seed) &&
          (!recovering_pitch || (!trial_locked && !trial.empty() && std::abs(trial.back().head<3>().sum())<=torso_pitch_max_+1e-7)) && probe(trial)) {
         samples=std::move(trial);locked=trial_locked;forced=true;ok=true;
+        candidate="tip_seed";
       }
     }
   }
@@ -846,10 +1078,103 @@ bool CartesianTracker::line_build(
                 tip.ori_on,false,frame,next,next_locked)) {
       samples=std::move(trial);locked=trial_locked;forced=true;ok=true;
       cascade_full_body=true;
+      candidate="cascade_full_body";
     }
   }
+
+  auto path_len=[&](const std::vector<Vec18,Eigen::aligned_allocator<Vec18>>& path,int begin,int count){
+    double s=0.0;
+    for(std::size_t i=1;i<path.size();++i){
+      s+=(path[i]-path[i-1]).segment(begin,count).cwiseAbs().sum();
+    }
+    return s;
+  };
+  auto elbow_err=[&](const std::vector<Vec18,Eigen::aligned_allocator<Vec18>>& path){
+    if(path.empty()) return 0.0;
+    return std::abs(path.back()[arm+3]-line_q_pref_[arm+3]);
+  };
+  // Optional posture candidate: only after a feasible baseline exists, waist may
+  // move, and loaded q_pref is available. Default-off; never loosens hard checks.
+  // Evidence on field exit fixtures: baseline often selects free_fit (arm-only
+  // fails), still with large elbow deviation. Allow pose_pref on both.
+  // Skip for reverse_cache / qa_seed — those already restore a known posture.
+  const bool pose_eligible =
+      candidate == "arm_only" || candidate == "free_fit";
+  // Pitch-recovery segments may still accept free_fit; allow pose_pref with the
+  // same end-pitch gate used by free_fit, without relaxing the pitch limit.
+  if(ok && !samples.empty() && line_pose_pref_enable_ && !upper_.waist_locked &&
+     pose_eligible) {
+    const double base_elbow=elbow_err(samples);
+    if(base_elbow < line_pose_pref_min_improve_) {
+      pose_decision="skipped_near_pref";
+    } else {
+      std::vector<Vec18,Eigen::aligned_allocator<Vec18>> pref_samples;
+      bool pref_locked=false;
+      // Seed from the accepted baseline endpoint so soft posture pull starts from a
+      // known feasible Cartesian solution instead of cold-starting near HOME.
+      const Vec18 seed=samples.back();
+      const bool fit_ok=line_fit(q0,arm,target,quat,ori_on,false,frame,pref_samples,
+          pref_locked,false,&seed,&line_q_pref_);
+      if(!fit_ok || pref_samples.empty()) {
+        pose_decision="rejected_fit";
+      } else if(pref_locked) {
+        pose_decision="rejected_relock";
+      } else if(recovering_pitch &&
+                std::abs(pref_samples.back().head<3>().sum())>torso_pitch_max_+1e-7) {
+        pose_decision="rejected_pitch";
+      } else if(!probe(pref_samples)) {
+        pose_decision="rejected_cascade";
+      } else if(!line_validate(pref_samples,target,quat,ori_on,frame)) {
+        pose_decision="rejected_validate";
+      } else {
+        const double improve=base_elbow-elbow_err(pref_samples);
+        const double waist_extra=path_len(pref_samples,0,kNWaist)-path_len(samples,0,kNWaist);
+        const double wrist_extra=path_len(pref_samples,arm+5,2)-path_len(samples,arm+5,2);
+        char metric[160];
+        std::snprintf(metric,sizeof(metric),
+            "improve_deg=%.3f;waist_extra_deg=%.3f;wrist_extra_deg=%.3f;elbow_end_err_deg=%.3f",
+            improve*180.0/kPi,waist_extra*180.0/kPi,wrist_extra*180.0/kPi,
+            elbow_err(pref_samples)*180.0/kPi);
+        if(improve < line_pose_pref_min_improve_) {
+          pose_decision=std::string("rejected_no_improve;")+metric;
+        } else if(waist_extra > line_pose_pref_waist_budget_) {
+          pose_decision=std::string("rejected_waist_budget;")+metric;
+        } else if(wrist_extra > line_pose_pref_wrist_budget_) {
+          pose_decision=std::string("rejected_wrist_budget;")+metric;
+        } else {
+          samples=std::move(pref_samples);
+          locked=pref_locked;
+          forced=line_tip_.has_value();
+          candidate="pose_pref";
+          pose_decision=std::string("accepted;")+metric;
+        }
+      }
+    }
+  } else if(!line_pose_pref_enable_) {
+    pose_decision="disabled";
+  } else if(ok && !pose_eligible) {
+    pose_decision="skipped_non_baseline";
+  } else if(upper_.waist_locked) {
+    pose_decision="skipped_waist_locked";
+  } else {
+    pose_decision="skipped";
+  }
+
   const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
-  if (!ok || samples.empty()) { if(recovering_pitch) line_.reason="pitch_recovery_infeasible"; line_.build_ms=ms; return false; }
+  reverse_decision_=reverse_decision;
+  if (!ok || samples.empty()) {
+    if(recovering_pitch) line_.reason="pitch_recovery_infeasible";
+    line_.build_ms=ms;
+    line_.reverse_decision=reverse_decision;
+    line_diag_push(LineDiagLayer::Build,q0,Vec18::Zero(),0.0,ms,candidate.c_str(),
+                   reverse_decision.c_str());
+    return false;
+  }
+  // Consumed or failed reverse intent must not be reused for a later segment.
+  if(candidate=="reverse_cache" || candidate=="qa_seed" ||
+     reverse_decision.rfind("rejected_",0)==0) {
+    clear_last_line_cache();
+  }
   LineRun built;
   built.on=true; built.left=left; built.ori_on=ori_on; built.waist_locked=locked;
   built.target=target; built.quat=ori_on?*quat:Vec4(0,0,0,1); built.frame=frame;
@@ -857,8 +1182,15 @@ bool CartesianTracker::line_build(
   built.cascade_checked=line_tip_.has_value(); built.cascade_passed=line_tip_.has_value();
   built.cascade_forced_waist=forced;
   built.cascade_full_body=cascade_full_body;
+  built.candidate=candidate;
+  built.pose_pref_decision=pose_decision;
+  built.reverse_decision=reverse_decision;
+  built.max_arm_fold=max_arm_fold(built.samples,arm);
   built.frozen=dist<=kLineBrakeM;
   line_=std::move(built); line_q_=q0; line_rate_=0.0; ++line_gen_;
+  last_line_cache_committed_=false;
+  line_diag_push(LineDiagLayer::Build,q0,line_.samples.back(),0.0,ms,candidate.c_str(),
+                 reverse_decision.c_str());
   return true;
 }
 
@@ -930,6 +1262,7 @@ bool CartesianTracker::follow_line(
 
   if (line_.hold && same) {
     last_arrived_ = true;
+    maybe_commit_last_line_cache(q0);
     out.dq.setZero();
     return true;
   }
@@ -972,16 +1305,23 @@ bool CartesianTracker::follow_line(
   if(at_end && remain<=kLineSampleTolM && ori_ok &&
       line_rate_<=0.1*line_speed_scale_+1e-9) {
     line_.hold=true;line_q_=q_from;line_rate_=0;last_arrived_=true;
+    maybe_commit_last_line_cache(q0);
+    line_diag_push(LineDiagLayer::FollowCommit,q_from,q0,line_.prog,0.0,
+                   line_.candidate.c_str(),"hold");
     out.dq.setZero();return true;
   }
   Vec18 next = q_from;
   if (line_rate_ > 1e-4 && !line_path_qp(q_from,line_.prog,step_lim,next)) {
     line_.prog=old_prog; refuse_line(line_.reason.empty()?"path_qp_or_tube":line_.reason); out.dq.setZero(); return false;
   }
+  line_diag_push(LineDiagLayer::FollowQp,next,q_from,line_.prog,0.0,
+                 line_.candidate.c_str(),"qp");
   const Vec18 dq=next-q_from;
   line_q_=next;
   if((line_.target-kin_.fk_pos(next,line_.frame)).norm()<=kLineBrakeM) line_.frozen=true;
   last_arrived_ = false;
+  line_diag_push(LineDiagLayer::FollowCommit,next,q0,line_.prog,0.0,
+                 line_.candidate.c_str(),"commit");
   out.dq = dq;
   return true;
 }

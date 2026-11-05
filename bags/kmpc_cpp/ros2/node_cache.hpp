@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -291,12 +292,17 @@ class StateAggregator {
   explicit StateAggregator(double timeout_sec = 0.5)
       : timeout_sec_(timeout_sec) {}
 
-  void on_q(const Vec18& q, const std::vector<std::string>& missing) {
+  void on_q(const Vec18& q, const std::vector<std::string>& missing,
+            bool has_source_stamp = false, int32_t source_sec = 0,
+            uint32_t source_nsec = 0) {
     std::lock_guard<std::mutex> lock(mu_);
     q_ = q;
     stamp_ = std::chrono::steady_clock::now();
     has_ = true;
     last_missing_ = missing;
+    has_source_stamp_ = has_source_stamp;
+    source_sec_ = source_sec;
+    source_nsec_ = source_nsec;
   }
 
   std::optional<Vec18> read() const {
@@ -313,6 +319,28 @@ class StateAggregator {
     return q_;
   }
 
+  // Local receive age of the last /joint_states sample (steady clock).
+  double receive_age_s() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!has_) return -1.0;
+    return std::chrono::duration<double>(
+               std::chrono::steady_clock::now() - stamp_)
+        .count();
+  }
+
+  bool has_source_stamp() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return has_ && has_source_stamp_;
+  }
+
+  // ROS header stamp from JointState when present; seconds since epoch.
+  double source_stamp_s() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!has_ || !has_source_stamp_) return -1.0;
+    return static_cast<double>(source_sec_) +
+           1e-9 * static_cast<double>(source_nsec_);
+  }
+
   std::vector<std::string> last_missing() const {
     std::lock_guard<std::mutex> lock(mu_);
     return last_missing_;
@@ -324,6 +352,9 @@ class StateAggregator {
   Vec18 q_ = Vec18::Zero();
   std::chrono::steady_clock::time_point stamp_{};
   bool has_ = false;
+  bool has_source_stamp_ = false;
+  int32_t source_sec_ = 0;
+  uint32_t source_nsec_ = 0;
   std::vector<std::string> last_missing_;
 };
 

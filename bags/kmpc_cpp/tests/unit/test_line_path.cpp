@@ -456,3 +456,148 @@ TEST(LinePath, Robot03PlacementAllowsConstrainedWaistInSuccessor) {
   EXPECT_TRUE(locked.line_refused());
   EXPECT_FALSE(locked.line_cascade_full_body());
 }
+
+TEST(LinePath, ReverseLastLineRestoresQaWhenEnabled) {
+  const auto cfg_all = kmpc::Config::load(
+      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+  kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
+  kmpc::CartesianTracker tracker(kin, cfg_all);
+  tracker.set_reverse_last_line_enable(true);
+  tracker.set_line_pace(0.6, 0.0);
+  kmpc::Vec18 q = cfg_all.q_pref;
+  const kmpc::Vec18 qA = q;
+  const kmpc::Vec3 pA = kin.fk_pos(q, kmpc::kEeFrameLeft);
+  const auto posed = kin.fk(q, kmpc::kEeFrameLeft);
+  const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
+  const kmpc::Vec3 pB = pA + kmpc::Vec3(0.08, 0.0, 0.0);
+
+  ASSERT_TRUE(tracker.rearm_line(1));
+  bool forward_ok = false;
+  for (int i = 0; i < 800; ++i) {
+    const auto step = tracker.compute(q, cfg_all.q_pref, &pB, nullptr, &quat, nullptr);
+    ASSERT_FALSE(tracker.line_refused()) << tracker.line_reason();
+    q += step.dq;
+    if (tracker.last_arrived()) {
+      forward_ok = true;
+      tracker.maybe_commit_last_line_cache(q);
+      break;
+    }
+  }
+  ASSERT_TRUE(forward_ok);
+  ASSERT_TRUE(tracker.last_line_cache().valid);
+  const auto forward_samples = tracker.last_line_cache().samples;
+  ASSERT_GE(forward_samples.size(), 2u);
+
+  ASSERT_TRUE(tracker.rearm_line(2));
+  const auto step0 = tracker.compute(q, cfg_all.q_pref, &pA, nullptr, &quat, nullptr);
+  ASSERT_FALSE(tracker.line_refused()) << tracker.line_reason();
+  EXPECT_EQ(tracker.line_candidate(), "reverse_cache")
+      << tracker.reverse_line_decision();
+  EXPECT_EQ(tracker.reverse_line_decision(), "accepted");
+  ASSERT_EQ(tracker.line_sample_count(), forward_samples.size());
+  for (size_t i = 0; i < forward_samples.size(); ++i) {
+    const auto& got = tracker.line_samples()[i];
+    const auto& want = forward_samples[forward_samples.size() - 1 - i];
+    // First sample is re-anchored to live qB; remaining match reverse cache.
+    if (i == 0) {
+      EXPECT_LT((got - q).cwiseAbs().maxCoeff(), 1e-12);
+    } else {
+      EXPECT_LT((got - want).cwiseAbs().maxCoeff(), 1e-9) << "sample " << i;
+    }
+  }
+  bool back_ok = false;
+  for (int i = 0; i < 800; ++i) {
+    const auto step = tracker.compute(q, cfg_all.q_pref, &pA, nullptr, &quat, nullptr);
+    ASSERT_FALSE(tracker.line_refused()) << tracker.line_reason();
+    q += step.dq;
+    if (tracker.last_arrived()) {
+      back_ok = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(back_ok);
+  EXPECT_LT((kin.fk_pos(q, kmpc::kEeFrameLeft) - pA).norm(), 0.003);
+  EXPECT_LT((q - qA).cwiseAbs().maxCoeff(), 2.0 * kmpc::kPi / 180.0)
+      << "qA recovery " << (q - qA).cwiseAbs().transpose();
+  (void)step0;
+}
+
+TEST(LinePath, ReverseDisabledKeepsBaseline) {
+  const auto cfg_all = kmpc::Config::load(
+      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+  kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
+  kmpc::CartesianTracker tracker(kin, cfg_all);
+  tracker.set_line_pace(0.6, 0.0);
+  kmpc::Vec18 q = cfg_all.q_pref;
+  const kmpc::Vec3 pA = kin.fk_pos(q, kmpc::kEeFrameLeft);
+  const auto posed = kin.fk(q, kmpc::kEeFrameLeft);
+  const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
+  const kmpc::Vec3 pB = pA + kmpc::Vec3(0.06, 0.0, 0.0);
+  ASSERT_TRUE(tracker.rearm_line(1));
+  for (int i = 0; i < 800 && !tracker.last_arrived(); ++i) {
+    q += tracker.compute(q, cfg_all.q_pref, &pB, nullptr, &quat, nullptr).dq;
+  }
+  ASSERT_TRUE(tracker.last_arrived());
+  tracker.maybe_commit_last_line_cache(q);
+  EXPECT_FALSE(tracker.last_line_cache().valid);
+  ASSERT_TRUE(tracker.rearm_line(2));
+  tracker.compute(q, cfg_all.q_pref, &pA, nullptr, &quat, nullptr);
+  EXPECT_NE(tracker.line_candidate(), "reverse_cache");
+  EXPECT_EQ(tracker.reverse_line_decision(), "disabled");
+}
+
+TEST(LinePath, ReverseRejectsQbMismatch) {
+  const auto cfg_all = kmpc::Config::load(
+      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+  kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
+  kmpc::CartesianTracker tracker(kin, cfg_all);
+  tracker.set_reverse_last_line_enable(true);
+  tracker.set_line_pace(0.6, 0.0);
+  kmpc::Vec18 q = cfg_all.q_pref;
+  const kmpc::Vec3 pA = kin.fk_pos(q, kmpc::kEeFrameLeft);
+  const auto posed = kin.fk(q, kmpc::kEeFrameLeft);
+  const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
+  const kmpc::Vec3 pB = pA + kmpc::Vec3(0.07, 0.0, 0.0);
+  ASSERT_TRUE(tracker.rearm_line(1));
+  for (int i = 0; i < 800 && !tracker.last_arrived(); ++i) {
+    q += tracker.compute(q, cfg_all.q_pref, &pB, nullptr, &quat, nullptr).dq;
+  }
+  ASSERT_TRUE(tracker.last_arrived());
+  tracker.maybe_commit_last_line_cache(q);
+  ASSERT_TRUE(tracker.last_line_cache().valid);
+  q[4] += 10.0 * kmpc::kPi / 180.0;  // spoil qB
+  ASSERT_TRUE(tracker.rearm_line(2));
+  tracker.compute(q, cfg_all.q_pref, &pA, nullptr, &quat, nullptr);
+  EXPECT_NE(tracker.line_candidate(), "reverse_cache");
+  EXPECT_EQ(tracker.reverse_line_decision(), "rejected_qb_mismatch");
+  EXPECT_FALSE(tracker.last_line_cache().valid);
+}
+
+TEST(LinePath, LineDiagRingDefaultOffBounded) {
+  const auto cfg_all = kmpc::Config::load(
+      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+  kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
+  kmpc::CartesianTracker tracker(kin, cfg_all);
+  kmpc::Vec18 q = cfg_all.q_pref;
+  const kmpc::Vec3 p0 = kin.fk_pos(q, kmpc::kEeFrameLeft);
+  const auto posed = kin.fk(q, kmpc::kEeFrameLeft);
+  const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
+  const kmpc::Vec3 goal = p0 + kmpc::Vec3(0.05, 0.0, 0.0);
+  ASSERT_TRUE(tracker.rearm_line(1));
+  tracker.compute(q, cfg_all.q_pref, &goal, nullptr, &quat, nullptr);
+  EXPECT_EQ(tracker.line_diag_size(), 0u);
+
+  tracker.set_line_diag_enable(true);
+  ASSERT_TRUE(tracker.rearm_line(2));
+  for (int i = 0; i < 40; ++i) {
+    q += tracker.compute(q, cfg_all.q_pref, &goal, nullptr, &quat, nullptr).dq;
+  }
+  EXPECT_GT(tracker.line_diag_size(), 0u);
+  const auto snap = tracker.line_diag_snapshot();
+  EXPECT_EQ(snap.size(), tracker.line_diag_size());
+  bool saw_build = false;
+  for (const auto& ev : snap) {
+    if (ev.layer == kmpc::CartesianTracker::LineDiagLayer::Build) saw_build = true;
+  }
+  EXPECT_TRUE(saw_build);
+}

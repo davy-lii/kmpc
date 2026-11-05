@@ -194,6 +194,13 @@ class KmpcNode : public rclcpp::Node {
     hold_deadband_ = double_param("hold_deadband", 0.01);
     dq_scale_ = std::clamp(double_param("dq_scale", 1.0), 0.0, 1.0);
     line_dq_scale_ = std::clamp(double_param("line_dq_scale", 0.60), 0.0, 1.0);
+    line_pose_pref_enable_ = bool_param("line_pose_pref_enable", false);
+    tracker_->set_line_pose_pref(line_pose_pref_enable_);
+    tracker_->set_line_pose_pref_q(cfg_.q_pref);
+    reverse_last_line_enable_ = bool_param("reverse_last_line_enable", false);
+    tracker_->set_reverse_last_line_enable(reverse_last_line_enable_);
+    line_diag_enable_ = bool_param("line_diag_enable", false);
+    tracker_->set_line_diag_enable(line_diag_enable_);
     t0_ = now().seconds();
     configure_command_io();
     stream_topic_name_ = str_or("stream_topic", "/xoip/robot/multi_joint_servo_cmd");
@@ -425,6 +432,9 @@ class KmpcNode : public rclcpp::Node {
     declare_parameter("require_xoip", true);
     declare_parameter("dq_scale", 1.0);
     declare_parameter("line_dq_scale", 0.60);
+    declare_parameter("line_pose_pref_enable", false);
+    declare_parameter("reverse_last_line_enable", false);
+    declare_parameter("line_diag_enable", false);
     declare_parameter("stream_hz", 250.0);
     declare_parameter("interp_catch_s", 0.02);
     declare_parameter("interp_accel_s", 0.50);
@@ -479,7 +489,16 @@ class KmpcNode : public rclcpp::Node {
         missing.push_back(name);
       }
     }
-    state_->on_q(q, missing);
+    const bool has_stamp =
+        msg->header.stamp.sec != 0 || msg->header.stamp.nanosec != 0;
+    state_->on_q(q, missing, has_stamp, msg->header.stamp.sec,
+                 msg->header.stamp.nanosec);
+    if (line_diag_enable_ && tracker_) {
+      tracker_->line_diag_push_feedback(
+          q, has_stamp ? (static_cast<double>(msg->header.stamp.sec) +
+                          1e-9 * static_cast<double>(msg->header.stamp.nanosec))
+                       : -1.0);
+    }
     if (!missing.empty()) {
       RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 5000,
@@ -1095,6 +1114,11 @@ class KmpcNode : public rclcpp::Node {
               kmpc::Vec18 budget=kmpc::Vec18::Zero();budget[0]=excess;
               stream_pitch_filter_.reset(budget);
             }
+            // Worker cache mutations stay local; mirror consume/reject on main.
+            if(plan.candidate=="reverse_cache" || plan.candidate=="qa_seed" ||
+               plan.reverse_decision.rfind("rejected_",0)==0) {
+              tracker_->clear_last_line_cache();
+            }
             tracker_->adopt_line(std::move(plan));
           }
         } else if(!current) {++line_plan_discards_;}
@@ -1113,10 +1137,22 @@ class KmpcNode : public rclcpp::Node {
         const auto config=cfg_; const auto source=line_urdf_source_; const bool xml=line_urdf_xml_;
         const auto upper=result.command;
         line_pending_waist_locked_=upper.waist_locked;
-        line_future_=std::async(std::launch::async,[config,source,xml,target,q0,is_left,upper]() {
+        const bool pose_pref=line_pose_pref_enable_;
+        const bool reverse_line=reverse_last_line_enable_;
+        const bool diag=line_diag_enable_;
+        const kmpc::Vec18 q_pref=cfg_.q_pref;
+        const auto line_cache=tracker_->last_line_cache();
+        line_future_=std::async(std::launch::async,
+            [config,source,xml,target,q0,is_left,upper,pose_pref,reverse_line,diag,q_pref,line_cache]() {
           kmpc::Kinematics model(source,xml?kmpc::Kinematics::UrdfInput::Xml:kmpc::Kinematics::UrdfInput::Path);
           kmpc::CartesianTracker worker(model,config);
-          worker.set_upper_commands(upper); worker.rearm_line(target.generation,target.cascade);
+          worker.set_upper_commands(upper);
+          worker.set_line_pose_pref(pose_pref);
+          worker.set_line_pose_pref_q(q_pref);
+          worker.set_reverse_last_line_enable(reverse_line);
+          worker.import_last_line_cache(line_cache);
+          worker.set_line_diag_enable(diag);
+          worker.rearm_line(target.generation,target.cascade);
           return worker.prepare_line(q0,is_left,target.xyz,&target.quat_xyzw);
         });
         publish_cmd(q0,kmpc::Vec18::Zero(),0.0,true); return;
@@ -1420,6 +1456,9 @@ class KmpcNode : public rclcpp::Node {
     const bool arrived=tracker_->last_arrived() &&
         (!tracker_->line_active() || recovery_complete) &&
         (!line_done || (settled && measured && tracker_->line_measured_arrived(*measured)));
+    if(measured && line_done) {
+      tracker_->maybe_commit_last_line_cache(*measured);
+    }
     if(tracker_->line_refused() && (last_reported_line_stop_gen_!=tracker_->goal_generation() ||
         last_reported_line_stop_reason_!=tracker_->line_reason())) {
       last_reported_line_stop_gen_=tracker_->goal_generation();
@@ -1475,6 +1514,11 @@ class KmpcNode : public rclcpp::Node {
         " cascade=" + (tracker_->line_cascade_checked()?(tracker_->line_cascade_passed()?"passed":"failed"):"not_provided") +
         " forced_waist=" + std::to_string(tracker_->line_cascade_forced_waist()) +
         " cascade_full_body=" + std::to_string(tracker_->line_cascade_full_body()) +
+        " line_candidate=" + (tracker_->line_candidate().empty()?"none":tracker_->line_candidate()) +
+        " line_waist_locked=" + std::string(tracker_->line_waist_locked() ? "True" : "False") +
+        " pose_pref=" + (tracker_->line_pose_pref_decision().empty()?"disabled":tracker_->line_pose_pref_decision()) +
+        " reverse_line=" + (tracker_->reverse_line_decision().empty()?"disabled":tracker_->reverse_line_decision()) +
+        " max_arm_fold_deg=" + std::to_string(kmpc::rad_to_deg(tracker_->line_max_arm_fold())) +
         " line_build_ms=" + std::to_string(tracker_->line_build_ms()) +
         " line_samples=" + std::to_string(tracker_->line_sample_count()) +
         " line_length_m=" + std::to_string(tracker_->line_length()) +
@@ -1495,6 +1539,10 @@ class KmpcNode : public rclcpp::Node {
         " fail=" + std::to_string(fail_count_) +
         " line_dq=" + std::to_string(line_dq_scale_) +
         " dq_scale=" + std::to_string(dq_scale_) +
+        " js_source_stamp_s=" + std::to_string(state_->source_stamp_s()) +
+        " js_receive_age_s=" + std::to_string(state_->receive_age_s()) +
+        " line_diag_n=" + std::to_string(tracker_->line_diag_size()) +
+        " line_diag_overflow=" + std::to_string(tracker_->line_diag_overflows()) +
         " N=" + std::to_string(cfg_.params.n_horizon) +
         " qp_nodes=2 arrived=" + std::string(arrived ? "True" : "False") +
         " e0=" + std::to_string(e0) +
@@ -1617,6 +1665,9 @@ class KmpcNode : public rclcpp::Node {
   double hold_deadband_ = 0.01;
   double dq_scale_ = 1.0;
   double line_dq_scale_ = 0.60;
+  bool line_pose_pref_enable_ = false;
+  bool reverse_last_line_enable_ = false;
+  bool line_diag_enable_ = false;
   bool stream_dedicated_thread_ = true;
   double stream_debug_q_hz_ = 50.0;
   double stream_hz_ = 250.0;

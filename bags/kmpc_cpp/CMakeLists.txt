@@ -157,6 +157,8 @@ if(BUILD_TESTING)
   target_include_directories(test_line_segment PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/ros2")
   add_executable(replay_recent tests/replay/replay_recent.cpp)
   target_link_libraries(replay_recent PRIVATE kmpc_core)
+  add_executable(probe_field_line tests/replay/probe_field_line.cpp)
+  target_link_libraries(probe_field_line PRIVATE kmpc_core)
 endif()
 
 # Thor colcon 常关 BUILD_TESTING；插补单测仍要能编、能 ctest。

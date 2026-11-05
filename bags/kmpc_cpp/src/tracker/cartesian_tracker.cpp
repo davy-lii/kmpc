@@ -87,6 +87,7 @@ CartesianTracker::CartesianTracker(Kinematics& kin, const Config& cfg)
 
   const Vec18 q_cal = cfg.q_pref;
   q_yaw_pref_ = q_cal[kIdxYaw];
+  line_q_pref_ = q_cal;
   r_lambda_ = kin_.inertia_lambda(q_cal, r_arm_);
   z_home_ = kin_.fk_pos(q_cal, kEeFrameLeft)[2];
   z_star_ = z_home_;
