@@ -241,6 +241,12 @@ def _real_setup(context, *args, **kwargs):
             LaunchConfiguration('stream_dedicated_thread'), value_type=bool),
         'stream_debug_q_hz': ParameterValue(
             LaunchConfiguration('stream_debug_q_hz'), value_type=float),
+        'line_pose_pref_enable': ParameterValue(
+            LaunchConfiguration('line_pose_pref_enable'), value_type=bool),
+        'reverse_last_line_enable': ParameterValue(
+            LaunchConfiguration('reverse_last_line_enable'), value_type=bool),
+        'line_diag_enable': ParameterValue(
+            LaunchConfiguration('line_diag_enable'), value_type=bool),
     }))
     if use_rviz:
         actions.append(rviz_action(paths['rviz']))
@@ -280,6 +286,15 @@ def generate_real_launch():
         DeclareLaunchArgument(
             'stream_debug_q_hz', default_value='50.0',
             description='/kmpc/debug/q 频率；从 250 Hz 热路径降下来。0=不发'),
+        DeclareLaunchArgument(
+            'line_pose_pref_enable', default_value='false',
+            description='直线段默认关闭的姿态偏好候选'),
+        DeclareLaunchArgument(
+            'reverse_last_line_enable', default_value='false',
+            description='放置退回：复用上一成功直线 nominal samples 逆序候选'),
+        DeclareLaunchArgument(
+            'line_diag_enable', default_value='false',
+            description='启动晃动分层诊断环（默认关闭）'),
         OpaqueFunction(function=_real_setup),
     ])
 
