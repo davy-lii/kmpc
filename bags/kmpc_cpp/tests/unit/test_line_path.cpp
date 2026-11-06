@@ -600,4 +600,14 @@ TEST(LinePath, LineDiagRingDefaultOffBounded) {
     if (ev.layer == kmpc::CartesianTracker::LineDiagLayer::Build) saw_build = true;
   }
   EXPECT_TRUE(saw_build);
+  EXPECT_GT(snap.back().mono_ns, 0u);
+  EXPECT_EQ(snap.back().source_stamp_ns, -1);
+  EXPECT_GT(snap.back().seq, 0u);
+  tracker.set_line_diag_run_id(99);
+  tracker.line_diag_push_feedback(q, 12.5);
+  const auto after = tracker.line_diag_snapshot();
+  ASSERT_FALSE(after.empty());
+  EXPECT_EQ(after.back().run_id, 99u);
+  EXPECT_EQ(after.back().source_stamp_ns, 12500000000LL);
+  EXPECT_EQ(after.back().layer, kmpc::CartesianTracker::LineDiagLayer::Feedback);
 }

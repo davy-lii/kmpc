@@ -169,13 +169,22 @@ class CartesianTracker {
     char decision[48]{};
     Vec18 q = Vec18::Zero();
     Vec18 q_aux = Vec18::Zero();  // QP from / feedback, depending on layer
+    // steady_clock 纪元纳秒。source_stamp_ns 只在有消息头时填写，否则 -1。
+    uint64_t mono_ns = 0;
+    int64_t source_stamp_ns = -1;
+    uint64_t recv_mono_ns = 0;
+    uint64_t run_id = 0;
+    uint64_t seq = 0;
   };
   void set_line_diag_enable(bool enable);
+  void set_line_diag_run_id(uint64_t run_id) { line_diag_run_id_ = run_id; }
   bool line_diag_enabled() const { return line_diag_enable_; }
   size_t line_diag_overflows() const { return line_diag_overflows_; }
   size_t line_diag_size() const;
   // Oldest→newest copy; safe to call off the RT thread when diag is paused/off.
   std::vector<LineDiagEvent> line_diag_snapshot() const;
+  std::vector<LineDiagEvent> line_diag_take();
+  void line_diag_splice(const std::vector<LineDiagEvent>& events);
   void line_diag_clear();
   void line_diag_push_feedback(const Vec18& q_meas, double source_stamp_s);
 
@@ -279,6 +288,8 @@ class CartesianTracker {
     std::string reverse_decision = "disabled";
     double max_arm_fold = 0.0;
     std::string reason;
+    // 异步建线线程的诊断副本。adopt 后拆走，不参与跟踪计算。
+    std::vector<LineDiagEvent> diag_events;
     double build_ms = 0.0;
     Vec3 target = Vec3::Zero();
     Vec4 quat = Vec4(0.0, 0.0, 0.0, 1.0);
@@ -294,6 +305,10 @@ class CartesianTracker {
     return line_;
   }
   void adopt_line(LineRun plan) {
+    if (!plan.diag_events.empty()) {
+      line_diag_splice(plan.diag_events);
+      plan.diag_events.clear();
+    }
     reverse_decision_ = plan.reverse_decision.empty() ? reverse_decision_ : plan.reverse_decision;
     line_ = std::move(plan);
     if (!line_.samples.empty()) line_q_=line_.samples.front();
@@ -356,6 +371,9 @@ class CartesianTracker {
   double reverse_xyz_tol_ = 0.003;
 
   bool line_diag_enable_ = false;
+  uint64_t line_diag_run_id_ = 0;
+  uint64_t line_diag_seq_ = 0;
+  int64_t line_diag_source_ns_ = -1;
   static constexpr size_t kLineDiagCap = 4096;
   std::vector<LineDiagEvent> line_diag_ring_;
   size_t line_diag_begin_ = 0;

@@ -8,6 +8,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <deque>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -42,6 +44,7 @@
 #include "kmpc/upper_planner.hpp"
 #include "kmpc/whole_body_guards.hpp"
 #include "node_cache.hpp"
+#include "layer_diag.hpp"
 #include "line_stream.hpp"
 
 #ifdef KMPC_HAVE_XOIP
@@ -201,6 +204,10 @@ class KmpcNode : public rclcpp::Node {
     tracker_->set_reverse_last_line_enable(reverse_last_line_enable_);
     line_diag_enable_ = bool_param("line_diag_enable", false);
     tracker_->set_line_diag_enable(line_diag_enable_);
+    run_id_ = kmpc::ros2io::layer_diag_mono_ns();
+    tracker_->set_line_diag_run_id(run_id_);
+    layer_diag_path_ = str_or("layer_diag_path", "");
+    config_snapshot_path_ = str_or("config_snapshot_path", "");
     t0_ = now().seconds();
     configure_command_io();
     stream_topic_name_ = str_or("stream_topic", "/xoip/robot/multi_joint_servo_cmd");
@@ -211,6 +218,9 @@ class KmpcNode : public rclcpp::Node {
     stream_status_sub_ = create_subscription<xoip_ros2::msg::StreamStatus>(
         "/xoip/robot/stream_status", 10,
         [this](xoip_ros2::msg::StreamStatus::ConstSharedPtr msg) {
+          if (layer_diag_on_) {
+            note_sdk_status(msg->sequence, msg->last_send_ok, msg->active);
+          }
           if (msg->active && !msg->last_send_ok) {
             RCLCPP_WARN_THROTTLE(
                 get_logger(), *get_clock(), 1000,
@@ -382,6 +392,8 @@ class KmpcNode : public rclcpp::Node {
         create_publisher<visualization_msgs::msg::Marker>("/kmpc/debug/com_marker", 10);
 
     const double rate = std::max(cfg_.params.control_rate, 1.0);
+    emit_effective_config();
+    arm_layer_diag();
     timer_ = create_wall_timer(
         std::chrono::duration<double>(1.0 / rate),
         std::bind(&KmpcNode::on_timer, this));
@@ -412,7 +424,12 @@ class KmpcNode : public rclcpp::Node {
     }
   }
 
-  ~KmpcNode() override { stop_stream_thread(); }
+  ~KmpcNode() override {
+    stop_stream_thread();
+    if (layer_diag_on_) {
+      drain_layer_diag();
+    }
+  }
 
  private:
   void declare_params() {
@@ -435,6 +452,8 @@ class KmpcNode : public rclcpp::Node {
     declare_parameter("line_pose_pref_enable", false);
     declare_parameter("reverse_last_line_enable", false);
     declare_parameter("line_diag_enable", false);
+    declare_parameter<std::string>("layer_diag_path", "");
+    declare_parameter<std::string>("config_snapshot_path", "");
     declare_parameter("stream_hz", 250.0);
     declare_parameter("interp_catch_s", 0.02);
     declare_parameter("interp_accel_s", 0.50);
@@ -578,6 +597,13 @@ class KmpcNode : public rclcpp::Node {
         if(excess<=1e-9 && extra<=1e-9) stream_pitch_recovery_=false;
       }
       const kmpc::Vec18 filtered=line_smoother_.push(stream_raw_ref_,interp_dt_);
+      if (layer_diag_on_) {
+        const uint32_t line_gen = stream_line_gen_ < 0 ? 0u : static_cast<uint32_t>(stream_line_gen_);
+        push_stream_diag(kmpc::ros2io::LayerDiagLayer::StreamRawRef, stream_raw_ref_,
+                         stream_goal_gen_, line_gen, "raw", 0, false);
+        push_stream_diag(kmpc::ros2io::LayerDiagLayer::LineSmoother, filtered,
+                         stream_goal_gen_, line_gen, "smoothed", 0, false);
+      }
       if(!fault) fault=stream_filtered_fault(filtered,extra);
       if(fault) {
         RCLCPP_ERROR(get_logger(),"line stream fault gen=%llu reason=%s pitch=%.9fdeg limit=%.9fdeg start_excess=%.9frad allowed_extra=%.9frad recovery_ticks=%d",
@@ -631,12 +657,20 @@ class KmpcNode : public rclcpp::Node {
       }
       kmpc::Vec18 q = kmpc::Vec18::Zero();
       bool send = false;
+      uint64_t gen = 0;
+      uint32_t line_gen = 0;
       {
         std::lock_guard<std::mutex> lock(stream_mu_);
         send = stream_take_tick(&q);
+        gen = stream_goal_gen_;
+        line_gen = stream_line_gen_ < 0 ? 0u : static_cast<uint32_t>(stream_line_gen_);
       }
       if (send) {
-        publish_stream(q);
+        const uint64_t seq = publish_stream(q);
+        if (layer_diag_on_) {
+          push_stream_diag(kmpc::ros2io::LayerDiagLayer::FinalSend, q, gen, line_gen,
+                           "sent", seq, true);
+        }
         maybe_publish_debug_q(q);
       }
       next += period;
@@ -708,6 +742,7 @@ class KmpcNode : public rclcpp::Node {
     stream_line_from_ = continuing?stream_raw_ref_:interpolator_.q_ref();
     if(!continuing) {stream_raw_ref_=stream_line_from_;line_smoother_.reset(stream_line_from_);}
     stream_line_gen_ = tracker_->line_gen();
+    stream_goal_gen_ = tracker_->goal_generation();
     const kmpc::Vec18 cap=tracker_->effective_dq_max()*cfg_.params.dt*line_dq_scale_;
     // A genuinely invalid solve still fails. A valid solve can be slightly
     // longer than one tick relative to the reference advanced during solving.
@@ -1142,8 +1177,9 @@ class KmpcNode : public rclcpp::Node {
         const bool diag=line_diag_enable_;
         const kmpc::Vec18 q_pref=cfg_.q_pref;
         const auto line_cache=tracker_->last_line_cache();
+        const uint64_t run_id=run_id_;
         line_future_=std::async(std::launch::async,
-            [config,source,xml,target,q0,is_left,upper,pose_pref,reverse_line,diag,q_pref,line_cache]() {
+            [config,source,xml,target,q0,is_left,upper,pose_pref,reverse_line,diag,q_pref,line_cache,run_id]() {
           kmpc::Kinematics model(source,xml?kmpc::Kinematics::UrdfInput::Xml:kmpc::Kinematics::UrdfInput::Path);
           kmpc::CartesianTracker worker(model,config);
           worker.set_upper_commands(upper);
@@ -1152,8 +1188,11 @@ class KmpcNode : public rclcpp::Node {
           worker.set_reverse_last_line_enable(reverse_line);
           worker.import_last_line_cache(line_cache);
           worker.set_line_diag_enable(diag);
+          worker.set_line_diag_run_id(run_id);
           worker.rearm_line(target.generation,target.cascade);
-          return worker.prepare_line(q0,is_left,target.xyz,&target.quat_xyzw);
+          auto plan = worker.prepare_line(q0,is_left,target.xyz,&target.quat_xyzw);
+          plan.diag_events = worker.line_diag_take();
+          return plan;
         });
         publish_cmd(q0,kmpc::Vec18::Zero(),0.0,true); return;
       }
@@ -1211,6 +1250,7 @@ class KmpcNode : public rclcpp::Node {
       last_use_cart_ = use_cart;
       {
         std::lock_guard<std::mutex> lock(stream_mu_);
+        stream_goal_gen_ = tracker_->goal_generation();
         if (use_cart && tracker_->line_active()) {
           const kmpc::Vec18 q_path = tracker_->line_cmd();
           if (!q_path.allFinite()) {
@@ -1325,6 +1365,258 @@ class KmpcNode : public rclcpp::Node {
     interpolator_.set_jerk_s(interp_jerk_s_);
   }
 
+  void push_stream_diag(
+      kmpc::ros2io::LayerDiagLayer layer, const kmpc::Vec18& q, uint64_t gen,
+      uint32_t line_gen, const char* note, uint64_t seq_override, bool use_override) {
+    if (!layer_diag_on_) {
+      return;
+    }
+    kmpc::ros2io::LayerDiagSample sample;
+    sample.mono_ns = kmpc::ros2io::layer_diag_mono_ns();
+    sample.recv_mono_ns = sample.mono_ns;
+    sample.source_stamp_ns = -1;
+    sample.run_id = run_id_;
+    sample.goal_generation = gen;
+    sample.seq = use_override ? seq_override : ++stream_diag_seq_;
+    sample.line_gen = line_gen;
+    sample.layer = layer;
+    sample.next_layer = kmpc::ros2io::layer_diag_next(layer);
+    kmpc::ros2io::layer_diag_copy_q(&sample, q);
+    kmpc::ros2io::layer_diag_note(&sample, note);
+    stream_diag_q_.try_push(sample);
+  }
+
+  void note_sdk_status(uint64_t sequence, bool last_send_ok, bool active) {
+    kmpc::ros2io::LayerDiagSample sample;
+    sample.mono_ns = kmpc::ros2io::layer_diag_mono_ns();
+    sample.recv_mono_ns = sample.mono_ns;
+    sample.source_stamp_ns = -1;
+    sample.run_id = run_id_;
+    sample.goal_generation = 0;
+    sample.seq = sequence;
+    sample.layer = kmpc::ros2io::LayerDiagLayer::SdkStatus;
+    sample.next_layer = sample.layer;
+    const char* note = last_send_ok ? (active ? "active_ok" : "idle_ok") : "last_send_fail";
+    kmpc::ros2io::layer_diag_note(&sample, note);
+    if (sdk_notes_.size() >= 256) {
+      sdk_notes_.pop_front();
+      ++sdk_note_drops_;
+    }
+    sdk_notes_.push_back(sample);
+  }
+
+  void drain_layer_diag() {
+    if (!layer_diag_out_.is_open()) {
+      return;
+    }
+    kmpc::ros2io::LayerDiagSample batch[64];
+    for (;;) {
+      const size_t n = stream_diag_q_.try_pop(batch, 64);
+      for (size_t i = 0; i < n; ++i) {
+        layer_diag_out_ << kmpc::ros2io::layer_diag_jsonl(batch[i]) << '\n';
+      }
+      if (n < 64) {
+        break;
+      }
+    }
+    const uint64_t drops = stream_diag_q_.drops();
+    if (drops != exported_stream_drops_) {
+      layer_diag_out_ << kmpc::ros2io::layer_diag_overflow_jsonl(run_id_, drops) << '\n';
+      exported_stream_drops_ = drops;
+    }
+    if (tracker_ && line_diag_enable_) {
+      const uint64_t ov = tracker_->line_diag_overflows();
+      const auto events = tracker_->line_diag_snapshot();
+      size_t begin = 0;
+      if (ov == exported_tracker_overflows_ && events.size() >= exported_ring_n_) {
+        begin = exported_ring_n_;
+      }
+      for (size_t i = begin; i < events.size(); ++i) {
+        const auto& ev = events[i];
+        kmpc::ros2io::LayerDiagSample sample;
+        sample.mono_ns = ev.mono_ns;
+        sample.recv_mono_ns = ev.recv_mono_ns;
+        sample.source_stamp_ns = ev.source_stamp_ns;
+        sample.run_id = ev.run_id == 0 ? run_id_ : ev.run_id;
+        sample.goal_generation = ev.goal_generation;
+        sample.seq = ev.seq;
+        sample.line_gen = ev.line_gen < 0 ? 0u : static_cast<uint32_t>(ev.line_gen);
+        using L = kmpc::CartesianTracker::LineDiagLayer;
+        sample.layer = ev.layer == L::FollowQp
+                           ? kmpc::ros2io::LayerDiagLayer::FollowQp
+                           : ev.layer == L::FollowCommit
+                                 ? kmpc::ros2io::LayerDiagLayer::FollowCommit
+                                 : ev.layer == L::Feedback
+                                       ? kmpc::ros2io::LayerDiagLayer::Feedback
+                                       : kmpc::ros2io::LayerDiagLayer::Build;
+        sample.next_layer = kmpc::ros2io::layer_diag_next(sample.layer);
+        sample.prog = ev.prog;
+        kmpc::ros2io::layer_diag_copy_q(&sample, ev.q);
+        kmpc::ros2io::layer_diag_note(
+            &sample, ev.decision[0] != '\0' ? ev.decision : ev.candidate);
+        layer_diag_out_ << kmpc::ros2io::layer_diag_jsonl(sample) << '\n';
+      }
+      exported_ring_n_ = events.size();
+      if (ov != exported_tracker_overflows_) {
+        layer_diag_out_ << kmpc::ros2io::layer_diag_overflow_jsonl(run_id_, ov) << '\n';
+        exported_tracker_overflows_ = ov;
+      }
+    }
+    if (sdk_note_drops_ != exported_sdk_drops_) {
+      layer_diag_out_ << kmpc::ros2io::layer_diag_overflow_jsonl(run_id_, sdk_note_drops_)
+                      << '\n';
+      exported_sdk_drops_ = sdk_note_drops_;
+    }
+    while (!sdk_notes_.empty()) {
+      layer_diag_out_ << kmpc::ros2io::layer_diag_jsonl(sdk_notes_.front()) << '\n';
+      sdk_notes_.pop_front();
+    }
+    layer_diag_out_.flush();
+  }
+
+  void arm_layer_diag() {
+    layer_diag_on_ = false;
+    if (layer_diag_path_.empty()) {
+      return;
+    }
+    if (!line_diag_enable_) {
+      RCLCPP_WARN(get_logger(),
+                  "layer_diag_path is set but line_diag_enable is false; export stays off");
+      return;
+    }
+    layer_diag_out_.open(layer_diag_path_, std::ios::out | std::ios::trunc);
+    if (!layer_diag_out_) {
+      RCLCPP_ERROR(get_logger(), "cannot open layer diag %s; export stays off",
+                   layer_diag_path_.c_str());
+      return;
+    }
+    layer_diag_out_ << kmpc::ros2io::layer_diag_header_jsonl(run_id_) << '\n';
+    layer_diag_out_.flush();
+    layer_diag_on_ = true;
+    layer_diag_timer_ = create_wall_timer(
+        std::chrono::milliseconds(100),
+        std::bind(&KmpcNode::drain_layer_diag, this));
+    RCLCPP_INFO(get_logger(), "layer diag export on path=%s run_id=%llu",
+                layer_diag_path_.c_str(), static_cast<unsigned long long>(run_id_));
+  }
+
+  void emit_effective_config() {
+    const std::string params_file =
+        str_or("kmpc_params_file", default_config("kmpc_params.yaml"));
+    const std::string limits_file =
+        str_or("joint_limits_file", default_config("joint_limits.yaml"));
+    std::vector<kmpc::ros2io::ConfigSnapshotRow> rows;
+    auto add = [&](const std::string& name, const std::string& value, const char* unit,
+                   const std::string& source, const char* range, bool ok) {
+      rows.push_back({name, value, unit, source, range, ok});
+    };
+    auto num = [&](const char* name, double value, const char* unit,
+                   const std::string& source, const char* range, bool ok) {
+      char buf[64];
+      std::snprintf(buf, sizeof(buf), "%.9g", value);
+      add(name, buf, unit, source, range, ok && std::isfinite(value));
+    };
+    auto ros_num = [&](const char* name, double fallback, double effective, const char* unit,
+                       const char* range) {
+      const double raw = double_param(name, fallback);
+      num(name, effective, unit, raw == fallback ? "node_default" : "ros_override", range,
+          true);
+    };
+    auto ros_bool = [&](const char* name, bool fallback) {
+      const bool value = bool_param(name, fallback);
+      add(name, value ? "true" : "false", "bool",
+          value == fallback ? "node_default" : "ros_override", "true|false", true);
+    };
+    const auto& p = cfg_.params;
+    num("dt", p.dt, "s", params_file, ">0", p.dt > 0.0);
+    num("control_rate", p.control_rate, "Hz", params_file, ">=1", p.control_rate >= 1.0);
+    num("n_horizon", static_cast<double>(p.n_horizon), "steps", params_file, ">=1",
+        p.n_horizon >= 1);
+    num("q_limit_margin", p.q_limit_margin, "rad", params_file, "finite", true);
+    num("arrived_err", p.arrived_err, "m", params_file, "finite", true);
+    num("arrived_ori_rad", p.arrived_ori_rad, "rad", params_file, "finite", true);
+    num("com_xmin", p.com_xmin, "m", params_file, "finite", true);
+    num("com_xmax", p.com_xmax, "m", params_file, "finite", true);
+    num("com_ymin", p.com_ymin, "m", params_file, "finite", true);
+    num("com_ymax", p.com_ymax, "m", params_file, "finite", true);
+    num("com_margin", p.com_margin, "m", params_file, "finite", true);
+    num("torso_pitch_max_deg", p.torso_pitch_max_deg, "deg", params_file, "finite", true);
+    num("calib_tol_rad", p.calib_tol_rad, "rad", params_file, "finite", true);
+    for (int i = 0; i < kmpc::kNDof; ++i) {
+      const std::string joint(kmpc::kJointNames[static_cast<std::size_t>(i)]);
+      num(("q_min." + joint).c_str(), cfg_.limits.q_min[i], "rad", limits_file, "finite",
+          true);
+      num(("q_max." + joint).c_str(), cfg_.limits.q_max[i], "rad", limits_file, "finite",
+          true);
+      num(("dq_max." + joint).c_str(), cfg_.limits.dq_max[i], "rad/s", limits_file, ">=0",
+          cfg_.limits.dq_max[i] >= 0.0);
+    }
+    ros_num("dq_scale", 1.0, dq_scale_, "1", "[0,1]");
+    ros_num("line_dq_scale", 0.60, line_dq_scale_, "1", "[0,1]");
+    ros_num("stream_hz", 250.0, stream_hz_, "Hz", ">0");
+    ros_num("interp_catch_s", 0.02, interp_catch_s_, "s", ">0");
+    ros_num("interp_accel_s", 0.50, interp_accel_s_, "s", ">0");
+    ros_num("interp_jerk_s", 0.08, interp_jerk_s_, "s", ">0");
+    ros_num("stream_debug_q_hz", 50.0, stream_debug_q_hz_, "Hz", ">=0");
+    ros_num("state_timeout_sec", 0.1, double_param("state_timeout_sec", 0.1), "s", "finite");
+    ros_num("hold_deadband", 0.01, hold_deadband_, "rad", "finite");
+    ros_bool("line_diag_enable", false);
+    ros_bool("line_pose_pref_enable", false);
+    ros_bool("reverse_last_line_enable", false);
+    ros_bool("stream_dedicated_thread", true);
+    ros_bool("auto_enable", false);
+    ros_bool("waist_locked", false);
+    ros_bool("require_xoip", true);
+    add("stream_topic", stream_topic_name_, "topic", "ros_param", "nonempty",
+        !stream_topic_name_.empty());
+    add("joint_states_topic", str_or("joint_states_topic", "/joint_states"), "topic",
+        "ros_param", "nonempty", true);
+    add("layer_diag_path", layer_diag_path_, "path",
+        layer_diag_path_.empty() ? "node_default" : "ros_override", "empty_or_writable",
+        true);
+    add("config_snapshot_path", config_snapshot_path_, "path",
+        config_snapshot_path_.empty() ? "node_default" : "ros_override", "empty_or_writable",
+        true);
+    add("q_pref_station", str_or("q_pref_station", "default"), "name",
+        str_or("q_pref_file", default_config("q_pref.yaml")), "nonempty", true);
+    add("sdk_servo_msg",
+#ifdef KMPC_HAVE_XOIP
+        "xoip_ros2/MultiJointServoCommand",
+#else
+        "unavailable",
+#endif
+        "msg", "compile", "KMPC_HAVE_XOIP", 
+#ifdef KMPC_HAVE_XOIP
+        true
+#else
+        false
+#endif
+    );
+    const std::string json = kmpc::ros2io::config_snapshot_json(run_id_, "unrecorded", rows);
+    bool bad = false;
+    for (const auto& row : rows) {
+      if (!row.ok) {
+        bad = true;
+      }
+    }
+    if (!config_snapshot_path_.empty()) {
+      std::ofstream out(config_snapshot_path_, std::ios::out | std::ios::trunc);
+      if (!out) {
+        RCLCPP_ERROR(get_logger(), "cannot write config snapshot %s",
+                     config_snapshot_path_.c_str());
+      } else {
+        out << json << '\n';
+        RCLCPP_INFO(get_logger(), "config snapshot wrote %s rows=%zu run_id=%llu",
+                    config_snapshot_path_.c_str(), rows.size(),
+                    static_cast<unsigned long long>(run_id_));
+      }
+    }
+    RCLCPP_INFO(get_logger(), "effective_config %s", json.c_str());
+    if (bad) {
+      RCLCPP_ERROR(get_logger(), "effective config has a row marked ok=false");
+    }
+  }
+
 
 
   void release_waist_route() {
@@ -1371,10 +1663,10 @@ class KmpcNode : public rclcpp::Node {
 #endif
   }
 
-  void publish_stream(const kmpc::Vec18& q_rad) {
+  uint64_t publish_stream(const kmpc::Vec18& q_rad) {
 #ifdef KMPC_HAVE_XOIP
     if (!servo_pub_) {
-      return;
+      return 0;
     }
     const auto packed = kmpc::pack_stream_deg(q_rad);
     xoip_ros2::msg::MultiJointServoCommand msg;
@@ -1390,8 +1682,10 @@ class KmpcNode : public rclcpp::Node {
     add(kmpc::kRobotIdRight, packed.right_deg);
     add(kmpc::kRobotIdLeft, packed.left_deg);
     servo_pub_->publish(msg);
+    return msg.sequence;
 #else
     (void)q_rad;
+    return 0;
 #endif
   }
 
@@ -1408,12 +1702,20 @@ class KmpcNode : public rclcpp::Node {
   void on_stream_timer() {
     kmpc::Vec18 q = kmpc::Vec18::Zero();
     bool send = false;
+    uint64_t gen = 0;
+    uint32_t line_gen = 0;
     {
       std::lock_guard<std::mutex> lock(stream_mu_);
       send = stream_take_tick(&q);
+      gen = stream_goal_gen_;
+      line_gen = stream_line_gen_ < 0 ? 0u : static_cast<uint32_t>(stream_line_gen_);
     }
     if (send) {
-      publish_stream(q);
+      const uint64_t seq = publish_stream(q);
+      if (layer_diag_on_) {
+        push_stream_diag(kmpc::ros2io::LayerDiagLayer::FinalSend, q, gen, line_gen,
+                         "sent", seq, true);
+      }
       maybe_publish_debug_q(q);
     }
   }
@@ -1668,6 +1970,20 @@ class KmpcNode : public rclcpp::Node {
   bool line_pose_pref_enable_ = false;
   bool reverse_last_line_enable_ = false;
   bool line_diag_enable_ = false;
+  bool layer_diag_on_ = false;
+  uint64_t run_id_ = 0;
+  uint64_t stream_goal_gen_ = 0;
+  uint64_t stream_diag_seq_ = 0;
+  uint64_t exported_stream_drops_ = 0;
+  uint64_t exported_tracker_overflows_ = 0;
+  size_t exported_ring_n_ = 0;
+  uint64_t sdk_note_drops_ = 0;
+  uint64_t exported_sdk_drops_ = 0;
+  std::string layer_diag_path_;
+  std::string config_snapshot_path_;
+  std::ofstream layer_diag_out_;
+  std::deque<kmpc::ros2io::LayerDiagSample> sdk_notes_;
+  kmpc::ros2io::LayerDiagQueue<8192> stream_diag_q_;
   bool stream_dedicated_thread_ = true;
   double stream_debug_q_hz_ = 50.0;
   double stream_hz_ = 250.0;
@@ -1707,6 +2023,7 @@ class KmpcNode : public rclcpp::Node {
 
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::TimerBase::SharedPtr stream_timer_;
+  rclcpp::TimerBase::SharedPtr layer_diag_timer_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr alarm_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr enable_sub_;

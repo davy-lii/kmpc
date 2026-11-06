@@ -247,6 +247,8 @@ def _real_setup(context, *args, **kwargs):
             LaunchConfiguration('reverse_last_line_enable'), value_type=bool),
         'line_diag_enable': ParameterValue(
             LaunchConfiguration('line_diag_enable'), value_type=bool),
+        'layer_diag_path': LaunchConfiguration('layer_diag_path'),
+        'config_snapshot_path': LaunchConfiguration('config_snapshot_path'),
     }))
     if use_rviz:
         actions.append(rviz_action(paths['rviz']))
@@ -295,6 +297,12 @@ def generate_real_launch():
         DeclareLaunchArgument(
             'line_diag_enable', default_value='false',
             description='启动晃动分层诊断环（默认关闭）'),
+        DeclareLaunchArgument(
+            'layer_diag_path', default_value='',
+            description='分层诊断 JSONL 路径。空则不导出；须同时打开 line_diag_enable'),
+        DeclareLaunchArgument(
+            'config_snapshot_path', default_value='',
+            description='有效配置快照 JSON 路径。空则只打到启动日志'),
         OpaqueFunction(function=_real_setup),
     ])
 

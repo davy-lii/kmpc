@@ -184,6 +184,15 @@ void CartesianTracker::line_diag_push(
   ev.build_ms = build_ms;
   ev.q = q;
   ev.q_aux = q_aux;
+  ev.mono_ns = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+  ev.recv_mono_ns = ev.mono_ns;
+  ev.source_stamp_ns = line_diag_source_ns_;
+  ev.run_id = line_diag_run_id_;
+  ev.seq = ++line_diag_seq_;
+  line_diag_source_ns_ = -1;
   if (candidate) {
     std::snprintf(ev.candidate, sizeof(ev.candidate), "%s", candidate);
   }
@@ -200,8 +209,36 @@ void CartesianTracker::line_diag_push(
   }
 }
 
+std::vector<CartesianTracker::LineDiagEvent> CartesianTracker::line_diag_take() {
+  auto out = line_diag_snapshot();
+  line_diag_clear();
+  return out;
+}
+
+void CartesianTracker::line_diag_splice(const std::vector<LineDiagEvent>& events) {
+  if (!line_diag_enable_ || events.empty()) return;
+  if (line_diag_ring_.empty()) {
+    line_diag_ring_.assign(kLineDiagCap, LineDiagEvent{});
+  }
+  for (const LineDiagEvent& ev : events) {
+    if (line_diag_count_ < kLineDiagCap) {
+      line_diag_ring_[(line_diag_begin_ + line_diag_count_) % kLineDiagCap] = ev;
+      ++line_diag_count_;
+    } else {
+      line_diag_ring_[line_diag_begin_] = ev;
+      line_diag_begin_ = (line_diag_begin_ + 1) % kLineDiagCap;
+      ++line_diag_overflows_;
+    }
+  }
+}
+
 void CartesianTracker::line_diag_push_feedback(const Vec18& q_meas, double source_stamp_s) {
   if (!line_diag_enable_ || !q_meas.allFinite()) return;
+  if (source_stamp_s >= 0.0 && std::isfinite(source_stamp_s)) {
+    line_diag_source_ns_ = static_cast<int64_t>(std::llround(source_stamp_s * 1e9));
+  } else {
+    line_diag_source_ns_ = -1;
+  }
   Vec18 aux = Vec18::Zero();
   aux[0] = source_stamp_s;
   line_diag_push(LineDiagLayer::Feedback, q_meas, aux, line_.prog, 0.0,
