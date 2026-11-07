@@ -243,8 +243,6 @@ def _real_setup(context, *args, **kwargs):
             LaunchConfiguration('stream_debug_q_hz'), value_type=float),
         'line_pose_pref_enable': ParameterValue(
             LaunchConfiguration('line_pose_pref_enable'), value_type=bool),
-        'reverse_last_line_enable': ParameterValue(
-            LaunchConfiguration('reverse_last_line_enable'), value_type=bool),
         'line_diag_enable': ParameterValue(
             LaunchConfiguration('line_diag_enable'), value_type=bool),
         'layer_diag_path': LaunchConfiguration('layer_diag_path'),
@@ -291,9 +289,6 @@ def generate_real_launch():
         DeclareLaunchArgument(
             'line_pose_pref_enable', default_value='false',
             description='直线段默认关闭的姿态偏好候选'),
-        DeclareLaunchArgument(
-            'reverse_last_line_enable', default_value='false',
-            description='放置退回：复用上一成功直线 nominal samples 逆序候选'),
         DeclareLaunchArgument(
             'line_diag_enable', default_value='false',
             description='启动晃动分层诊断环（默认关闭）'),

@@ -200,8 +200,6 @@ class KmpcNode : public rclcpp::Node {
     line_pose_pref_enable_ = bool_param("line_pose_pref_enable", false);
     tracker_->set_line_pose_pref(line_pose_pref_enable_);
     tracker_->set_line_pose_pref_q(cfg_.q_pref);
-    reverse_last_line_enable_ = bool_param("reverse_last_line_enable", false);
-    tracker_->set_reverse_last_line_enable(reverse_last_line_enable_);
     line_diag_enable_ = bool_param("line_diag_enable", false);
     tracker_->set_line_diag_enable(line_diag_enable_);
     run_id_ = kmpc::ros2io::layer_diag_mono_ns();
@@ -450,7 +448,6 @@ class KmpcNode : public rclcpp::Node {
     declare_parameter("dq_scale", 1.0);
     declare_parameter("line_dq_scale", 0.60);
     declare_parameter("line_pose_pref_enable", false);
-    declare_parameter("reverse_last_line_enable", false);
     declare_parameter("line_diag_enable", false);
     declare_parameter<std::string>("layer_diag_path", "");
     declare_parameter<std::string>("config_snapshot_path", "");
@@ -1015,6 +1012,7 @@ class KmpcNode : public rclcpp::Node {
       }
     }
     tracker_->set_line_pace(line_scale, interp_accel_s_);
+    tracker_->set_line_jerk_s(interp_jerk_s_);
 
     const auto targets=task_->targets();
     const auto& left=targets.first;
@@ -1173,19 +1171,17 @@ class KmpcNode : public rclcpp::Node {
         const auto upper=result.command;
         line_pending_waist_locked_=upper.waist_locked;
         const bool pose_pref=line_pose_pref_enable_;
-        const bool reverse_line=reverse_last_line_enable_;
         const bool diag=line_diag_enable_;
         const kmpc::Vec18 q_pref=cfg_.q_pref;
         const auto line_cache=tracker_->last_line_cache();
         const uint64_t run_id=run_id_;
         line_future_=std::async(std::launch::async,
-            [config,source,xml,target,q0,is_left,upper,pose_pref,reverse_line,diag,q_pref,line_cache,run_id]() {
+            [config,source,xml,target,q0,is_left,upper,pose_pref,diag,q_pref,line_cache,run_id]() {
           kmpc::Kinematics model(source,xml?kmpc::Kinematics::UrdfInput::Xml:kmpc::Kinematics::UrdfInput::Path);
           kmpc::CartesianTracker worker(model,config);
           worker.set_upper_commands(upper);
           worker.set_line_pose_pref(pose_pref);
           worker.set_line_pose_pref_q(q_pref);
-          worker.set_reverse_last_line_enable(reverse_line);
           worker.import_last_line_cache(line_cache);
           worker.set_line_diag_enable(diag);
           worker.set_line_diag_run_id(run_id);
@@ -1562,7 +1558,6 @@ class KmpcNode : public rclcpp::Node {
     ros_num("hold_deadband", 0.01, hold_deadband_, "rad", "finite");
     ros_bool("line_diag_enable", false);
     ros_bool("line_pose_pref_enable", false);
-    ros_bool("reverse_last_line_enable", false);
     ros_bool("stream_dedicated_thread", true);
     ros_bool("auto_enable", false);
     ros_bool("waist_locked", false);
@@ -1968,7 +1963,6 @@ class KmpcNode : public rclcpp::Node {
   double dq_scale_ = 1.0;
   double line_dq_scale_ = 0.60;
   bool line_pose_pref_enable_ = false;
-  bool reverse_last_line_enable_ = false;
   bool line_diag_enable_ = false;
   bool layer_diag_on_ = false;
   uint64_t run_id_ = 0;

@@ -16,6 +16,48 @@ std::string cfg(const char* name) {
   return std::string(KMPC_CONFIG_DIR) + "/" + name;
 }
 
+double pitch_sum(const kmpc::Vec18& q) { return q[0] + q[1] + q[2]; }
+
+// 俯仰相对整段方向走回头的最大幅度。平的一段则是峰谷差。
+double pitch_turnback(const std::vector<kmpc::Vec18>& qs) {
+  if (qs.size() < 2) {
+    return 0.0;
+  }
+  const double net = pitch_sum(qs.back()) - pitch_sum(qs.front());
+  const double dir = net > 1e-4 ? 1.0 : (net < -1e-4 ? -1.0 : 0.0);
+  if (dir == 0.0) {
+    double lo = pitch_sum(qs.front());
+    double hi = lo;
+    for (const auto& q : qs) {
+      lo = std::min(lo, pitch_sum(q));
+      hi = std::max(hi, pitch_sum(q));
+    }
+    return hi - lo;
+  }
+  double best = pitch_sum(qs.front());
+  double worst = 0.0;
+  for (const auto& q : qs) {
+    const double p = pitch_sum(q);
+    if (dir > 0.0) {
+      best = std::max(best, p);
+      worst = std::max(worst, best - p);
+    } else {
+      best = std::min(best, p);
+      worst = std::max(worst, p - best);
+    }
+  }
+  return worst;
+}
+
+double along_m(const kmpc::Vec3& p, const kmpc::Vec3& a, const kmpc::Vec3& b) {
+  const kmpc::Vec3 ab = b - a;
+  const double n = ab.norm();
+  if (n < 1e-12) {
+    return 0.0;
+  }
+  return (p - a).dot(ab) / n;
+}
+
 double lateral(const kmpc::Vec3& p, const kmpc::Vec3& a, const kmpc::Vec3& b) {
   const kmpc::Vec3 ab = b - a;
   const double n2 = ab.squaredNorm();
@@ -457,12 +499,11 @@ TEST(LinePath, Robot03PlacementAllowsConstrainedWaistInSuccessor) {
   EXPECT_FALSE(locked.line_cascade_full_body());
 }
 
-TEST(LinePath, ReverseLastLineRestoresQaWhenEnabled) {
+TEST(LinePath, ReverseLastLineRestoresQa) {
   const auto cfg_all = kmpc::Config::load(
       cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
   kmpc::CartesianTracker tracker(kin, cfg_all);
-  tracker.set_reverse_last_line_enable(true);
   tracker.set_line_pace(0.6, 0.0);
   kmpc::Vec18 q = cfg_all.q_pref;
   const kmpc::Vec18 qA = q;
@@ -522,36 +563,11 @@ TEST(LinePath, ReverseLastLineRestoresQaWhenEnabled) {
   (void)step0;
 }
 
-TEST(LinePath, ReverseDisabledKeepsBaseline) {
-  const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
-  kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
-  kmpc::CartesianTracker tracker(kin, cfg_all);
-  tracker.set_line_pace(0.6, 0.0);
-  kmpc::Vec18 q = cfg_all.q_pref;
-  const kmpc::Vec3 pA = kin.fk_pos(q, kmpc::kEeFrameLeft);
-  const auto posed = kin.fk(q, kmpc::kEeFrameLeft);
-  const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
-  const kmpc::Vec3 pB = pA + kmpc::Vec3(0.06, 0.0, 0.0);
-  ASSERT_TRUE(tracker.rearm_line(1));
-  for (int i = 0; i < 800 && !tracker.last_arrived(); ++i) {
-    q += tracker.compute(q, cfg_all.q_pref, &pB, nullptr, &quat, nullptr).dq;
-  }
-  ASSERT_TRUE(tracker.last_arrived());
-  tracker.maybe_commit_last_line_cache(q);
-  EXPECT_FALSE(tracker.last_line_cache().valid);
-  ASSERT_TRUE(tracker.rearm_line(2));
-  tracker.compute(q, cfg_all.q_pref, &pA, nullptr, &quat, nullptr);
-  EXPECT_NE(tracker.line_candidate(), "reverse_cache");
-  EXPECT_EQ(tracker.reverse_line_decision(), "disabled");
-}
-
 TEST(LinePath, ReverseRejectsQbMismatch) {
   const auto cfg_all = kmpc::Config::load(
       cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
   kmpc::CartesianTracker tracker(kin, cfg_all);
-  tracker.set_reverse_last_line_enable(true);
   tracker.set_line_pace(0.6, 0.0);
   kmpc::Vec18 q = cfg_all.q_pref;
   const kmpc::Vec3 pA = kin.fk_pos(q, kmpc::kEeFrameLeft);
@@ -610,4 +626,165 @@ TEST(LinePath, LineDiagRingDefaultOffBounded) {
   EXPECT_EQ(after.back().run_id, 99u);
   EXPECT_EQ(after.back().source_stamp_ns, 12500000000LL);
   EXPECT_EQ(after.back().layer, kmpc::CartesianTracker::LineDiagLayer::Feedback);
+}
+
+// r9 20261105T104221Z 的固定点。右臂抓取预备/抓取，以及放置预备/放入。
+// 循环走：手留在 3 mm 管子里，俯仰不回头，进度不过终点再退。
+TEST(LinePath, LoggedFixedPointsNoPitchReversalOrOvershoot) {
+  const auto cfg_all = kmpc::Config::load(
+      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+  kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
+  const double home_raw[18] = {
+      0.69813170, -0.87264718, -0.17453293, -0.02630211,
+      -0.00171042, 0.51532590, -0.13651965, -2.12657900,
+      -1.27522486, -0.24291493, 0.01394518,
+      -0.00171042, 0.51532590, 0.13651965, -2.12657900,
+      1.27522486, -0.24291493, 0.01394518};
+  const double place_raw[18] = {
+      0.34900476, -0.34911297, -0.00002443, -0.02616074,
+      -2.34329651, -0.78733548, 2.07929800, -2.06681890,
+      -1.88539192, -0.77878337, 0.09534734,
+      2.76662437, -0.93607069, -1.86430835, -1.81009842,
+      2.23602857, -0.08285078, 0.25028021};
+  auto load = [](const double* raw) {
+    kmpc::Vec18 q;
+    for (int i = 0; i < 18; ++i) q[i] = raw[i];
+    return q;
+  };
+  const kmpc::Vec18 q_home = load(home_raw);
+  const kmpc::Vec18 q_place = load(place_raw);
+  const kmpc::Vec3 grasp_prep(0.498429119, -0.286684478, 0.640);
+  const kmpc::Vec3 grasp(0.498429119, -0.286684478, 0.490);
+  const auto grasp_quat = kmpc::tool_to_flange_quat_xyzw(
+      kmpc::Vec4(-0.785307554, 0.204189333, 0.328536754, 0.483386350));
+  const kmpc::Vec3 place_prep(0.245839000, -0.391452000, 0.520);
+  const kmpc::Vec3 place(0.485839000, -0.391452000, 0.520);
+  const auto place_quat = kmpc::tool_to_flange_quat_xyzw(
+      kmpc::Vec4(-0.851980633, 0.201084490, 0.138013856, 0.463299261));
+
+  auto check_samples = [&](const kmpc::CartesianTracker& tracker, const char* name) {
+    std::vector<kmpc::Vec18> samples(
+        tracker.line_samples().begin(), tracker.line_samples().end());
+    const double back = pitch_turnback(samples);
+    EXPECT_LE(back, 0.05 * kmpc::kPi / 180.0)
+        << name << " sample pitch turnback deg " << (back * 180.0 / kmpc::kPi)
+        << " candidate " << tracker.line_candidate();
+    if (samples.size() < 2) {
+      ADD_FAILURE() << name << " has no line samples";
+      return;
+    }
+    const auto frame = kmpc::kEeFrameRight;
+    const kmpc::Vec3 a = kin.fk_pos(samples.front(), frame);
+    const kmpc::Vec3 b = kin.fk_pos(samples.back(), frame);
+    const double length = (b - a).norm();
+    double worst_lat = 0.0;
+    double best = 0.0;
+    double back_m = 0.0;
+    for (const auto& q : samples) {
+      const kmpc::Vec3 p = kin.fk_pos(q, frame);
+      worst_lat = std::max(worst_lat, lateral(p, a, b));
+      const double s = along_m(p, a, b);
+      best = std::max(best, s);
+      back_m = std::max(back_m, best - s);
+    }
+    EXPECT_LE(worst_lat, 0.003) << name;
+    EXPECT_LE(back_m, 5e-4) << name;
+    EXPECT_LE(best, length + 1.5e-3) << name;
+  };
+
+  auto play = [&](kmpc::CartesianTracker& tracker, kmpc::Vec18& q, uint64_t gen,
+                  const kmpc::Vec3* tip, const kmpc::Vec3& goal, const kmpc::Vec4& quat,
+                  const char* name, const char* want_candidate) {
+    bool armed = false;
+    if (tip) {
+      kmpc::LineTarget extra;
+      extra.xyz = *tip;
+      extra.quat_xyzw = quat;
+      extra.ori_on = true;
+      armed = tracker.rearm_line(gen, extra);
+    } else {
+      armed = tracker.rearm_line(gen);
+    }
+    if (!armed) {
+      ADD_FAILURE() << name << " rearm failed";
+      return;
+    }
+    const kmpc::Vec3 p0 = kin.fk_pos(q, kmpc::kEeFrameRight);
+    const auto first = tracker.compute(q, cfg_all.q_pref, nullptr, &goal, nullptr, &quat);
+    if (tracker.line_refused()) {
+      ADD_FAILURE() << name << " " << tracker.line_reason();
+      return;
+    }
+    if (want_candidate) {
+      EXPECT_EQ(tracker.line_candidate(), want_candidate) << name << " " << tracker.reverse_line_decision();
+    }
+    check_samples(tracker, name);
+    std::vector<kmpc::Vec18> commanded;
+    commanded.push_back(q);
+    std::vector<double> rates;
+    rates.push_back(tracker.line_rate());
+    q += first.dq;
+    commanded.push_back(q);
+    bool arrived = tracker.last_arrived();
+    double worst_lat = lateral(kin.fk_pos(q, kmpc::kEeFrameRight), p0, goal);
+    for (int i = 0; i < 4000 && !arrived; ++i) {
+      const auto step = tracker.compute(q, cfg_all.q_pref, nullptr, &goal, nullptr, &quat);
+      if (tracker.line_refused()) {
+        ADD_FAILURE() << name << " tick " << i << " " << tracker.line_reason();
+        return;
+      }
+      rates.push_back(tracker.line_rate());
+      q += step.dq;
+      commanded.push_back(q);
+      worst_lat = std::max(worst_lat, lateral(kin.fk_pos(q, kmpc::kEeFrameRight), p0, goal));
+      arrived = tracker.last_arrived();
+    }
+    if (!arrived) {
+      ADD_FAILURE() << name << " prog " << tracker.line_progress() << " e " << tracker.last_e0();
+      return;
+    }
+    EXPECT_LT((kin.fk_pos(q, kmpc::kEeFrameRight) - goal).norm(), 0.003) << name;
+    EXPECT_LE(worst_lat, 0.003) << name;
+    const double turn = pitch_turnback(commanded);
+    EXPECT_LE(turn, 0.05 * kmpc::kPi / 180.0)
+        << name << " command pitch turnback deg " << (turn * 180.0 / kmpc::kPi);
+    double best = 0.0;
+    double back_m = 0.0;
+    const double length = (goal - p0).norm();
+    for (const auto& one : commanded) {
+      const double s = along_m(kin.fk_pos(one, kmpc::kEeFrameRight), p0, goal);
+      best = std::max(best, s);
+      back_m = std::max(back_m, best - s);
+    }
+    EXPECT_LE(back_m, 5e-4) << name << " hand reversed along the line";
+    EXPECT_LE(best, length + 1.5e-3) << name << " hand passed the goal";
+    if (name[0] == 'G' && std::string(name).find("approach") != std::string::npos &&
+        rates.size() > 16) {
+      EXPECT_GT(rates[1], 1e-4) << name;
+      EXPECT_LT(rates[1], 0.02) << name;
+      for (int i = 2; i < 12; ++i) {
+        EXPECT_GE(rates[static_cast<size_t>(i)] + 1e-6, rates[static_cast<size_t>(i - 1)])
+            << name << " rate dipped at " << i;
+      }
+      EXPECT_GT(rates[14], 0.2) << name << " rate did not climb";
+    }
+  };
+
+  for (int loop = 0; loop < 2; ++loop) {
+    kmpc::CartesianTracker tracker(kin, cfg_all);
+    tracker.set_line_pace(0.3, 0.8);
+    tracker.set_line_jerk_s(0.08);
+    kmpc::Vec18 q = q_home;
+    const std::string tag = "G" + std::to_string(loop);
+    play(tracker, q, 1, &grasp, grasp_prep, grasp_quat, (tag + " approach").c_str(), nullptr);
+    play(tracker, q, 2, nullptr, grasp, grasp_quat, (tag + " insert").c_str(), nullptr);
+    play(tracker, q, 3, nullptr, grasp_prep, grasp_quat, (tag + " retreat").c_str(), "reverse_cache");
+  }
+  kmpc::CartesianTracker place_tracker(kin, cfg_all);
+  place_tracker.set_line_pace(0.3, 0.8);
+  place_tracker.set_line_jerk_s(0.08);
+  kmpc::Vec18 q = q_place;
+  play(place_tracker, q, 1, &place, place_prep, place_quat, "P approach", nullptr);
+  play(place_tracker, q, 2, nullptr, place, place_quat, "P insert", nullptr);
+  play(place_tracker, q, 3, nullptr, place_prep, place_quat, "P retreat", "reverse_cache");
 }

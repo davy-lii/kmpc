@@ -95,6 +95,9 @@ class CartesianTracker {
   int line_gen() const { return line_gen_; }
   // speed_scale 是直线自己的比例，0..1，不跟 QP 的 dq_scale。accel_s<=0 表示这一拍直接用满，不爬坡。
   void set_line_pace(double speed_scale, double accel_s);
+  // 和插补器同一个 jerk_s：比例从 0 收到巡航要这么多秒的加速度爬坡。只作用在路径进度这一个标量上。
+  void set_line_jerk_s(double jerk_s);
+  double line_rate() const { return line_rate_; }
   // Explicit segment boundary. Target updates alone never clear a refusal.
   bool rearm_line(uint64_t generation, const std::optional<LineTarget>& tip = std::nullopt);
   void set_line_reference(const Vec18& q) { line_reference_ = q; }
@@ -123,10 +126,8 @@ class CartesianTracker {
   bool line_pose_pref_enabled() const { return line_pose_pref_enable_; }
   void set_line_pose_pref_q(const Vec18& q_pref) { line_q_pref_ = q_pref; }
 
-  // Default-off: reuse the last successful nominal LineRun.samples in reverse for a
-  // matching immediate return. Not a servo-time-series reverse.
-  void set_reverse_last_line_enable(bool enable) { reverse_last_line_enable_ = enable; }
-  bool reverse_last_line_enabled() const { return reverse_last_line_enable_; }
+  // Immediate return reuses the last successful nominal samples in reverse.
+  // Not a servo-time-series reverse. There is no off switch.
   const std::string& reverse_line_decision() const { return reverse_decision_; }
   void clear_last_line_cache();
   // Snapshot/import so async prepare_line workers can see the main-tracker cache.
@@ -284,8 +285,8 @@ class CartesianTracker {
     std::string candidate = "none";
     // skipped | accepted | rejected_<reason> | disabled
     std::string pose_pref_decision = "disabled";
-    // disabled | skipped | accepted | rejected_<reason>
-    std::string reverse_decision = "disabled";
+    // skipped | accepted | rejected_<reason>
+    std::string reverse_decision = "skipped";
     double max_arm_fold = 0.0;
     std::string reason;
     // 异步建线线程的诊断副本。adopt 后拆走，不参与跟踪计算。
@@ -312,7 +313,7 @@ class CartesianTracker {
     reverse_decision_ = plan.reverse_decision.empty() ? reverse_decision_ : plan.reverse_decision;
     line_ = std::move(plan);
     if (!line_.samples.empty()) line_q_=line_.samples.front();
-    line_rate_=0; ++line_gen_; last_arrived_=false;
+    line_rate_=0; line_rate_acc_=0; ++line_gen_; last_arrived_=false;
     last_line_cache_committed_ = false;
   }
  private:
@@ -351,7 +352,9 @@ class CartesianTracker {
   int line_gen_ = 0;
   double line_speed_scale_ = 1.0;
   double line_accel_s_ = 0.0;
+  double line_jerk_s_ = 0.08;
   double line_rate_ = 0.0;
+  double line_rate_acc_ = 0.0;
   bool line_pose_pref_enable_ = false;
   Vec18 line_q_pref_ = Vec18::Zero();
   // Soft posture pull and acceptance budgets (radians unless noted).
@@ -362,8 +365,7 @@ class CartesianTracker {
   double line_pose_pref_waist_budget_ = 35.0 * kPi / 180.0;
   double line_pose_pref_wrist_budget_ = 25.0 * kPi / 180.0;
 
-  bool reverse_last_line_enable_ = false;
-  std::string reverse_decision_ = "disabled";
+  std::string reverse_decision_ = "skipped";
   LastLineCache last_line_cache_{};
   bool last_line_cache_committed_ = false;
   // Joint-space match for reverse start (~2°/axis) and Cartesian end match (3 mm).

@@ -40,6 +40,9 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
       if(previous) ct.emplace_back(r,(k-1)*d+j,-a[j]);
     }
   };
+  const double pitch0=line_.samples.front().head<3>().sum();
+  const double pitchN=line_.samples.back().head<3>().sum();
+  const double pitch_net=pitchN-pitch0;
   Vec18 prev=from;
   double s=next_prog;
   for(int k=0;k<n;++k) {
@@ -99,6 +102,25 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
           std::max(0.0,std::abs(initial)-torso_pitch_max_) : 0.0;
       row(k,pitch,-torso_pitch_max_-numerical_slack-q.head<3>().sum(),
           torso_pitch_max_+numerical_slack-q.head<3>().sum());
+    }
+    // 名义路径的俯仰和已经定好。这一拍的修正不能把它改回反方向。x=0 不在界内就不加，避免把原来能走的段判失败。
+    {
+      constexpr double kPitchSlack=2e-4;
+      const double p_prev=prev.head<3>().sum();
+      const double p_q=q.head<3>().sum();
+      const double dp=p_q-p_prev;
+      double lo=-1e9, hi=1e9;
+      if(std::abs(pitch_net)<=1e-4) {
+        lo=pitch0-kPitchSlack-p_q;
+        hi=pitch0+kPitchSlack-p_q;
+      } else if(pitch_net>0.0) {
+        lo=-dp-kPitchSlack;
+      } else {
+        hi=-dp+kPitchSlack;
+      }
+      lo=std::max(lo,std::min(p_prev,pitchN)-kPitchSlack-p_q);
+      hi=std::min(hi,std::max(p_prev,pitchN)+kPitchSlack-p_q);
+      if(lo<=0.0 && hi>=0.0 && lo<hi) row(k,pitch,lo,hi);
     }
     if(yaw_max_>0) {
       Eigen::Matrix<double,1,d> yaw=Eigen::Matrix<double,1,d>::Zero();yaw[kIdxYaw]=1;

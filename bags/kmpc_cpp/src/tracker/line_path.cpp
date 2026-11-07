@@ -122,14 +122,23 @@ void CartesianTracker::set_line_pace(double speed_scale, double accel_s) {
   }
 }
 
+void CartesianTracker::set_line_jerk_s(double jerk_s) {
+  if (!std::isfinite(jerk_s) || jerk_s <= 0.0) {
+    line_jerk_s_ = 0.08;
+  } else {
+    line_jerk_s_ = jerk_s;
+  }
+}
+
 void CartesianTracker::line_clear() {
   line_ = LineRun{};
   line_q_.setZero();
   line_rate_ = 0.0;
+  line_rate_acc_ = 0.0;
   line_tip_.reset();
   line_reference_.reset();
   last_line_cache_committed_ = false;
-  reverse_decision_ = reverse_last_line_enable_ ? "skipped" : "disabled";
+  reverse_decision_ = "skipped";
 }
 
 void CartesianTracker::clear_last_line_cache() {
@@ -246,7 +255,7 @@ void CartesianTracker::line_diag_push_feedback(const Vec18& q_meas, double sourc
 }
 
 void CartesianTracker::maybe_commit_last_line_cache(const Vec18& q_meas) {
-  if (!reverse_last_line_enable_ || last_line_cache_committed_ || !line_.on ||
+  if (last_line_cache_committed_ || !line_.on ||
       line_.samples.size() < 2 || !line_.hold) {
     return;
   }
@@ -833,6 +842,96 @@ bool CartesianTracker::line_fit(
     }
   }
 
+  // 俯仰和是一个冗余量，直线只约束手。端点不动，中间点只在手的零空间里拉回两端连线。
+  // 拉完仍要过 3 mm 管子；拉不动就留在原来的可行解上，不把整段判失败。
+  if (!lock_waist && n > 1) {
+    const auto pitch_of = [](const Red& y) { return y.head<3>().sum(); };
+    const double p0 = pitch_of(path[0]);
+    const double pN = pitch_of(path[static_cast<std::size_t>(n)]);
+    Aligned<Red> kept = path;
+    for (int pass = 0; pass < 12; ++pass) {
+      double worst = 0.0;
+      for (int i = 1; i < n; ++i) {
+        const double s = static_cast<double>(i) / static_cast<double>(n);
+        const double want = (1.0 - s) * p0 + s * pN;
+        worst = std::max(
+            worst, std::abs(pitch_of(path[static_cast<std::size_t>(i)]) - want));
+      }
+      if (worst < 2e-4) {
+        break;
+      }
+      bool moved = false;
+      for (int i = 1; i < n; ++i) {
+        Red& y = path[static_cast<std::size_t>(i)];
+        const double s = static_cast<double>(i) / static_cast<double>(n);
+        const double want = (1.0 - s) * p0 + s * pN;
+        const double miss = want - pitch_of(y);
+        if (std::abs(miss) < 2e-4) {
+          continue;
+        }
+        Eigen::Matrix<double, 6, kRed> jac;
+        Eigen::Matrix<double, 6, 1> err;
+        double ori_rad = 0.0;
+        task(y, i, jac, err, ori_rad);
+        (void)ori_rad;
+        Eigen::Matrix<double, 6, 6> jjt = jac * jac.transpose();
+        jjt.diagonal().array() += 1e-6;
+        const Eigen::LDLT<Eigen::Matrix<double, 6, 6>> ldlt(jjt);
+        if (ldlt.info() != Eigen::Success) {
+          continue;
+        }
+        const Eigen::Matrix<double, kRed, 6> j_pinv =
+            jac.transpose() * ldlt.solve(Eigen::Matrix<double, 6, 6>::Identity());
+        const MatR nullspace = MatR::Identity() - j_pinv * jac;
+        Eigen::Matrix<double, 1, kRed> prow = Eigen::Matrix<double, 1, kRed>::Zero();
+        prow(0) = 1.0;
+        prow(1) = 1.0;
+        prow(2) = 1.0;
+        const Red nvec = nullspace * prow.transpose();
+        const double denom = (prow * nvec)(0, 0);
+        if (!(std::abs(denom) > 1e-5)) {
+          continue;
+        }
+        double alpha = miss / denom;
+        constexpr double kMaxPitchStep = 0.05;
+        if (std::abs(alpha * denom) > kMaxPitchStep) {
+          alpha *= kMaxPitchStep / std::abs(alpha * denom);
+        }
+        const Red next = limited_step(y, nvec * alpha + j_pinv * err);
+        Eigen::Matrix<double, 6, kRed> jac2;
+        Eigen::Matrix<double, 6, 1> err2;
+        double ori2 = 0.0;
+        task(next, i, jac2, err2, ori2);
+        if (err2.head<3>().norm() > kLineSampleTolM || (ori_on && ori2 > 0.08)) {
+          continue;
+        }
+        if (!(std::abs(want - pitch_of(next)) < std::abs(miss) - 1e-5)) {
+          continue;
+        }
+        y = next;
+        moved = true;
+      }
+      if (!moved) {
+        break;
+      }
+    }
+    std::vector<Vec18, Eigen::aligned_allocator<Vec18>> trial;
+    trial.reserve(static_cast<std::size_t>(n + 1));
+    bool finite = true;
+    for (int i = 0; i <= n; ++i) {
+      const Vec18 q = expand(path[static_cast<std::size_t>(i)]);
+      if (!q.allFinite()) {
+        finite = false;
+        break;
+      }
+      trial.push_back(q);
+    }
+    if (!finite || worst_pos(path) > kLineSampleTolM ||
+        !line_validate(trial, target, quat, ori_on, frame)) {
+      path = std::move(kept);
+    }
+  }
+
   // A forced-free cascade candidate must not silently be relocked.
   waist_locked = lock_waist;
   if (allow_relock) {
@@ -898,6 +997,7 @@ void CartesianTracker::refuse_line(const std::string& reason) {
   line_.reason = reason;
   last_arrived_ = false;
   line_rate_ = 0.0;
+  line_rate_acc_ = 0.0;
   clear_last_line_cache();
 }
 
@@ -973,7 +1073,7 @@ bool CartesianTracker::line_build(
   line_.reason = "geometry_or_orientation";
   line_.cascade_checked=line_tip_.has_value();
   line_.cascade_passed=false;
-  reverse_decision_=reverse_last_line_enable_ ? "skipped" : "disabled";
+  reverse_decision_="skipped";
   if(torso_pitch_max_>0 && std::abs(q0.head<3>().sum())>torso_pitch_max_+0.001) {
     line_.reason="start_pitch_outside"; return false;
   }
@@ -993,7 +1093,7 @@ bool CartesianTracker::line_build(
   bool locked=true;
   std::string candidate="none";
   std::string pose_decision="disabled";
-  std::string reverse_decision=reverse_last_line_enable_ ? "skipped" : "disabled";
+  std::string reverse_decision="skipped";
   const bool recovering_pitch=torso_pitch_max_>0 && std::abs(q0.head<3>().sum())>torso_pitch_max_+1e-6;
   if (recovering_pitch && upper_.waist_locked) { line_.reason="waist_locked_outside"; return false; }
 
@@ -1001,7 +1101,7 @@ bool CartesianTracker::line_build(
     return (a-b).cwiseAbs().maxCoeff()<=reverse_q_tol_;
   };
   auto reverse_intent=[&](){
-    if(!reverse_last_line_enable_ || !last_line_cache_.valid || line_tip_.has_value()) return false;
+    if(!last_line_cache_.valid || line_tip_.has_value()) return false;
     const auto& c=last_line_cache_;
     if(c.left!=left || c.frame!=frame || c.ori_on!=ori_on) return false;
     if((target-c.start_xyz).norm()>reverse_xyz_tol_) return false;
@@ -1054,7 +1154,7 @@ bool CartesianTracker::line_build(
         }
       }
     }
-  } else if(reverse_last_line_enable_) {
+  } else {
     reverse_decision="skipped_no_match";
   }
 
@@ -1224,7 +1324,7 @@ bool CartesianTracker::line_build(
   built.reverse_decision=reverse_decision;
   built.max_arm_fold=max_arm_fold(built.samples,arm);
   built.frozen=dist<=kLineBrakeM;
-  line_=std::move(built); line_q_=q0; line_rate_=0.0; ++line_gen_;
+  line_=std::move(built); line_q_=q0; line_rate_=0.0; line_rate_acc_=0.0; ++line_gen_;
   last_line_cache_committed_=false;
   line_diag_push(LineDiagLayer::Build,q0,line_.samples.back(),0.0,ms,candidate.c_str(),
                  reverse_decision.c_str());
@@ -1314,18 +1414,34 @@ bool CartesianTracker::follow_line(
   if (path_remain < kLineBrakeM) brake = std::max(0.05,path_remain/kLineBrakeM);
   const double speed = line_speed_scale_;
   const double want = speed * brake;
+  // 加减速只乘在路径进度这一个标量上，再去采样已经求好的折线。不能按关节各做一条 S 曲线，
+  // 否则手会离开直线，预备点/抓取点上会重新出现走过再折返。
   if (speed <= 1e-4) {
     line_rate_ = 0.0;
+    line_rate_acc_ = 0.0;
+  } else if (!(line_accel_s_ > 1e-3)) {
+    line_rate_ = want;
+    line_rate_acc_ = 0.0;
   } else {
-    double du = 1.0;
-    if (line_accel_s_ > 1e-3) {
-      du = constraints_.dt() / line_accel_s_;
+    const double dt = std::max(constraints_.dt(), 1e-4);
+    const double a_bar = 1.0 / line_accel_s_;
+    const double j_bar = a_bar / std::max(line_jerk_s_, 1e-3);
+    const auto clip = [](double x, double lim) { return std::clamp(x, -lim, lim); };
+    const double a_des = clip((want - line_rate_) / dt, a_bar);
+    const double j_cmd = clip((a_des - line_rate_acc_) / dt, j_bar);
+    line_rate_acc_ = clip(line_rate_acc_ + j_cmd * dt, a_bar);
+    double v = line_rate_ + line_rate_acc_ * dt;
+    if (v < 0.0) {
+      v = 0.0;
+      line_rate_acc_ = 0.0;
     }
-    if (line_rate_ < want) {
-      line_rate_ = std::min(want, line_rate_ + du);
-    } else {
-      line_rate_ = std::max(want, line_rate_ - du);
+    if (v > line_speed_scale_) {
+      v = line_speed_scale_;
+      if (line_rate_acc_ > 0.0) {
+        line_rate_acc_ = 0.0;
+      }
     }
+    line_rate_ = v;
   }
   const Vec18 q_from = line_reference_.value_or(line_q_);
   const Vec18 step_lim = effective_dq_max() * constraints_.dt() * line_rate_;
@@ -1339,12 +1455,16 @@ bool CartesianTracker::follow_line(
   const bool at_end=nseg<=0.0 || line_.prog>=nseg-1e-4;
   // Once the path ends inside the accepted pose tolerance, do not spend more
   // ticks reducing a harmless residual through redundant joint motion.
-  if(at_end && remain<=kLineSampleTolM && ori_ok &&
-      line_rate_<=0.1*line_speed_scale_+1e-9) {
-    line_.hold=true;line_q_=q_from;line_rate_=0;last_arrived_=true;
-    maybe_commit_last_line_cache(q0);
-    line_diag_push(LineDiagLayer::FollowCommit,q_from,q0,line_.prog,0.0,
-                   line_.candidate.c_str(),"hold");
+  if(at_end && remain<=kLineSampleTolM && ori_ok) {
+    // 人已经在终点公差里。速度还没收完也不再解 QP，避免在预备点/抓取点上折返微调。
+    if(line_rate_<=0.1*line_speed_scale_+1e-9) {
+      line_.hold=true;line_q_=q_from;line_rate_=0;line_rate_acc_=0;last_arrived_=true;
+      maybe_commit_last_line_cache(q0);
+      line_diag_push(LineDiagLayer::FollowCommit,q_from,q0,line_.prog,0.0,
+                     line_.candidate.c_str(),"hold");
+    } else {
+      line_q_=q_from;
+    }
     out.dq.setZero();return true;
   }
   Vec18 next = q_from;
