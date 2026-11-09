@@ -1,5 +1,6 @@
 #include <Eigen/Geometry>
 #include <cmath>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -758,10 +759,11 @@ TEST(LinePath, LoggedFixedPointsNoPitchReversalOrOvershoot) {
     }
     EXPECT_LE(back_m, 5e-4) << name << " hand reversed along the line";
     EXPECT_LE(best, length + 1.5e-3) << name << " hand passed the goal";
-    if (name[0] == 'G' && std::string(name).find("approach") != std::string::npos &&
-        rates.size() > 16) {
+    if (std::string(name).find("approach") != std::string::npos && rates.size() > 16 &&
+        std::string(name).find("_G") != std::string::npos) {
       EXPECT_GT(rates[1], 1e-4) << name;
-      EXPECT_LT(rates[1], 0.02) << name;
+      // first-order: rates[1]≈2*(dt/accel_s)=0.05; S-curve is slower.
+      EXPECT_LT(rates[1], 0.06) << name;
       for (int i = 2; i < 12; ++i) {
         EXPECT_GE(rates[static_cast<size_t>(i)] + 1e-6, rates[static_cast<size_t>(i - 1)])
             << name << " rate dipped at " << i;
@@ -770,21 +772,192 @@ TEST(LinePath, LoggedFixedPointsNoPitchReversalOrOvershoot) {
     }
   };
 
-  for (int loop = 0; loop < 2; ++loop) {
+  const kmpc::CartesianTracker::LinePaceMode modes[] = {
+      kmpc::CartesianTracker::LinePaceMode::R10bFirstOrder,
+      kmpc::CartesianTracker::LinePaceMode::R11Scurve,
+  };
+  for (const auto mode : modes) {
+    for (int loop = 0; loop < 2; ++loop) {
+      kmpc::CartesianTracker tracker(kin, cfg_all);
+      tracker.set_line_pace_mode(mode);
+      tracker.set_line_pace(0.3, 0.8);
+      tracker.set_line_jerk_s(0.08);
+      kmpc::Vec18 q = q_home;
+      const std::string tag =
+          std::string(kmpc::CartesianTracker::line_pace_mode_name(mode)) +
+          "_G" + std::to_string(loop);
+      play(tracker, q, 1, &grasp, grasp_prep, grasp_quat, (tag + " approach").c_str(),
+           nullptr);
+      play(tracker, q, 2, nullptr, grasp, grasp_quat, (tag + " insert").c_str(), nullptr);
+      play(tracker, q, 3, nullptr, grasp_prep, grasp_quat, (tag + " retreat").c_str(),
+           "reverse_cache");
+    }
+    kmpc::CartesianTracker place_tracker(kin, cfg_all);
+    place_tracker.set_line_pace_mode(mode);
+    place_tracker.set_line_pace(0.3, 0.8);
+    place_tracker.set_line_jerk_s(0.08);
+    kmpc::Vec18 q = q_place;
+    const std::string ptag =
+        std::string(kmpc::CartesianTracker::line_pace_mode_name(mode)) + "_P";
+    play(place_tracker, q, 1, &place, place_prep, place_quat, (ptag + " approach").c_str(),
+         nullptr);
+    play(place_tracker, q, 2, nullptr, place, place_quat, (ptag + " insert").c_str(),
+         nullptr);
+    play(place_tracker, q, 3, nullptr, place_prep, place_quat, (ptag + " retreat").c_str(),
+         "reverse_cache");
+  }
+}
+
+TEST(LinePath, PaceModeParseAndBrakeValidation) {
+  kmpc::CartesianTracker::LinePaceMode mode =
+      kmpc::CartesianTracker::LinePaceMode::R11Scurve;
+  EXPECT_TRUE(kmpc::CartesianTracker::parse_line_pace_mode("r10b_first_order", &mode));
+  EXPECT_EQ(mode, kmpc::CartesianTracker::LinePaceMode::R10bFirstOrder);
+  EXPECT_TRUE(kmpc::CartesianTracker::parse_line_pace_mode("r11_scurve", &mode));
+  EXPECT_EQ(mode, kmpc::CartesianTracker::LinePaceMode::R11Scurve);
+  EXPECT_FALSE(kmpc::CartesianTracker::parse_line_pace_mode("bogus", &mode));
+  EXPECT_EQ(
+      kmpc::CartesianTracker::kDefaultLinePaceMode,
+      kmpc::CartesianTracker::LinePaceMode::R10bFirstOrder);
+
+  const auto cfg_all = kmpc::Config::load(
+      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+  kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
+  kmpc::CartesianTracker tracker(kin, cfg_all);
+  EXPECT_EQ(tracker.line_pace_mode(), kmpc::CartesianTracker::kDefaultLinePaceMode);
+  EXPECT_FALSE(tracker.set_line_brake_distance_m(0.0));
+  EXPECT_FALSE(tracker.set_line_brake_distance_m(-0.1));
+  EXPECT_FALSE(tracker.set_line_brake_distance_m(
+      std::numeric_limits<double>::quiet_NaN()));
+  EXPECT_TRUE(tracker.set_line_brake_distance_m(0.08));
+  EXPECT_DOUBLE_EQ(tracker.line_brake_distance_m(), 0.08);
+}
+
+TEST(LinePath, PaceModeAbCompareSameBrake) {
+  const auto cfg_all = kmpc::Config::load(
+      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+  kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
+  const kmpc::Vec18 q0 = cfg_all.q_pref;
+  const kmpc::Vec3 p0 = kin.fk_pos(q0, kmpc::kEeFrameLeft);
+  const auto posed = kin.fk(q0, kmpc::kEeFrameLeft);
+  const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
+  const kmpc::Vec3 goal = p0 + kmpc::Vec3(0.12, 0.0, 0.0);
+
+  struct Trace {
+    std::vector<double> rates;
+    std::vector<double> wants;
+    std::vector<double> dq_inf;
+    bool ok = false;
+  };
+  auto run_mode = [&](kmpc::CartesianTracker::LinePaceMode mode) -> Trace {
+    Trace out;
     kmpc::CartesianTracker tracker(kin, cfg_all);
+    tracker.set_line_pace_mode(mode);
+    if (!tracker.set_line_brake_distance_m(0.08)) {
+      return out;
+    }
     tracker.set_line_pace(0.3, 0.8);
     tracker.set_line_jerk_s(0.08);
-    kmpc::Vec18 q = q_home;
-    const std::string tag = "G" + std::to_string(loop);
-    play(tracker, q, 1, &grasp, grasp_prep, grasp_quat, (tag + " approach").c_str(), nullptr);
-    play(tracker, q, 2, nullptr, grasp, grasp_quat, (tag + " insert").c_str(), nullptr);
-    play(tracker, q, 3, nullptr, grasp_prep, grasp_quat, (tag + " retreat").c_str(), "reverse_cache");
+    if (!tracker.rearm_line(1)) {
+      return out;
+    }
+    kmpc::Vec18 q = q0;
+    bool arrived = false;
+    for (int i = 0; i < 2500; ++i) {
+      const auto step =
+          tracker.compute(q, cfg_all.q_pref, &goal, nullptr, &quat, nullptr);
+      if (tracker.line_refused()) {
+        return out;
+      }
+      out.rates.push_back(tracker.line_rate());
+      out.wants.push_back(tracker.last_line_want());
+      out.dq_inf.push_back(step.dq.cwiseAbs().maxCoeff());
+      if (mode == kmpc::CartesianTracker::LinePaceMode::R10bFirstOrder &&
+          tracker.line_rate_acc() != 0.0) {
+        return out;
+      }
+      q += step.dq;
+      if (std::abs(q.head<3>().sum()) >
+          cfg_all.params.torso_pitch_max_deg * kmpc::kPi / 180.0 + 1e-6) {
+        return out;
+      }
+      if (tracker.last_arrived()) {
+        arrived = true;
+        break;
+      }
+    }
+    out.ok = arrived &&
+             (kin.fk_pos(q, kmpc::kEeFrameLeft) - goal).norm() < 0.003 &&
+             tracker.line_frozen();
+    return out;
+  };
+
+  const Trace a = run_mode(kmpc::CartesianTracker::LinePaceMode::R11Scurve);
+  const Trace b = run_mode(kmpc::CartesianTracker::LinePaceMode::R10bFirstOrder);
+  ASSERT_TRUE(a.ok);
+  ASSERT_TRUE(b.ok);
+  ASSERT_GT(a.rates.size(), 20u);
+  ASSERT_GT(b.rates.size(), 20u);
+  EXPECT_NEAR(a.wants[1], 0.3, 1e-9);
+  EXPECT_NEAR(b.wants[1], 0.3, 1e-9);
+  double max_rate_gap = 0.0;
+  const size_t n = std::min(a.rates.size(), b.rates.size());
+  for (size_t i = 0; i < n; ++i) {
+    max_rate_gap = std::max(max_rate_gap, std::abs(a.rates[i] - b.rates[i]));
   }
-  kmpc::CartesianTracker place_tracker(kin, cfg_all);
-  place_tracker.set_line_pace(0.3, 0.8);
-  place_tracker.set_line_jerk_s(0.08);
-  kmpc::Vec18 q = q_place;
-  play(place_tracker, q, 1, &place, place_prep, place_quat, "P approach", nullptr);
-  play(place_tracker, q, 2, nullptr, place, place_quat, "P insert", nullptr);
-  play(place_tracker, q, 3, nullptr, place_prep, place_quat, "P retreat", "reverse_cache");
+  EXPECT_GT(max_rate_gap, 1e-4);
+  for (double d : a.dq_inf) {
+    EXPECT_TRUE(std::isfinite(d));
+  }
+  for (double d : b.dq_inf) {
+    EXPECT_TRUE(std::isfinite(d));
+  }
+}
+
+TEST(LinePath, BrakeDistanceDoesNotChangeFreezeThreshold) {
+  const auto cfg_all = kmpc::Config::load(
+      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+  kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
+  kmpc::Vec18 q = cfg_all.q_pref;
+  const kmpc::Vec3 p0 = kin.fk_pos(q, kmpc::kEeFrameLeft);
+  const auto posed = kin.fk(q, kmpc::kEeFrameLeft);
+  const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
+  const kmpc::Vec3 goal = p0 + kmpc::Vec3(0.25, 0.0, 0.0);
+
+  kmpc::CartesianTracker tracker(kin, cfg_all);
+  tracker.set_line_pace_mode(kmpc::CartesianTracker::LinePaceMode::R10bFirstOrder);
+  ASSERT_TRUE(tracker.set_line_brake_distance_m(0.20));  // wider brake, freeze stays 0.08
+  tracker.set_line_pace(0.3, 0.0);
+  ASSERT_TRUE(tracker.rearm_line(1));
+  bool saw_full = false;
+  bool saw_brake_scale = false;
+  bool arrived = false;
+  for (int i = 0; i < 4000; ++i) {
+    const auto step =
+        tracker.compute(q, cfg_all.q_pref, &goal, nullptr, &quat, nullptr);
+    ASSERT_FALSE(tracker.line_refused()) << tracker.line_reason();
+    const double remain = tracker.last_line_path_remain_m();
+    if (remain > 0.20 + 1e-9) {
+      EXPECT_NEAR(tracker.last_line_brake(), 1.0, 1e-12);
+      saw_full = true;
+    } else if (remain > 1e-9) {
+      EXPECT_NEAR(tracker.last_line_brake(),
+                  std::max(0.05, remain / 0.20), 1e-9);
+      saw_brake_scale = true;
+    }
+    if (tracker.line_frozen()) {
+      // Freeze still uses the compile-time 0.08 m cartesian gate, not brake_m.
+      EXPECT_LE((kin.fk_pos(tracker.line_cmd(), kmpc::kEeFrameLeft) - goal).norm(),
+                0.08 + 1e-3);
+    }
+    q += step.dq;
+    if (tracker.last_arrived()) {
+      arrived = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(arrived);
+  EXPECT_TRUE(saw_full);
+  EXPECT_TRUE(saw_brake_scale);
+  EXPECT_TRUE(tracker.line_frozen());
 }

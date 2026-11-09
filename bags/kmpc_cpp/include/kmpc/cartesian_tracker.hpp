@@ -93,11 +93,47 @@ class CartesianTracker {
   // 本拍要发的路径点。进度只沿路径加，不看实测把方向拉开。
   Vec18 line_cmd() const { return line_q_; }
   int line_gen() const { return line_gen_; }
+  // Path-rate update only. Does not change planning, freeze, or safety.
+  // Experiment default is r10b first-order; r11 S-curve remains the same-build baseline.
+  enum class LinePaceMode : uint8_t {
+    R11Scurve = 0,
+    R10bFirstOrder = 1,
+  };
+  static constexpr LinePaceMode kDefaultLinePaceMode = LinePaceMode::R10bFirstOrder;
+  static const char* line_pace_mode_name(LinePaceMode mode) {
+    return mode == LinePaceMode::R10bFirstOrder ? "r10b_first_order" : "r11_scurve";
+  }
+  static bool parse_line_pace_mode(std::string_view text, LinePaceMode* out) {
+    if (!out) {
+      return false;
+    }
+    if (text == "r11_scurve") {
+      *out = LinePaceMode::R11Scurve;
+      return true;
+    }
+    if (text == "r10b_first_order") {
+      *out = LinePaceMode::R10bFirstOrder;
+      return true;
+    }
+    return false;
+  }
+
   // speed_scale 是直线自己的比例，0..1，不跟 QP 的 dq_scale。accel_s<=0 表示这一拍直接用满，不爬坡。
   void set_line_pace(double speed_scale, double accel_s);
   // 和插补器同一个 jerk_s：比例从 0 收到巡航要这么多秒的加速度爬坡。只作用在路径进度这一个标量上。
   void set_line_jerk_s(double jerk_s);
+  void set_line_pace_mode(LinePaceMode mode) { line_pace_mode_ = mode; }
+  LinePaceMode line_pace_mode() const { return line_pace_mode_; }
+  // Brake scale only. Freeze distance stays at the compile-time 0.08 m constant.
+  // Returns false on non-finite or non-positive values; caller must refuse startup.
+  bool set_line_brake_distance_m(double meters);
+  double line_brake_distance_m() const { return line_brake_distance_m_; }
   double line_rate() const { return line_rate_; }
+  // S-curve acceleration state. First-order mode keeps this at 0 (not applicable).
+  double line_rate_acc() const { return line_rate_acc_; }
+  double last_line_path_remain_m() const { return last_line_path_remain_m_; }
+  double last_line_brake() const { return last_line_brake_; }
+  double last_line_want() const { return last_line_want_; }
   // Explicit segment boundary. Target updates alone never clear a refusal.
   bool rearm_line(uint64_t generation, const std::optional<LineTarget>& tip = std::nullopt);
   void set_line_reference(const Vec18& q) { line_reference_ = q; }
@@ -353,8 +389,13 @@ class CartesianTracker {
   double line_speed_scale_ = 1.0;
   double line_accel_s_ = 0.0;
   double line_jerk_s_ = 0.08;
+  LinePaceMode line_pace_mode_ = kDefaultLinePaceMode;
+  double line_brake_distance_m_ = 0.08;
   double line_rate_ = 0.0;
   double line_rate_acc_ = 0.0;
+  double last_line_path_remain_m_ = 0.0;
+  double last_line_brake_ = 1.0;
+  double last_line_want_ = 0.0;
   bool line_pose_pref_enable_ = false;
   Vec18 line_q_pref_ = Vec18::Zero();
   // Soft posture pull and acceptance budgets (radians unless noted).

@@ -197,6 +197,26 @@ class KmpcNode : public rclcpp::Node {
     hold_deadband_ = double_param("hold_deadband", 0.01);
     dq_scale_ = std::clamp(double_param("dq_scale", 1.0), 0.0, 1.0);
     line_dq_scale_ = std::clamp(double_param("line_dq_scale", 0.60), 0.0, 1.0);
+    {
+      const std::string mode_text = str_or(
+          "line_pace_mode",
+          kmpc::CartesianTracker::line_pace_mode_name(
+              kmpc::CartesianTracker::kDefaultLinePaceMode));
+      kmpc::CartesianTracker::LinePaceMode mode =
+          kmpc::CartesianTracker::kDefaultLinePaceMode;
+      if (!kmpc::CartesianTracker::parse_line_pace_mode(mode_text, &mode)) {
+        throw kmpc::ConfigError(
+            "line_pace_mode must be r11_scurve or r10b_first_order");
+      }
+      line_pace_mode_ = mode;
+      tracker_->set_line_pace_mode(mode);
+    }
+    line_brake_distance_m_ = double_param("line_brake_distance_m", 0.08);
+    if (!tracker_->set_line_brake_distance_m(line_brake_distance_m_)) {
+      throw kmpc::ConfigError(
+          "line_brake_distance_m must be finite and > 0");
+    }
+    line_brake_distance_m_ = tracker_->line_brake_distance_m();
     line_pose_pref_enable_ = bool_param("line_pose_pref_enable", false);
     tracker_->set_line_pose_pref(line_pose_pref_enable_);
     tracker_->set_line_pose_pref_q(cfg_.q_pref);
@@ -415,6 +435,11 @@ class KmpcNode : public rclcpp::Node {
         kmpc::kEeFrameLeft.data(), kmpc::kEeFrameRight.data());
     RCLCPP_INFO(
         get_logger(),
+        "line_pace mode=%s brake_m=%.3f freeze_m=0.080",
+        kmpc::CartesianTracker::line_pace_mode_name(line_pace_mode_),
+        line_brake_distance_m_);
+    RCLCPP_INFO(
+        get_logger(),
         "stream_io dedicated_thread=%d debug_q_hz=%.0f",
         stream_dedicated_thread_ ? 1 : 0, stream_debug_q_hz_);
     if (stream_dedicated_thread_) {
@@ -447,6 +472,11 @@ class KmpcNode : public rclcpp::Node {
     declare_parameter("require_xoip", true);
     declare_parameter("dq_scale", 1.0);
     declare_parameter("line_dq_scale", 0.60);
+    declare_parameter<std::string>(
+        "line_pace_mode",
+        kmpc::CartesianTracker::line_pace_mode_name(
+            kmpc::CartesianTracker::kDefaultLinePaceMode));
+    declare_parameter("line_brake_distance_m", 0.08);
     declare_parameter("line_pose_pref_enable", false);
     declare_parameter("line_diag_enable", false);
     declare_parameter<std::string>("layer_diag_path", "");
@@ -882,6 +912,9 @@ class KmpcNode : public rclcpp::Node {
     if (alarm_text_active(text)) {
       if (!alarm_block_) {
         RCLCPP_WARN(get_logger(), "alarm, stop stream: %s", text.c_str());
+        // Only targets at-or-before this watermark are stale on resume.
+        // A segment installed while blocked (enable-time approach) is kept.
+        alarm_block_generation_ = task_->generation();
       }
       alarm_block_ = true;
       alarm_clear_since_valid_ = false;
@@ -969,7 +1002,9 @@ class KmpcNode : public rclcpp::Node {
         reset_interpolator_to(*q_meas);
         safety_->seed(*q_meas);
         tracker_->reset();
-        task_->clear_cartesian();
+        // Keep a line segment that arrived while blocked (same enable tick).
+        // Still drop pre-alarm goals so an old reach is not chased again.
+        task_->drop_cartesian_up_to(alarm_block_generation_);
         joint_tracker_->reset();
         alarm_block_ = false;
         feedback_block_ = false;
@@ -1172,16 +1207,22 @@ class KmpcNode : public rclcpp::Node {
         line_pending_waist_locked_=upper.waist_locked;
         const bool pose_pref=line_pose_pref_enable_;
         const bool diag=line_diag_enable_;
+        const auto pace_mode=line_pace_mode_;
+        const double brake_m=line_brake_distance_m_;
         const kmpc::Vec18 q_pref=cfg_.q_pref;
         const auto line_cache=tracker_->last_line_cache();
         const uint64_t run_id=run_id_;
         line_future_=std::async(std::launch::async,
-            [config,source,xml,target,q0,is_left,upper,pose_pref,diag,q_pref,line_cache,run_id]() {
+            [config,source,xml,target,q0,is_left,upper,pose_pref,diag,pace_mode,brake_m,q_pref,line_cache,run_id]() {
           kmpc::Kinematics model(source,xml?kmpc::Kinematics::UrdfInput::Xml:kmpc::Kinematics::UrdfInput::Path);
           kmpc::CartesianTracker worker(model,config);
           worker.set_upper_commands(upper);
           worker.set_line_pose_pref(pose_pref);
           worker.set_line_pose_pref_q(q_pref);
+          worker.set_line_pace_mode(pace_mode);
+          if (!worker.set_line_brake_distance_m(brake_m)) {
+            throw kmpc::ConfigError("line_brake_distance_m must be finite and > 0");
+          }
           worker.import_last_line_cache(line_cache);
           worker.set_line_diag_enable(diag);
           worker.set_line_diag_run_id(run_id);
@@ -1549,6 +1590,11 @@ class KmpcNode : public rclcpp::Node {
     }
     ros_num("dq_scale", 1.0, dq_scale_, "1", "[0,1]");
     ros_num("line_dq_scale", 0.60, line_dq_scale_, "1", "[0,1]");
+    add("line_pace_mode",
+        kmpc::CartesianTracker::line_pace_mode_name(line_pace_mode_), "enum",
+        "ros_param", "r11_scurve|r10b_first_order", true);
+    ros_num("line_brake_distance_m", 0.08, line_brake_distance_m_, "m", ">0");
+    add("line_freeze_distance_m", "0.08", "m", "compile_const", "=0.08", true);
     ros_num("stream_hz", 250.0, stream_hz_, "Hz", ">0");
     ros_num("interp_catch_s", 0.02, interp_catch_s_, "s", ">0");
     ros_num("interp_accel_s", 0.50, interp_accel_s_, "s", ">0");
@@ -1819,12 +1865,27 @@ class KmpcNode : public rclcpp::Node {
         " line_build_ms=" + std::to_string(tracker_->line_build_ms()) +
         " line_samples=" + std::to_string(tracker_->line_sample_count()) +
         " line_length_m=" + std::to_string(tracker_->line_length()) +
+        " line_prog=" + std::to_string(tracker_->line_progress()) +
+        " path_remain_m=" + std::to_string(tracker_->last_line_path_remain_m()) +
+        " line_brake=" + std::to_string(tracker_->last_line_brake()) +
+        " line_want=" + std::to_string(tracker_->last_line_want()) +
+        " line_rate=" + std::to_string(tracker_->line_rate()) +
+        " line_rate_acc=" +
+        std::string(
+            tracker_->line_pace_mode() ==
+                    kmpc::CartesianTracker::LinePaceMode::R10bFirstOrder
+                ? "na"
+                : std::to_string(tracker_->line_rate_acc())) +
+        " line_pace_mode=" +
+        kmpc::CartesianTracker::line_pace_mode_name(tracker_->line_pace_mode()) +
+        " line_brake_m=" + std::to_string(tracker_->line_brake_distance_m()) +
         " line_planning=" + std::to_string(line_future_.valid()) +
         " line_plan_builds=" + std::to_string(line_plan_builds_) +
         " line_plan_discards=" + std::to_string(line_plan_discards_) +
         " stream_commit_scale=" + std::to_string(line_commit_scale_) +
         " stream_step_ratio=" + std::to_string(line_commit_peak_ratio_) +
         " stream_limited_steps=" + std::to_string(line_limited_steps_) +
+        " stream_limited=" + std::to_string(line_limited_steps_ > 0 ? 1 : 0) +
         " tracking_state=" + std::string(kmpc::to_cstring(planner_->tracking_state())) +
         " waist_locked=" + std::string(planner_->waist_locked() ? "True" : "False") +
         " com_reject=" + std::string(planner_rx_->last_com_reject() ? "True" : "False") +
@@ -1962,6 +2023,9 @@ class KmpcNode : public rclcpp::Node {
   double hold_deadband_ = 0.01;
   double dq_scale_ = 1.0;
   double line_dq_scale_ = 0.60;
+  kmpc::CartesianTracker::LinePaceMode line_pace_mode_ =
+      kmpc::CartesianTracker::kDefaultLinePaceMode;
+  double line_brake_distance_m_ = 0.08;
   bool line_pose_pref_enable_ = false;
   bool line_diag_enable_ = false;
   bool layer_diag_on_ = false;
@@ -2004,6 +2068,7 @@ class KmpcNode : public rclcpp::Node {
   bool feedback_block_ = false;
   bool alarm_clear_since_valid_ = false;
   std::chrono::steady_clock::time_point alarm_clear_since_{};
+  uint64_t alarm_block_generation_ = 0;
   bool stream_fixed_ = false;
   bool stream_have_qp_ = false;
   kmpc::Vec18 stream_qp_to_ = kmpc::Vec18::Zero();

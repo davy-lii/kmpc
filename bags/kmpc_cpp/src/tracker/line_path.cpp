@@ -19,7 +19,8 @@ namespace {
 
 constexpr double kLineSampleM = 0.005;
 constexpr double kLineReplanM = 0.008;
-constexpr double kLineBrakeM = 0.08;
+// Freeze / abort-near-goal distance. Brake distance is a separate runtime param.
+constexpr double kLineFreezeM = 0.08;
 constexpr double kLineSampleTolM = 0.003;
 constexpr double kLineSolveTolM = 0.0015;
 constexpr double kLineAbortM = 0.05;
@@ -128,6 +129,14 @@ void CartesianTracker::set_line_jerk_s(double jerk_s) {
   } else {
     line_jerk_s_ = jerk_s;
   }
+}
+
+bool CartesianTracker::set_line_brake_distance_m(double meters) {
+  if (!std::isfinite(meters) || !(meters > 0.0)) {
+    return false;
+  }
+  line_brake_distance_m_ = meters;
+  return true;
 }
 
 void CartesianTracker::line_clear() {
@@ -1323,7 +1332,7 @@ bool CartesianTracker::line_build(
   built.pose_pref_decision=pose_decision;
   built.reverse_decision=reverse_decision;
   built.max_arm_fold=max_arm_fold(built.samples,arm);
-  built.frozen=dist<=kLineBrakeM;
+  built.frozen=dist<=kLineFreezeM;
   line_=std::move(built); line_q_=q0; line_rate_=0.0; line_rate_acc_=0.0; ++line_gen_;
   last_line_cache_committed_=false;
   line_diag_push(LineDiagLayer::Build,q0,line_.samples.back(),0.0,ms,candidate.c_str(),
@@ -1350,7 +1359,7 @@ bool CartesianTracker::follow_line(
   }
 
   if (line_.on && !line_.frozen &&
-      (line_.target - kin_.fk_pos(line_q_,line_.frame)).norm() <= kLineBrakeM) line_.frozen=true;
+      (line_.target - kin_.fk_pos(line_q_,line_.frame)).norm() <= kLineFreezeM) line_.frozen=true;
   if (line_.frozen && !line_.refused) {
     const double pos_jump=(target-line_.target).norm();
     const double ori_jump=(quat && line_.ori_on) ? ori_error_xyzw(*quat,line_.quat).norm():0.0;
@@ -1411,14 +1420,31 @@ bool CartesianTracker::follow_line(
   // 步长看路径自身的增量，不看 q0。q0 偏了也不把方向拉去追它。
   double brake = 1.0;
   const double path_remain = line_.length_m * (1.0-line_.prog/std::max(nseg,1.0));
-  if (path_remain < kLineBrakeM) brake = std::max(0.05,path_remain/kLineBrakeM);
+  const double brake_m = line_brake_distance_m_;
+  if (path_remain < brake_m) brake = std::max(0.05, path_remain / brake_m);
   const double speed = line_speed_scale_;
   const double want = speed * brake;
+  last_line_path_remain_m_ = path_remain;
+  last_line_brake_ = brake;
+  last_line_want_ = want;
   // 加减速只乘在路径进度这一个标量上，再去采样已经求好的折线。不能按关节各做一条 S 曲线，
   // 否则手会离开直线，预备点/抓取点上会重新出现走过再折返。
   if (speed <= 1e-4) {
     line_rate_ = 0.0;
     line_rate_acc_ = 0.0;
+  } else if (line_pace_mode_ == LinePaceMode::R10bFirstOrder) {
+    // Local restore of 08e16ce first-order tracking of want. rate_acc is N/A.
+    line_rate_acc_ = 0.0;
+    if (!(line_accel_s_ > 1e-3)) {
+      line_rate_ = want;
+    } else {
+      const double du = constraints_.dt() / line_accel_s_;
+      if (line_rate_ < want) {
+        line_rate_ = std::min(want, line_rate_ + du);
+      } else {
+        line_rate_ = std::max(want, line_rate_ - du);
+      }
+    }
   } else if (!(line_accel_s_ > 1e-3)) {
     line_rate_ = want;
     line_rate_acc_ = 0.0;
@@ -1475,7 +1501,7 @@ bool CartesianTracker::follow_line(
                  line_.candidate.c_str(),"qp");
   const Vec18 dq=next-q_from;
   line_q_=next;
-  if((line_.target-kin_.fk_pos(next,line_.frame)).norm()<=kLineBrakeM) line_.frozen=true;
+  if((line_.target-kin_.fk_pos(next,line_.frame)).norm()<=kLineFreezeM) line_.frozen=true;
   last_arrived_ = false;
   line_diag_push(LineDiagLayer::FollowCommit,next,q0,line_.prog,0.0,
                  line_.candidate.c_str(),"commit");

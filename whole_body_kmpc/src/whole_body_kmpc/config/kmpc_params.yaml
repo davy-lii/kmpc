@@ -100,6 +100,11 @@ kmpc_node:
     interp_catch_s: 0.02
     interp_accel_s: 0.50
     interp_jerk_s: 0.08
+    # 直线路径 rate：r10b_first_order（实验默认）| r11_scurve（对照）。
+    # 实际以 ROS launch/节点参数为准；此处作文档锚点。
+    line_pace_mode: r10b_first_order
+    # 只影响 path_remain 刹车比例；冻结距离仍固定 0.08 m。
+    line_brake_distance_m: 0.08
     joint_states_topic: /joint_states
     enable_topic: /kmpc/enable
     mode_topic: /kmpc/mode

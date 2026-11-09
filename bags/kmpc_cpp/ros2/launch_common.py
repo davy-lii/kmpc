@@ -229,6 +229,9 @@ def _real_setup(context, *args, **kwargs):
     actions.append(kmpc_node_action(robot_desc, paths, {
         'line_dq_scale': ParameterValue(
             LaunchConfiguration('line_dq_scale'), value_type=float),
+        'line_pace_mode': LaunchConfiguration('line_pace_mode'),
+        'line_brake_distance_m': ParameterValue(
+            LaunchConfiguration('line_brake_distance_m'), value_type=float),
         'stream_hz': ParameterValue(
             LaunchConfiguration('stream_hz'), value_type=float),
         'interp_catch_s': ParameterValue(
@@ -268,6 +271,12 @@ def generate_real_launch():
         DeclareLaunchArgument(
             'line_dq_scale', default_value=LaunchConfiguration('dq_scale'),
             description='直线段速度比例，默认跟随 dq_scale'),
+        DeclareLaunchArgument(
+            'line_pace_mode', default_value='r10b_first_order',
+            description='直线路径 rate 更新：r10b_first_order（实验默认）或 r11_scurve（对照）'),
+        DeclareLaunchArgument(
+            'line_brake_distance_m', default_value='0.08',
+            description='直线 path_remain 刹车距离（m）；与冻结 0.08 m 拆开，非法值拒绝启动'),
         DeclareLaunchArgument(
             'stream_hz', default_value='250.0',
             description='插补后发 multi_joint_servo_cmd 的频率；须与驱动 stream_control_rate 对齐'),

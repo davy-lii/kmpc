@@ -125,6 +125,30 @@ class TaskReceiver {
     saw_cartesian_ = false;
   }
 
+  // Accepted generation watermark. Alarm resume uses this to drop only
+  // targets that were already known when the alarm latched.
+  uint64_t generation() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return generation_;
+  }
+
+  // Drop cartesian targets with generation <= gen. If none remain, rewind
+  // generation_ to gen so a later segment with a newer id can still install
+  // (alarm resume must not permanently reject the enable-time goal).
+  void drop_cartesian_up_to(uint64_t gen) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (left_ && left_->generation <= gen) {
+      left_.reset();
+    }
+    if (right_ && right_->generation <= gen) {
+      right_.reset();
+    }
+    saw_cartesian_ = left_.has_value() || right_.has_value();
+    if (!saw_cartesian_) {
+      generation_ = gen;
+    }
+  }
+
   void clear_left() {
     std::lock_guard<std::mutex> lock(mu_);
     left_.reset();
