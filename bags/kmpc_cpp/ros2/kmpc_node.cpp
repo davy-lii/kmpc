@@ -1676,8 +1676,11 @@ class KmpcNode : public rclcpp::Node {
     add("line_brake_profile",
         kmpc::CartesianTracker::line_brake_profile_name(line_brake_profile_),
         "enum", "ros_param", "linear|sqrt", true);
-    ros_num("line_qp_max_iter", 200.0, static_cast<double>(line_qp_max_iter_),
-            "iters", "[1,10000]");
+    {
+      const int raw = int_param("line_qp_max_iter", 200);
+      num("line_qp_max_iter", static_cast<double>(line_qp_max_iter_), "iters",
+          raw == 200 ? "node_default" : "ros_override", "[1,10000]", true);
+    }
     add("line_freeze_distance_m", "0.08", "m", "compile_const", "=0.08", true);
     ros_bool("line_pitch_straighten_enable", false);
     ros_bool("line_qp_pitch_monotonic_enable", true);
