@@ -238,8 +238,7 @@ class KmpcNode : public rclcpp::Node {
       line_brake_profile_ = profile;
       tracker_->set_line_brake_profile(profile);
     }
-    line_qp_max_iter_ = static_cast<int>(
-        std::lround(double_param("line_qp_max_iter", 200.0)));
+    line_qp_max_iter_ = int_param("line_qp_max_iter", 200);
     if (!tracker_->set_line_qp_max_iter(line_qp_max_iter_)) {
       throw kmpc::ConfigError(
           "line_qp_max_iter must be in [1,10000]");
@@ -527,7 +526,7 @@ class KmpcNode : public rclcpp::Node {
         "line_brake_profile",
         kmpc::CartesianTracker::line_brake_profile_name(
             kmpc::CartesianTracker::kDefaultLineBrakeProfile));
-    declare_parameter("line_qp_max_iter", 200.0);
+    declare_parameter("line_qp_max_iter", 200);
     declare_parameter("line_pose_pref_enable", false);
     declare_parameter("line_pitch_straighten_enable", false);
     declare_parameter("line_qp_pitch_monotonic_enable", true);
@@ -573,6 +572,13 @@ class KmpcNode : public rclcpp::Node {
       return fallback;
     }
     return get_parameter(name).as_double();
+  }
+
+  int int_param(const char* name, int fallback) {
+    if (!has_parameter(name)) {
+      return fallback;
+    }
+    return static_cast<int>(get_parameter(name).as_int());
   }
 
   void on_joint_states(sensor_msgs::msg::JointState::ConstSharedPtr msg) {

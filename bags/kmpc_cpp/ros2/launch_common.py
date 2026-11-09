@@ -236,7 +236,7 @@ def _real_setup(context, *args, **kwargs):
             LaunchConfiguration('line_brake_floor'), value_type=float),
         'line_brake_profile': LaunchConfiguration('line_brake_profile'),
         'line_qp_max_iter': ParameterValue(
-            LaunchConfiguration('line_qp_max_iter'), value_type=float),
+            LaunchConfiguration('line_qp_max_iter'), value_type=int),
         'stream_hz': ParameterValue(
             LaunchConfiguration('stream_hz'), value_type=float),
         'interp_catch_s': ParameterValue(
