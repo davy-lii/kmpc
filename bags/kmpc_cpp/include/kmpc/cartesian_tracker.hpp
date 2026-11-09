@@ -128,12 +128,65 @@ class CartesianTracker {
   // Returns false on non-finite or non-positive values; caller must refuse startup.
   bool set_line_brake_distance_m(double meters);
   double line_brake_distance_m() const { return line_brake_distance_m_; }
+  // End-of-path rate floor in (0,1]. Old hard-coded 0.05 caused multi-second crawl.
+  bool set_line_brake_floor(double floor);
+  double line_brake_floor() const { return line_brake_floor_; }
+  enum class LineBrakeProfile : uint8_t { Linear = 0, Sqrt = 1 };
+  static constexpr LineBrakeProfile kDefaultLineBrakeProfile = LineBrakeProfile::Sqrt;
+  static const char* line_brake_profile_name(LineBrakeProfile profile) {
+    return profile == LineBrakeProfile::Sqrt ? "sqrt" : "linear";
+  }
+  static bool parse_line_brake_profile(std::string_view text, LineBrakeProfile* out) {
+    if (!out) {
+      return false;
+    }
+    if (text == "sqrt") {
+      *out = LineBrakeProfile::Sqrt;
+      return true;
+    }
+    if (text == "linear") {
+      *out = LineBrakeProfile::Linear;
+      return true;
+    }
+    return false;
+  }
+  bool set_line_brake_profile(LineBrakeProfile profile) {
+    line_brake_profile_ = profile;
+    return true;
+  }
+  LineBrakeProfile line_brake_profile() const { return line_brake_profile_; }
+  // Sparse line ProxQP iteration budget. Non-SOLVED still refuses the segment.
+  bool set_line_qp_max_iter(int max_iter);
+  int line_qp_max_iter() const { return line_qp_max_iter_; }
   double line_rate() const { return line_rate_; }
   // S-curve acceleration state. First-order mode keeps this at 0 (not applicable).
   double line_rate_acc() const { return line_rate_acc_; }
   double last_line_path_remain_m() const { return last_line_path_remain_m_; }
   double last_line_brake() const { return last_line_brake_; }
   double last_line_want() const { return last_line_want_; }
+  // Segment phase timing (steady_clock seconds). -1 means not observed yet.
+  double line_seg_start_s() const { return line_seg_start_s_; }
+  double line_tail_enter_brake_s() const { return line_tail_enter_brake_s_; }
+  double line_tail_enter_2cm_s() const { return line_tail_enter_2cm_s_; }
+  double line_tail_hold_s() const { return line_tail_hold_s_; }
+  // Bounded last line-QP failure snapshot for notes / ERROR logs.
+  struct LineQpFailSnapshot {
+    bool valid = false;
+    int status = -1;
+    char status_name[24]{};
+    int iter = -1;
+    double pri_res = 0.0;
+    double dua_res = 0.0;
+    double solve_ms = 0.0;
+    int worst_c = -1;
+    double worst_violation = 0.0;
+    double path_remain_m = 0.0;
+    double prog = 0.0;
+    double pitch_deg = 0.0;
+    double ee_err_m = 0.0;
+    char reason[64]{};
+  };
+  const LineQpFailSnapshot& last_line_qp_fail() const { return last_line_qp_fail_; }
   // Explicit segment boundary. Target updates alone never clear a refusal.
   bool rearm_line(uint64_t generation, const std::optional<LineTarget>& tip = std::nullopt);
   void set_line_reference(const Vec18& q) { line_reference_ = q; }
@@ -416,11 +469,19 @@ class CartesianTracker {
   double line_jerk_s_ = 0.08;
   LinePaceMode line_pace_mode_ = kDefaultLinePaceMode;
   double line_brake_distance_m_ = 0.08;
+  double line_brake_floor_ = 0.20;
+  LineBrakeProfile line_brake_profile_ = kDefaultLineBrakeProfile;
+  int line_qp_max_iter_ = 200;
   double line_rate_ = 0.0;
   double line_rate_acc_ = 0.0;
   double last_line_path_remain_m_ = 0.0;
   double last_line_brake_ = 1.0;
   double last_line_want_ = 0.0;
+  double line_seg_start_s_ = -1.0;
+  double line_tail_enter_brake_s_ = -1.0;
+  double line_tail_enter_2cm_s_ = -1.0;
+  double line_tail_hold_s_ = -1.0;
+  LineQpFailSnapshot last_line_qp_fail_{};
   bool line_pose_pref_enable_ = false;
   Vec18 line_q_pref_ = Vec18::Zero();
   // Soft posture pull and acceptance budgets (radians unless noted).

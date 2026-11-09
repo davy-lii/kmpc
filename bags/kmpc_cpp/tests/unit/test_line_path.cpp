@@ -968,6 +968,8 @@ TEST(LinePath, BrakeDistanceDoesNotChangeFreezeThreshold) {
   kmpc::CartesianTracker tracker(kin, cfg_all);
   tracker.set_line_pace_mode(kmpc::CartesianTracker::LinePaceMode::R10bFirstOrder);
   ASSERT_TRUE(tracker.set_line_brake_distance_m(0.20));  // wider brake, freeze stays 0.08
+  ASSERT_TRUE(tracker.set_line_brake_floor(0.20));
+  tracker.set_line_brake_profile(kmpc::CartesianTracker::LineBrakeProfile::Sqrt);
   tracker.set_line_pace(0.3, 0.0);
   ASSERT_TRUE(tracker.rearm_line(1));
   bool saw_full = false;
@@ -982,8 +984,9 @@ TEST(LinePath, BrakeDistanceDoesNotChangeFreezeThreshold) {
       EXPECT_NEAR(tracker.last_line_brake(), 1.0, 1e-12);
       saw_full = true;
     } else if (remain > 1e-9) {
-      EXPECT_NEAR(tracker.last_line_brake(),
-                  std::max(0.05, remain / 0.20), 1e-9);
+      const double expected =
+          std::max(0.20, std::sqrt(std::max(0.0, remain / 0.20)));
+      EXPECT_NEAR(tracker.last_line_brake(), expected, 1e-9);
       saw_brake_scale = true;
     }
     if (tracker.line_frozen()) {

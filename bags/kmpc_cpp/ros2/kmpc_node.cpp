@@ -217,6 +217,34 @@ class KmpcNode : public rclcpp::Node {
           "line_brake_distance_m must be finite and > 0");
     }
     line_brake_distance_m_ = tracker_->line_brake_distance_m();
+    line_brake_floor_ = double_param("line_brake_floor", 0.20);
+    if (!tracker_->set_line_brake_floor(line_brake_floor_)) {
+      throw kmpc::ConfigError(
+          "line_brake_floor must be finite and in (0,1]");
+    }
+    line_brake_floor_ = tracker_->line_brake_floor();
+    {
+      const std::string profile_text =
+          str_or("line_brake_profile",
+                 kmpc::CartesianTracker::line_brake_profile_name(
+                     kmpc::CartesianTracker::kDefaultLineBrakeProfile));
+      kmpc::CartesianTracker::LineBrakeProfile profile =
+          kmpc::CartesianTracker::kDefaultLineBrakeProfile;
+      if (!kmpc::CartesianTracker::parse_line_brake_profile(profile_text,
+                                                            &profile)) {
+        throw kmpc::ConfigError(
+            "line_brake_profile must be linear or sqrt");
+      }
+      line_brake_profile_ = profile;
+      tracker_->set_line_brake_profile(profile);
+    }
+    line_qp_max_iter_ = static_cast<int>(
+        std::lround(double_param("line_qp_max_iter", 200.0)));
+    if (!tracker_->set_line_qp_max_iter(line_qp_max_iter_)) {
+      throw kmpc::ConfigError(
+          "line_qp_max_iter must be in [1,10000]");
+    }
+    line_qp_max_iter_ = tracker_->line_qp_max_iter();
     line_pose_pref_enable_ = bool_param("line_pose_pref_enable", false);
     tracker_->set_line_pose_pref(line_pose_pref_enable_);
     tracker_->set_line_pose_pref_q(cfg_.q_pref);
@@ -445,10 +473,13 @@ class KmpcNode : public rclcpp::Node {
         kmpc::kEeFrameLeft.data(), kmpc::kEeFrameRight.data());
     RCLCPP_INFO(
         get_logger(),
-        "line_pace mode=%s brake_m=%.3f freeze_m=0.080 "
+        "line_pace mode=%s brake_m=%.3f brake_floor=%.3f brake_profile=%s "
+        "qp_max_iter=%d freeze_m=0.080 "
         "pitch_straighten=%d qp_pitch_mono=%d reverse_last_line=%d",
         kmpc::CartesianTracker::line_pace_mode_name(line_pace_mode_),
-        line_brake_distance_m_,
+        line_brake_distance_m_, line_brake_floor_,
+        kmpc::CartesianTracker::line_brake_profile_name(line_brake_profile_),
+        line_qp_max_iter_,
         line_pitch_straighten_enable_ ? 1 : 0,
         line_qp_pitch_monotonic_enable_ ? 1 : 0,
         reverse_last_line_enable_ ? 1 : 0);
@@ -491,6 +522,12 @@ class KmpcNode : public rclcpp::Node {
         kmpc::CartesianTracker::line_pace_mode_name(
             kmpc::CartesianTracker::kDefaultLinePaceMode));
     declare_parameter("line_brake_distance_m", 0.08);
+    declare_parameter("line_brake_floor", 0.20);
+    declare_parameter<std::string>(
+        "line_brake_profile",
+        kmpc::CartesianTracker::line_brake_profile_name(
+            kmpc::CartesianTracker::kDefaultLineBrakeProfile));
+    declare_parameter("line_qp_max_iter", 200.0);
     declare_parameter("line_pose_pref_enable", false);
     declare_parameter("line_pitch_straighten_enable", false);
     declare_parameter("line_qp_pitch_monotonic_enable", true);
@@ -1229,13 +1266,16 @@ class KmpcNode : public rclcpp::Node {
         const bool diag=line_diag_enable_;
         const auto pace_mode=line_pace_mode_;
         const double brake_m=line_brake_distance_m_;
+        const double brake_floor=line_brake_floor_;
+        const auto brake_profile=line_brake_profile_;
+        const int qp_max_iter=line_qp_max_iter_;
         const kmpc::Vec18 q_pref=cfg_.q_pref;
         const auto line_cache=tracker_->last_line_cache();
         const uint64_t run_id=run_id_;
         line_future_=std::async(std::launch::async,
             [config,source,xml,target,q0,is_left,upper,pose_pref,pitch_straighten,
-             qp_pitch_mono,reverse_last,diag,pace_mode,brake_m,q_pref,line_cache,
-             run_id]() {
+             qp_pitch_mono,reverse_last,diag,pace_mode,brake_m,brake_floor,
+             brake_profile,qp_max_iter,q_pref,line_cache,run_id]() {
           kmpc::Kinematics model(source,xml?kmpc::Kinematics::UrdfInput::Xml:kmpc::Kinematics::UrdfInput::Path);
           kmpc::CartesianTracker worker(model,config);
           worker.set_upper_commands(upper);
@@ -1247,6 +1287,13 @@ class KmpcNode : public rclcpp::Node {
           worker.set_line_pace_mode(pace_mode);
           if (!worker.set_line_brake_distance_m(brake_m)) {
             throw kmpc::ConfigError("line_brake_distance_m must be finite and > 0");
+          }
+          if (!worker.set_line_brake_floor(brake_floor)) {
+            throw kmpc::ConfigError("line_brake_floor must be finite and in (0,1]");
+          }
+          worker.set_line_brake_profile(brake_profile);
+          if (!worker.set_line_qp_max_iter(qp_max_iter)) {
+            throw kmpc::ConfigError("line_qp_max_iter must be in [1,10000]");
           }
           worker.import_last_line_cache(line_cache);
           worker.set_line_diag_enable(diag);
@@ -1619,6 +1666,12 @@ class KmpcNode : public rclcpp::Node {
         kmpc::CartesianTracker::line_pace_mode_name(line_pace_mode_), "enum",
         "ros_param", "r11_scurve|r10b_first_order", true);
     ros_num("line_brake_distance_m", 0.08, line_brake_distance_m_, "m", ">0");
+    ros_num("line_brake_floor", 0.20, line_brake_floor_, "1", "(0,1]");
+    add("line_brake_profile",
+        kmpc::CartesianTracker::line_brake_profile_name(line_brake_profile_),
+        "enum", "ros_param", "linear|sqrt", true);
+    ros_num("line_qp_max_iter", 200.0, static_cast<double>(line_qp_max_iter_),
+            "iters", "[1,10000]");
     add("line_freeze_distance_m", "0.08", "m", "compile_const", "=0.08", true);
     ros_bool("line_pitch_straighten_enable", false);
     ros_bool("line_qp_pitch_monotonic_enable", true);
@@ -1834,8 +1887,23 @@ class KmpcNode : public rclcpp::Node {
         last_reported_line_stop_reason_!=tracker_->line_reason())) {
       last_reported_line_stop_gen_=tracker_->goal_generation();
       last_reported_line_stop_reason_=tracker_->line_reason();
-      RCLCPP_ERROR(get_logger(),"line stopped generation=%llu reason=%s",
-          static_cast<unsigned long long>(tracker_->goal_generation()),tracker_->line_reason().c_str());
+      const auto& fail = tracker_->last_line_qp_fail();
+      if (fail.valid) {
+        RCLCPP_ERROR(
+            get_logger(),
+            "line stopped generation=%llu reason=%s status=%s(%d) iter=%d "
+            "pri_res=%.3e dua_res=%.3e solve_ms=%.3f worst_c=%d worst_viol=%.3e "
+            "path_remain_m=%.4f prog=%.4f pitch_deg=%.3f ee_err_m=%.4f",
+            static_cast<unsigned long long>(tracker_->goal_generation()),
+            tracker_->line_reason().c_str(), fail.status_name, fail.status,
+            fail.iter, fail.pri_res, fail.dua_res, fail.solve_ms, fail.worst_c,
+            fail.worst_violation, fail.path_remain_m, fail.prog, fail.pitch_deg,
+            fail.ee_err_m);
+      } else {
+        RCLCPP_ERROR(get_logger(),"line stopped generation=%llu reason=%s",
+            static_cast<unsigned long long>(tracker_->goal_generation()),
+            tracker_->line_reason().c_str());
+      }
     }
     publish_arrived(arbiter_->enabled() && last_use_cart_ && arrived);
     const kmpc::Vec3 com = last_use_cart_ ? tracker_->last_com()
@@ -1907,6 +1975,11 @@ class KmpcNode : public rclcpp::Node {
         " line_pace_mode=" +
         kmpc::CartesianTracker::line_pace_mode_name(tracker_->line_pace_mode()) +
         " line_brake_m=" + std::to_string(tracker_->line_brake_distance_m()) +
+        " line_brake_floor=" + std::to_string(tracker_->line_brake_floor()) +
+        " line_brake_profile=" +
+        kmpc::CartesianTracker::line_brake_profile_name(
+            tracker_->line_brake_profile()) +
+        " line_qp_max_iter=" + std::to_string(tracker_->line_qp_max_iter()) +
         " pitch_straighten=" +
         std::string(tracker_->line_pitch_straighten_enabled() ? "1" : "0") +
         " pitch_straighten_hits=" +
@@ -1917,6 +1990,33 @@ class KmpcNode : public rclcpp::Node {
         std::to_string(tracker_->line_qp_pitch_monotonic_hits()) +
         " reverse_last_line=" +
         std::string(tracker_->reverse_last_line_enabled() ? "1" : "0") +
+        " tail_brake_dt_s=" +
+        std::to_string(
+            (tracker_->line_tail_enter_brake_s() < 0.0 ||
+             tracker_->line_seg_start_s() < 0.0)
+                ? -1.0
+                : (tracker_->line_tail_enter_brake_s() -
+                   tracker_->line_seg_start_s())) +
+        " tail_2cm_dt_s=" +
+        std::to_string(
+            (tracker_->line_tail_enter_2cm_s() < 0.0 ||
+             tracker_->line_seg_start_s() < 0.0)
+                ? -1.0
+                : (tracker_->line_tail_enter_2cm_s() -
+                   tracker_->line_seg_start_s())) +
+        " tail_hold_dt_s=" +
+        std::to_string(
+            (tracker_->line_tail_hold_s() < 0.0 ||
+             tracker_->line_seg_start_s() < 0.0)
+                ? -1.0
+                : (tracker_->line_tail_hold_s() - tracker_->line_seg_start_s())) +
+        " tail_2cm_to_hold_s=" +
+        std::to_string(
+            (tracker_->line_tail_hold_s() < 0.0 ||
+             tracker_->line_tail_enter_2cm_s() < 0.0)
+                ? -1.0
+                : (tracker_->line_tail_hold_s() -
+                   tracker_->line_tail_enter_2cm_s())) +
         " line_planning=" + std::to_string(line_future_.valid()) +
         " line_plan_builds=" + std::to_string(line_plan_builds_) +
         " line_plan_discards=" + std::to_string(line_plan_discards_) +
@@ -1976,6 +2076,21 @@ class KmpcNode : public rclcpp::Node {
           "," +
           std::to_string(kmpc::rad_to_deg(joint_tracker_->last_pitch_seg_hi())) +
           ")";
+    }
+    if (tracker_->last_line_qp_fail().valid) {
+      const auto& fail = tracker_->last_line_qp_fail();
+      status.data +=
+          " qp_fail_status=" + std::string(fail.status_name) +
+          "(" + std::to_string(fail.status) + ")" +
+          " qp_fail_iter=" + std::to_string(fail.iter) +
+          " qp_fail_pri_res=" + std::to_string(fail.pri_res) +
+          " qp_fail_dua_res=" + std::to_string(fail.dua_res) +
+          " qp_fail_solve_ms=" + std::to_string(fail.solve_ms) +
+          " qp_fail_worst_c=" + std::to_string(fail.worst_c) +
+          " qp_fail_worst_viol=" + std::to_string(fail.worst_violation) +
+          " qp_fail_path_remain_m=" + std::to_string(fail.path_remain_m) +
+          " qp_fail_pitch_deg=" + std::to_string(fail.pitch_deg) +
+          " qp_fail_ee_err_m=" + std::to_string(fail.ee_err_m);
     }
     dbg_status_->publish(status);
     status_pub_->publish(status);
@@ -2064,6 +2179,10 @@ class KmpcNode : public rclcpp::Node {
   kmpc::CartesianTracker::LinePaceMode line_pace_mode_ =
       kmpc::CartesianTracker::kDefaultLinePaceMode;
   double line_brake_distance_m_ = 0.08;
+  double line_brake_floor_ = 0.20;
+  kmpc::CartesianTracker::LineBrakeProfile line_brake_profile_ =
+      kmpc::CartesianTracker::kDefaultLineBrakeProfile;
+  int line_qp_max_iter_ = 200;
   bool line_pose_pref_enable_ = false;
   bool line_pitch_straighten_enable_ = false;
   bool line_qp_pitch_monotonic_enable_ = true;

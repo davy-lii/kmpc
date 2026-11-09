@@ -105,6 +105,11 @@ kmpc_node:
     line_pace_mode: r10b_first_order
     # 只影响 path_remain 刹车比例；冻结距离仍固定 0.08 m。
     line_brake_distance_m: 0.08
+    # 末端 rate 地板与曲线；旧硬编码 floor=0.05 + linear 易慢尾。
+    line_brake_floor: 0.20
+    line_brake_profile: sqrt
+    # 直线 sparse ProxQP 迭代预算；非 SOLVED 仍拒绝。
+    line_qp_max_iter: 200
     # P0 路径层隔离开关（与 launch 默认一致；真机以 launch/节点参数为准）。
     line_pitch_straighten_enable: false
     line_qp_pitch_monotonic_enable: true

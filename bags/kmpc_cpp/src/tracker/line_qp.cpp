@@ -4,7 +4,9 @@
 #include "kmpc/path_progress.hpp"
 #include "kmpc/tracker_math.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <Eigen/SparseCore>
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-parameter"
@@ -13,9 +15,46 @@
 #pragma GCC diagnostic pop
 
 namespace kmpc {
+namespace {
+
+const char* proxqp_status_name(proxsuite::proxqp::QPSolverOutput status) {
+  using S = proxsuite::proxqp::QPSolverOutput;
+  switch (status) {
+    case S::PROXQP_SOLVED:
+      return "SOLVED";
+    case S::PROXQP_SOLVED_CLOSEST_PRIMAL_FEASIBLE:
+      return "SOLVED_CLOSEST";
+    case S::PROXQP_MAX_ITER_REACHED:
+      return "MAX_ITER";
+    case S::PROXQP_PRIMAL_INFEASIBLE:
+      return "PRIMAL_INFEASIBLE";
+    case S::PROXQP_DUAL_INFEASIBLE:
+      return "DUAL_INFEASIBLE";
+    case S::PROXQP_NOT_RUN:
+      return "NOT_RUN";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+}  // namespace
+
 bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
                                      const Vec18& cap, Vec18& to) {
-  auto reject=[this](const std::string& reason) { line_.reason=reason; return false; };
+  auto reject=[this](const std::string& reason) {
+    line_.reason=reason;
+    std::snprintf(last_line_qp_fail_.reason, sizeof(last_line_qp_fail_.reason), "%s",
+                  reason.c_str());
+    last_line_qp_fail_.valid = true;
+    return false;
+  };
+  last_line_qp_fail_ = LineQpFailSnapshot{};
+  last_line_qp_fail_.path_remain_m = last_line_path_remain_m_;
+  last_line_qp_fail_.prog = next_prog;
+  last_line_qp_fail_.pitch_deg = rad_to_deg(from.head<3>().sum());
+  last_line_qp_fail_.ee_err_m =
+      (line_.target - kin_.fk_pos(from, line_.frame)).norm();
+
   constexpr int d=kNWaist+kNArm;
   const int n=std::clamp(n_horizon_,1,30), nx=n*d;
   const int arm=line_.left?kSliceLeft.begin:kSliceRight.begin;
@@ -136,22 +175,70 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
   Eigen::SparseMatrix<double> H(nx,nx),C(nc,nx);
   H.setFromTriplets(ht.begin(),ht.end()); C.setFromTriplets(ct.begin(),ct.end());
   const Eigen::Map<Eigen::VectorXd> lo(lower.data(),nc),hi(upper.data(),nc);
-  if((lo.array()>hi.array()).any()) return reject("qp_bounds");
+  auto fill_worst=[&](const Eigen::VectorXd& x_cand) {
+    if (x_cand.size() != nx || nc <= 0) {
+      return;
+    }
+    const Eigen::VectorXd cx = C * x_cand;
+    double worst = 0.0;
+    int wi = -1;
+    for (int i = 0; i < nc; ++i) {
+      const double v = std::max(lo[i] - cx[i], cx[i] - hi[i]);
+      if (v > worst) {
+        worst = v;
+        wi = i;
+      }
+    }
+    last_line_qp_fail_.worst_c = wi;
+    last_line_qp_fail_.worst_violation = worst;
+  };
+  if((lo.array()>hi.array()).any()) {
+    double worst = 0.0;
+    int wi = -1;
+    for (int i = 0; i < nc; ++i) {
+      const double v = lo[i] - hi[i];
+      if (v > worst) {
+        worst = v;
+        wi = i;
+      }
+    }
+    last_line_qp_fail_.worst_c = wi;
+    last_line_qp_fail_.worst_violation = worst;
+    return reject("qp_bounds");
+  }
   Eigen::VectorXd x;
   try {
     proxsuite::proxqp::sparse::QP<double,int> qp(nx,0,nc);
-    qp.settings.eps_abs=1e-7; qp.settings.eps_rel=0.0; qp.settings.max_iter=100;
+    qp.settings.eps_abs=1e-7; qp.settings.eps_rel=0.0;
+    qp.settings.max_iter=line_qp_max_iter_;
     qp.settings.verbose=false;
     qp.init(H,g,proxsuite::nullopt,proxsuite::nullopt,C,lo,hi);
     ++line_qp_solves_;
+    const auto t0 = std::chrono::steady_clock::now();
     qp.solve();
-    if(qp.results.info.status!=proxsuite::proxqp::QPSolverOutput::PROXQP_SOLVED) return reject("qp_status_"+std::to_string(static_cast<int>(qp.results.info.status)));
+    const auto t1 = std::chrono::steady_clock::now();
+    last_line_qp_fail_.solve_ms =
+        std::chrono::duration<double, std::milli>(t1 - t0).count();
+    last_line_qp_fail_.status = static_cast<int>(qp.results.info.status);
+    std::snprintf(last_line_qp_fail_.status_name,
+                  sizeof(last_line_qp_fail_.status_name), "%s",
+                  proxqp_status_name(qp.results.info.status));
+    last_line_qp_fail_.iter = static_cast<int>(qp.results.info.iter);
+    last_line_qp_fail_.pri_res = static_cast<double>(qp.results.info.pri_res);
+    last_line_qp_fail_.dua_res = static_cast<double>(qp.results.info.dua_res);
+    fill_worst(qp.results.x);
+    if(qp.results.info.status!=proxsuite::proxqp::QPSolverOutput::PROXQP_SOLVED) {
+      return reject("qp_status_"+std::to_string(static_cast<int>(qp.results.info.status)));
+    }
     x=qp.results.x;
   } catch(...) { return reject("qp_exception"); }
   if(!x.allFinite()) return reject("qp_nonfinite");
   if(line_.waist_locked) for(int k=0;k<n;++k) x.segment(k*d,kNWaist).setZero();
   const Eigen::VectorXd cx=C*x;
-  if((cx.array()<lo.array()-2e-7).any() || (cx.array()>hi.array()+2e-7).any()) return reject("qp_primal_residual");
+  if((cx.array()<lo.array()-2e-7).any() || (cx.array()>hi.array()+2e-7).any()) {
+    fill_worst(x);
+    return reject("qp_primal_residual");
+  }
   prev=from;
   // The first interval starts at the actual stream reference, not the old endpoint.
   double previous_t=(kin_.fk_pos(from,line_.frame)-p_start).dot(line_.target-p_start)/
@@ -175,6 +262,8 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
     if(k==0) to=q;
     prev=q; previous_t=t;
   }
+  // Success clears the fail latch so notes only show the last real refusal.
+  last_line_qp_fail_ = LineQpFailSnapshot{};
   return true;
 }
 } // namespace kmpc

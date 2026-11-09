@@ -139,6 +139,22 @@ bool CartesianTracker::set_line_brake_distance_m(double meters) {
   return true;
 }
 
+bool CartesianTracker::set_line_brake_floor(double floor) {
+  if (!std::isfinite(floor) || !(floor > 0.0) || !(floor <= 1.0)) {
+    return false;
+  }
+  line_brake_floor_ = floor;
+  return true;
+}
+
+bool CartesianTracker::set_line_qp_max_iter(int max_iter) {
+  if (max_iter < 1 || max_iter > 10000) {
+    return false;
+  }
+  line_qp_max_iter_ = max_iter;
+  return true;
+}
+
 void CartesianTracker::line_clear() {
   line_ = LineRun{};
   line_q_.setZero();
@@ -148,6 +164,11 @@ void CartesianTracker::line_clear() {
   line_reference_.reset();
   last_line_cache_committed_ = false;
   reverse_decision_ = reverse_last_line_enable_ ? "skipped" : "disabled";
+  line_seg_start_s_ = -1.0;
+  line_tail_enter_brake_s_ = -1.0;
+  line_tail_enter_2cm_s_ = -1.0;
+  line_tail_hold_s_ = -1.0;
+  last_line_qp_fail_ = LineQpFailSnapshot{};
 }
 
 void CartesianTracker::clear_last_line_cache() {
@@ -1422,10 +1443,33 @@ bool CartesianTracker::follow_line(
           ? 0.0
           : static_cast<double>(line_.samples.size() - 1);
   // 步长看路径自身的增量，不看 q0。q0 偏了也不把方向拉去追它。
+  // 末端时间律：linear 旧式线性；sqrt 在相同 floor 下平均更快、仍连续降到 floor。
+  // 进度已到终点后必须 want=0，否则 floor 会把 rate 顶在 hold 门槛之上永远到不了点。
   double brake = 1.0;
   const double path_remain = line_.length_m * (1.0-line_.prog/std::max(nseg,1.0));
   const double brake_m = line_brake_distance_m_;
-  if (path_remain < brake_m) brake = std::max(0.05, path_remain / brake_m);
+  const bool prog_at_end = nseg <= 0.0 || line_.prog >= nseg - 1e-4;
+  const double now_s = std::chrono::duration<double>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+  if (line_seg_start_s_ < 0.0) {
+    line_seg_start_s_ = now_s;
+  }
+  if (prog_at_end) {
+    brake = 0.0;
+  } else if (path_remain < brake_m) {
+    double scale = path_remain / std::max(brake_m, 1e-9);
+    if (line_brake_profile_ == LineBrakeProfile::Sqrt) {
+      scale = std::sqrt(std::max(0.0, scale));
+    }
+    brake = std::max(line_brake_floor_, std::min(1.0, scale));
+    if (line_tail_enter_brake_s_ < 0.0) {
+      line_tail_enter_brake_s_ = now_s;
+    }
+  }
+  if (path_remain < 0.02 && line_tail_enter_2cm_s_ < 0.0) {
+    line_tail_enter_2cm_s_ = now_s;
+  }
   const double speed = line_speed_scale_;
   const double want = speed * brake;
   last_line_path_remain_m_ = path_remain;
@@ -1489,6 +1533,11 @@ bool CartesianTracker::follow_line(
     // 人已经在终点公差里。速度还没收完也不再解 QP，避免在预备点/抓取点上折返微调。
     if(line_rate_<=0.1*line_speed_scale_+1e-9) {
       line_.hold=true;line_q_=q_from;line_rate_=0;line_rate_acc_=0;last_arrived_=true;
+      if (line_tail_hold_s_ < 0.0) {
+        line_tail_hold_s_ = std::chrono::duration<double>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count();
+      }
       maybe_commit_last_line_cache(q0);
       line_diag_push(LineDiagLayer::FollowCommit,q_from,q0,line_.prog,0.0,
                      line_.candidate.c_str(),"hold");
@@ -1499,7 +1548,10 @@ bool CartesianTracker::follow_line(
   }
   Vec18 next = q_from;
   if (line_rate_ > 1e-4 && !line_path_qp(q_from,line_.prog,step_lim,next)) {
-    line_.prog=old_prog; refuse_line(line_.reason.empty()?"path_qp_or_tube":line_.reason); out.dq.setZero(); return false;
+    line_.prog=old_prog;
+    line_diag_push(LineDiagLayer::FollowQp,q_from,q_from,line_.prog,0.0,
+                   line_.candidate.c_str(),"qp_fail");
+    refuse_line(line_.reason.empty()?"path_qp_or_tube":line_.reason); out.dq.setZero(); return false;
   }
   line_diag_push(LineDiagLayer::FollowQp,next,q_from,line_.prog,0.0,
                  line_.candidate.c_str(),"qp");

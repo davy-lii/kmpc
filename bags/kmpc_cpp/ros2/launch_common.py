@@ -232,6 +232,11 @@ def _real_setup(context, *args, **kwargs):
         'line_pace_mode': LaunchConfiguration('line_pace_mode'),
         'line_brake_distance_m': ParameterValue(
             LaunchConfiguration('line_brake_distance_m'), value_type=float),
+        'line_brake_floor': ParameterValue(
+            LaunchConfiguration('line_brake_floor'), value_type=float),
+        'line_brake_profile': LaunchConfiguration('line_brake_profile'),
+        'line_qp_max_iter': ParameterValue(
+            LaunchConfiguration('line_qp_max_iter'), value_type=float),
         'stream_hz': ParameterValue(
             LaunchConfiguration('stream_hz'), value_type=float),
         'interp_catch_s': ParameterValue(
@@ -283,6 +288,15 @@ def generate_real_launch():
         DeclareLaunchArgument(
             'line_brake_distance_m', default_value='0.08',
             description='直线 path_remain 刹车距离（m）；与冻结 0.08 m 拆开，非法值拒绝启动'),
+        DeclareLaunchArgument(
+            'line_brake_floor', default_value='0.20',
+            description='末端 rate 地板 (0,1]；旧硬编码 0.05 易慢尾'),
+        DeclareLaunchArgument(
+            'line_brake_profile', default_value='sqrt',
+            description='末端降速曲线：sqrt（更快平均）或 linear（旧式）'),
+        DeclareLaunchArgument(
+            'line_qp_max_iter', default_value='200',
+            description='直线 sparse ProxQP 最大迭代；非 SOLVED 仍拒绝该段'),
         DeclareLaunchArgument(
             'stream_hz', default_value='250.0',
             description='插补后发 multi_joint_servo_cmd 的频率；须与驱动 stream_control_rate 对齐'),
