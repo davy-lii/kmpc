@@ -1006,3 +1006,105 @@ TEST(LinePath, BrakeDistanceDoesNotChangeFreezeThreshold) {
   EXPECT_TRUE(saw_brake_scale);
   EXPECT_TRUE(tracker.line_frozen());
 }
+
+// r17 field: build admit must cover ~0.00108 rad feedback overshoot at −22°,
+// but still reject a clearly larger initial excess.
+TEST(LinePath, StartPitchAdmitWindow) {
+  const auto cfg_all = kmpc::Config::load(
+      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+  kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
+  const double limit = cfg_all.params.torso_pitch_max_deg * kmpc::kPi / 180.0;
+  ASSERT_GT(limit, 0.0);
+
+  auto set_pitch = [](kmpc::Vec18 q, double want) {
+    q[0] += want - (q[0] + q[1] + q[2]);
+    return q;
+  };
+
+  {
+    kmpc::CartesianTracker tracker(kin, cfg_all);
+    tracker.set_line_pitch_straighten_enable(false);
+    tracker.set_line_pace(0.3, 0.8);
+    kmpc::Vec18 q = set_pitch(cfg_all.q_pref, -limit - 0.00108);
+    const kmpc::Vec3 p0 = kin.fk_pos(q, kmpc::kEeFrameLeft);
+    const auto posed = kin.fk(q, kmpc::kEeFrameLeft);
+    const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
+    const kmpc::Vec3 goal = p0 + kmpc::Vec3(0.05, 0.0, 0.0);
+    ASSERT_TRUE(tracker.rearm_line(1));
+    tracker.compute(q, cfg_all.q_pref, &goal, nullptr, &quat, nullptr);
+    // Gate itself must accept this overshoot; later recovery may still fail.
+    EXPECT_NE(tracker.line_reason(), "start_pitch_outside");
+  }
+  {
+    kmpc::CartesianTracker tracker(kin, cfg_all);
+    tracker.set_line_pitch_straighten_enable(false);
+    tracker.set_line_pace(0.3, 0.8);
+    kmpc::Vec18 q = set_pitch(cfg_all.q_pref, -limit - 0.003);
+    const kmpc::Vec3 p0 = kin.fk_pos(q, kmpc::kEeFrameLeft);
+    const auto posed = kin.fk(q, kmpc::kEeFrameLeft);
+    const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
+    const kmpc::Vec3 goal = p0 + kmpc::Vec3(0.05, 0.0, 0.0);
+    ASSERT_TRUE(tracker.rearm_line(1));
+    tracker.compute(q, cfg_all.q_pref, &goal, nullptr, &quat, nullptr);
+    EXPECT_TRUE(tracker.line_refused());
+    EXPECT_EQ(tracker.line_reason(), "start_pitch_outside");
+  }
+}
+
+// Field A/B structural issue: start a ~0.24 m line with pitch slightly outside
+// ±22° and mono ON. First QP tick must not refuse (soft admit + skip/clamp mono).
+TEST(LinePath, PitchRecoveryOutsideFirstQpDoesNotRefuse) {
+  const auto cfg_all = kmpc::Config::load(
+      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+  kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
+  const double limit = cfg_all.params.torso_pitch_max_deg * kmpc::kPi / 180.0;
+  ASSERT_GT(limit, 0.0);
+  const double home_raw[18] = {
+      0.69813170, -0.87264718, -0.17453293, -0.02630211,
+      -0.00171042, 0.51532590, -0.13651965, -2.12657900,
+      -1.27522486, -0.24291493, 0.01394518,
+      -0.00171042, 0.51532590, 0.13651965, -2.12657900,
+      1.27522486, -0.24291493, 0.01394518};
+
+  for (const double excess : {2.54e-4, 6.13e-4}) {
+    kmpc::CartesianTracker tracker(kin, cfg_all);
+    tracker.set_line_pitch_straighten_enable(false);
+    tracker.set_line_qp_pitch_monotonic_enable(true);
+    tracker.set_line_pace(0.3, 0.8);
+    kmpc::Vec18 q;
+    for (int i = 0; i < 18; ++i) q[i] = home_raw[i];
+    const double p0_sum = q[0] + q[1] + q[2];
+    const double want = -limit - excess;
+    const double d = want - p0_sum;
+    q[0] += d / 3.0;
+    q[1] += d / 3.0;
+    q[2] += d / 3.0;
+    ASSERT_NEAR(q[0] + q[1] + q[2], want, 1e-9);
+    const kmpc::Vec3 p0 = kin.fk_pos(q, kmpc::kEeFrameRight);
+    const auto posed = kin.fk(q, kmpc::kEeFrameRight);
+    const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
+    // Field reverse length was ~0.24 m.
+    const kmpc::Vec3 goal = p0 + kmpc::Vec3(0.24, 0.0, 0.0);
+    ASSERT_TRUE(tracker.rearm_line(1)) << "excess=" << excess;
+    bool arrived = false;
+    for (int i = 0; i < 4000; ++i) {
+      const auto step =
+          tracker.compute(q, cfg_all.q_pref, nullptr, &goal, nullptr, &quat);
+      ASSERT_FALSE(tracker.line_refused())
+          << "refuse excess=" << excess << " i=" << i << " "
+          << tracker.line_reason() << " candidate=" << tracker.line_candidate();
+      if (i == 0) {
+        EXPECT_TRUE(tracker.line_active());
+        EXPECT_GT(std::abs(q[0] + q[1] + q[2]), limit + 1e-9);
+      }
+      q += step.dq;
+      if (tracker.last_arrived()) {
+        arrived = true;
+        break;
+      }
+    }
+    EXPECT_TRUE(arrived) << "excess=" << excess;
+    EXPECT_LE(std::abs(q[0] + q[1] + q[2]), limit + 1e-5)
+        << "should finish back in hard box; excess=" << excess;
+  }
+}

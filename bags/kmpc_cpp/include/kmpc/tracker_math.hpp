@@ -15,6 +15,10 @@ inline constexpr double kTargetJumpOriRad = 0.17;
 inline constexpr double kIdentityQuatEps = 1e-6;
 inline constexpr double kDeepExitM = 0.02;
 inline constexpr double kPitchWallEpsDeg = 0.5;
+// Shared build/QP/250Hz pitch-recovery admit: allow measured start slightly
+// outside ±torso_pitch_max, never permanently widen the hard box. Field
+// start_pitch_outside saw ~0.00108 rad overshoot; 0.001 rejected it.
+inline constexpr double kStartPitchAdmitRad = 0.002;
 inline constexpr double kStallWallEzM = 0.05;
 inline constexpr double kStallWallE0M = 0.20;
 inline constexpr double kStallJ2SlackDeg = 8.0;

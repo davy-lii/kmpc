@@ -1106,7 +1106,8 @@ bool CartesianTracker::line_build(
   line_.cascade_checked=line_tip_.has_value();
   line_.cascade_passed=false;
   reverse_decision_=reverse_last_line_enable_ ? "skipped" : "disabled";
-  if(torso_pitch_max_>0 && std::abs(q0.head<3>().sum())>torso_pitch_max_+0.001) {
+  if(torso_pitch_max_>0 &&
+     std::abs(q0.head<3>().sum())>torso_pitch_max_+kStartPitchAdmitRad) {
     line_.reason="start_pitch_outside"; return false;
   }
   if (dist > kLineMaxSamples*kLineSampleM) { line_.reason="sample_limit"; return false; }
@@ -1162,13 +1163,34 @@ bool CartesianTracker::line_build(
       if(!line_validate(rev,target,quat,ori_on,frame) || !probe(rev)) {
         reverse_decision="rejected_validate";
       } else {
-        const bool waist_moves=(rev.back().head<kNWaist>()-rev.front().head<kNWaist>())
-                                   .cwiseAbs().maxCoeff()>waist_lock_eps_;
-        if(upper_.waist_locked && waist_moves) {
-          reverse_decision="rejected_waist_locked";
+        // reverse_cache may start slightly outside (servo overshoot). Do not
+        // require the cached end back in the hard box here — that rejected field
+        // A/B and fought QP's bounded recovery. Only forbid worsening excess
+        // vs live q0; free_fit/qa_seed still keep their end-in-box gates.
+        bool pitch_ok=true;
+        if(torso_pitch_max_>0) {
+          const double start_ex=std::max(
+              0.0,std::abs(q0.head<3>().sum())-torso_pitch_max_);
+          for(const auto& q:rev) {
+            const double ex=std::max(
+                0.0,std::abs(q.head<3>().sum())-torso_pitch_max_);
+            if(ex>start_ex+1e-9) {
+              pitch_ok=false;
+              break;
+            }
+          }
+        }
+        if(!pitch_ok) {
+          reverse_decision="rejected_pitch";
         } else {
-          samples=std::move(rev); locked=!waist_moves; ok=true;
-          candidate="reverse_cache"; reverse_decision="accepted";
+          const bool waist_moves=(rev.back().head<kNWaist>()-rev.front().head<kNWaist>())
+                                     .cwiseAbs().maxCoeff()>waist_lock_eps_;
+          if(upper_.waist_locked && waist_moves) {
+            reverse_decision="rejected_waist_locked";
+          } else {
+            samples=std::move(rev); locked=!waist_moves; ok=true;
+            candidate="reverse_cache"; reverse_decision="accepted";
+          }
         }
       }
       if(!ok) {

@@ -2,7 +2,7 @@
 // the generic 36-variable endpoint QP is deliberately untouched.
 #include "kmpc/cartesian_tracker.hpp"
 #include "kmpc/path_progress.hpp"
-#include "kmpc/tracker_math.hpp"
+#include "kmpc/tracker_math.hpp"  // kStartPitchAdmitRad
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -81,7 +81,6 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
   };
   const double pitch0=line_.samples.front().head<3>().sum();
   const double pitchN=line_.samples.back().head<3>().sum();
-  const double pitch_net=pitchN-pitch0;
   Vec18 prev=from;
   double s=next_prog;
   for(int k=0;k<n;++k) {
@@ -135,31 +134,60 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
     row(k,jc.row(0),com_xmin_+com_margin_-com[0],com_xmax_-com_margin_-com[0]);
     row(k,jc.row(1),com_ymin_+com_margin_-com[1],com_ymax_-com_margin_-com[1]);
     Eigen::Matrix<double,1,d> pitch=Eigen::Matrix<double,1,d>::Zero(); pitch.head<3>().setOnes();
-    if(torso_pitch_max_>0) {
-      const double initial=line_.samples.front().head<3>().sum();
-      const double numerical_slack=std::abs(initial)<=torso_pitch_max_+1e-6 ?
-          std::max(0.0,std::abs(initial)-torso_pitch_max_) : 0.0;
-      row(k,pitch,-torso_pitch_max_-numerical_slack-q.head<3>().sum(),
-          torso_pitch_max_+numerical_slack-q.head<3>().sum());
+    // Unified with line_build / 250 Hz stream_pitch_recovery (kStartPitchAdmitRad):
+    // existing tiny excess may persist (no worsen vs stream `from`), shrink toward
+    // the hard box by the waist rate budget, then stay inside. Never permanently
+    // widen the box; never treat MAX_ITER as success.
+    const double limit=torso_pitch_max_;
+    bool pitch_recovering=false;
+    if(limit>0) {
+      auto excess=[&](double p){ return std::max(0.0,std::abs(p)-limit); };
+      const double p_from=from.head<3>().sum();
+      const double from_ex=excess(p_from);
+      const double start_ex=excess(pitch0);
+      const double admit_excess=
+          std::min(kStartPitchAdmitRad,std::max(start_ex,from_ex));
+      double recover_step=0.0;
+      for(int j=0;j<3;++j) recover_step+=std::abs(cap[j]);
+      // Active recovery follows the live stream state, not only the sample start.
+      pitch_recovering=from_ex>1e-9;
+      // Ceiling shrinks with stage index; stage 0 keeps a one-step reachability
+      // floor so field-B's ~1e-5 rad shortfall stays feasible.
+      const double staged=
+          std::max(0.0,from_ex-static_cast<double>(k)*recover_step);
+      const double first_floor=
+          (k==0)?std::max(0.0,from_ex-recover_step):0.0;
+      const double allowed_ex=
+          std::min(admit_excess,std::max(staged,first_floor));
+      const double soft=limit+allowed_ex;
+      row(k,pitch,-soft-q.head<3>().sum(),soft-q.head<3>().sum());
     }
     // 名义路径的俯仰和已经定好。这一拍的修正不能把它改回反方向。x=0 不在界内就不加，避免把原来能走的段判失败。
     // P0: independent of line_fit pitch straighten; first field对照 keeps this ON.
-    if (line_qp_pitch_monotonic_enable_) {
+    // While `from` is still outside, flat mono can lock the path outside the hard
+    // box (field A). After back in box, mono uses clamped endpoints so the flat
+    // band sits on ±limit instead of fighting it.
+    if (line_qp_pitch_monotonic_enable_ && !pitch_recovering) {
       constexpr double kPitchSlack=2e-4;
       const double p_prev=prev.head<3>().sum();
       const double p_q=q.head<3>().sum();
       const double dp=p_q-p_prev;
+      const double p0m=
+          (limit>0)?std::clamp(pitch0,-limit,limit):pitch0;
+      const double pNm=
+          (limit>0)?std::clamp(pitchN,-limit,limit):pitchN;
+      const double netm=pNm-p0m;
       double lo=-1e9, hi=1e9;
-      if(std::abs(pitch_net)<=1e-4) {
-        lo=pitch0-kPitchSlack-p_q;
-        hi=pitch0+kPitchSlack-p_q;
-      } else if(pitch_net>0.0) {
+      if(std::abs(netm)<=1e-4) {
+        lo=p0m-kPitchSlack-p_q;
+        hi=p0m+kPitchSlack-p_q;
+      } else if(netm>0.0) {
         lo=-dp-kPitchSlack;
       } else {
         hi=-dp+kPitchSlack;
       }
-      lo=std::max(lo,std::min(p_prev,pitchN)-kPitchSlack-p_q);
-      hi=std::min(hi,std::max(p_prev,pitchN)+kPitchSlack-p_q);
+      lo=std::max(lo,std::min(p_prev,pNm)-kPitchSlack-p_q);
+      hi=std::min(hi,std::max(p_prev,pNm)+kPitchSlack-p_q);
       if(lo<=0.0 && hi>=0.0 && lo<hi) {
         row(k,pitch,lo,hi);
         ++line_qp_pitch_monotonic_hits_;
