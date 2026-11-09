@@ -779,6 +779,8 @@ TEST(LinePath, LoggedFixedPointsNoPitchReversalOrOvershoot) {
   for (const auto mode : modes) {
     for (int loop = 0; loop < 2; ++loop) {
       kmpc::CartesianTracker tracker(kin, cfg_all);
+      // This regression asserts no pitch turnback; keep straighten ON here.
+      tracker.set_line_pitch_straighten_enable(true);
       tracker.set_line_pace_mode(mode);
       tracker.set_line_pace(0.3, 0.8);
       tracker.set_line_jerk_s(0.08);
@@ -793,6 +795,7 @@ TEST(LinePath, LoggedFixedPointsNoPitchReversalOrOvershoot) {
            "reverse_cache");
     }
     kmpc::CartesianTracker place_tracker(kin, cfg_all);
+    place_tracker.set_line_pitch_straighten_enable(true);
     place_tracker.set_line_pace_mode(mode);
     place_tracker.set_line_pace(0.3, 0.8);
     place_tracker.set_line_jerk_s(0.08);
@@ -806,6 +809,44 @@ TEST(LinePath, LoggedFixedPointsNoPitchReversalOrOvershoot) {
     play(place_tracker, q, 3, nullptr, place_prep, place_quat, (ptag + " retreat").c_str(),
          "reverse_cache");
   }
+}
+
+TEST(LinePath, P0IsolationSwitchDefaults) {
+  const auto cfg_all = kmpc::Config::load(
+      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+  kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
+  kmpc::CartesianTracker tracker(kin, cfg_all);
+  EXPECT_FALSE(tracker.line_pitch_straighten_enabled());
+  EXPECT_TRUE(tracker.line_qp_pitch_monotonic_enabled());
+  EXPECT_TRUE(tracker.reverse_last_line_enabled());
+  EXPECT_EQ(tracker.line_pitch_straighten_hits(), 0u);
+  EXPECT_EQ(tracker.line_qp_pitch_monotonic_hits(), 0u);
+
+  tracker.set_reverse_last_line_enable(false);
+  EXPECT_FALSE(tracker.reverse_last_line_enabled());
+  kmpc::Vec18 q = cfg_all.q_pref;
+  const kmpc::Vec3 p0 = kin.fk_pos(q, kmpc::kEeFrameLeft);
+  const auto posed = kin.fk(q, kmpc::kEeFrameLeft);
+  const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
+  const kmpc::Vec3 goal = p0 + kmpc::Vec3(0.08, 0.0, 0.0);
+  ASSERT_TRUE(tracker.rearm_line(1));
+  tracker.set_line_pace(0.3, 0.0);
+  bool arrived = false;
+  for (int i = 0; i < 2000; ++i) {
+    const auto step =
+        tracker.compute(q, cfg_all.q_pref, &goal, nullptr, &quat, nullptr);
+    ASSERT_FALSE(tracker.line_refused()) << tracker.line_reason();
+    q += step.dq;
+    if (tracker.last_arrived()) {
+      arrived = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(arrived);
+  tracker.maybe_commit_last_line_cache(q);
+  EXPECT_FALSE(tracker.last_line_cache().valid);
+  EXPECT_EQ(tracker.reverse_line_decision(), "disabled");
+  EXPECT_EQ(tracker.line_pitch_straighten_hits(), 0u);
 }
 
 TEST(LinePath, PaceModeParseAndBrakeValidation) {

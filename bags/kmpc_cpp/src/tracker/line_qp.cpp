@@ -104,7 +104,8 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
           torso_pitch_max_+numerical_slack-q.head<3>().sum());
     }
     // 名义路径的俯仰和已经定好。这一拍的修正不能把它改回反方向。x=0 不在界内就不加，避免把原来能走的段判失败。
-    {
+    // P0: independent of line_fit pitch straighten; first field对照 keeps this ON.
+    if (line_qp_pitch_monotonic_enable_) {
       constexpr double kPitchSlack=2e-4;
       const double p_prev=prev.head<3>().sum();
       const double p_q=q.head<3>().sum();
@@ -120,7 +121,10 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
       }
       lo=std::max(lo,std::min(p_prev,pitchN)-kPitchSlack-p_q);
       hi=std::min(hi,std::max(p_prev,pitchN)+kPitchSlack-p_q);
-      if(lo<=0.0 && hi>=0.0 && lo<hi) row(k,pitch,lo,hi);
+      if(lo<=0.0 && hi>=0.0 && lo<hi) {
+        row(k,pitch,lo,hi);
+        ++line_qp_pitch_monotonic_hits_;
+      }
     }
     if(yaw_max_>0) {
       Eigen::Matrix<double,1,d> yaw=Eigen::Matrix<double,1,d>::Zero();yaw[kIdxYaw]=1;

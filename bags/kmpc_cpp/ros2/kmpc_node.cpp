@@ -220,6 +220,16 @@ class KmpcNode : public rclcpp::Node {
     line_pose_pref_enable_ = bool_param("line_pose_pref_enable", false);
     tracker_->set_line_pose_pref(line_pose_pref_enable_);
     tracker_->set_line_pose_pref_q(cfg_.q_pref);
+    // P0 path-layer isolation switches (scheme defaults).
+    line_pitch_straighten_enable_ =
+        bool_param("line_pitch_straighten_enable", false);
+    tracker_->set_line_pitch_straighten_enable(line_pitch_straighten_enable_);
+    line_qp_pitch_monotonic_enable_ =
+        bool_param("line_qp_pitch_monotonic_enable", true);
+    tracker_->set_line_qp_pitch_monotonic_enable(
+        line_qp_pitch_monotonic_enable_);
+    reverse_last_line_enable_ = bool_param("reverse_last_line_enable", true);
+    tracker_->set_reverse_last_line_enable(reverse_last_line_enable_);
     line_diag_enable_ = bool_param("line_diag_enable", false);
     tracker_->set_line_diag_enable(line_diag_enable_);
     run_id_ = kmpc::ros2io::layer_diag_mono_ns();
@@ -435,9 +445,13 @@ class KmpcNode : public rclcpp::Node {
         kmpc::kEeFrameLeft.data(), kmpc::kEeFrameRight.data());
     RCLCPP_INFO(
         get_logger(),
-        "line_pace mode=%s brake_m=%.3f freeze_m=0.080",
+        "line_pace mode=%s brake_m=%.3f freeze_m=0.080 "
+        "pitch_straighten=%d qp_pitch_mono=%d reverse_last_line=%d",
         kmpc::CartesianTracker::line_pace_mode_name(line_pace_mode_),
-        line_brake_distance_m_);
+        line_brake_distance_m_,
+        line_pitch_straighten_enable_ ? 1 : 0,
+        line_qp_pitch_monotonic_enable_ ? 1 : 0,
+        reverse_last_line_enable_ ? 1 : 0);
     RCLCPP_INFO(
         get_logger(),
         "stream_io dedicated_thread=%d debug_q_hz=%.0f",
@@ -478,6 +492,9 @@ class KmpcNode : public rclcpp::Node {
             kmpc::CartesianTracker::kDefaultLinePaceMode));
     declare_parameter("line_brake_distance_m", 0.08);
     declare_parameter("line_pose_pref_enable", false);
+    declare_parameter("line_pitch_straighten_enable", false);
+    declare_parameter("line_qp_pitch_monotonic_enable", true);
+    declare_parameter("reverse_last_line_enable", true);
     declare_parameter("line_diag_enable", false);
     declare_parameter<std::string>("layer_diag_path", "");
     declare_parameter<std::string>("config_snapshot_path", "");
@@ -1206,6 +1223,9 @@ class KmpcNode : public rclcpp::Node {
         const auto upper=result.command;
         line_pending_waist_locked_=upper.waist_locked;
         const bool pose_pref=line_pose_pref_enable_;
+        const bool pitch_straighten=line_pitch_straighten_enable_;
+        const bool qp_pitch_mono=line_qp_pitch_monotonic_enable_;
+        const bool reverse_last=reverse_last_line_enable_;
         const bool diag=line_diag_enable_;
         const auto pace_mode=line_pace_mode_;
         const double brake_m=line_brake_distance_m_;
@@ -1213,12 +1233,17 @@ class KmpcNode : public rclcpp::Node {
         const auto line_cache=tracker_->last_line_cache();
         const uint64_t run_id=run_id_;
         line_future_=std::async(std::launch::async,
-            [config,source,xml,target,q0,is_left,upper,pose_pref,diag,pace_mode,brake_m,q_pref,line_cache,run_id]() {
+            [config,source,xml,target,q0,is_left,upper,pose_pref,pitch_straighten,
+             qp_pitch_mono,reverse_last,diag,pace_mode,brake_m,q_pref,line_cache,
+             run_id]() {
           kmpc::Kinematics model(source,xml?kmpc::Kinematics::UrdfInput::Xml:kmpc::Kinematics::UrdfInput::Path);
           kmpc::CartesianTracker worker(model,config);
           worker.set_upper_commands(upper);
           worker.set_line_pose_pref(pose_pref);
           worker.set_line_pose_pref_q(q_pref);
+          worker.set_line_pitch_straighten_enable(pitch_straighten);
+          worker.set_line_qp_pitch_monotonic_enable(qp_pitch_mono);
+          worker.set_reverse_last_line_enable(reverse_last);
           worker.set_line_pace_mode(pace_mode);
           if (!worker.set_line_brake_distance_m(brake_m)) {
             throw kmpc::ConfigError("line_brake_distance_m must be finite and > 0");
@@ -1595,6 +1620,9 @@ class KmpcNode : public rclcpp::Node {
         "ros_param", "r11_scurve|r10b_first_order", true);
     ros_num("line_brake_distance_m", 0.08, line_brake_distance_m_, "m", ">0");
     add("line_freeze_distance_m", "0.08", "m", "compile_const", "=0.08", true);
+    ros_bool("line_pitch_straighten_enable", false);
+    ros_bool("line_qp_pitch_monotonic_enable", true);
+    ros_bool("reverse_last_line_enable", true);
     ros_num("stream_hz", 250.0, stream_hz_, "Hz", ">0");
     ros_num("interp_catch_s", 0.02, interp_catch_s_, "s", ">0");
     ros_num("interp_accel_s", 0.50, interp_accel_s_, "s", ">0");
@@ -1879,6 +1907,16 @@ class KmpcNode : public rclcpp::Node {
         " line_pace_mode=" +
         kmpc::CartesianTracker::line_pace_mode_name(tracker_->line_pace_mode()) +
         " line_brake_m=" + std::to_string(tracker_->line_brake_distance_m()) +
+        " pitch_straighten=" +
+        std::string(tracker_->line_pitch_straighten_enabled() ? "1" : "0") +
+        " pitch_straighten_hits=" +
+        std::to_string(tracker_->line_pitch_straighten_hits()) +
+        " qp_pitch_mono=" +
+        std::string(tracker_->line_qp_pitch_monotonic_enabled() ? "1" : "0") +
+        " qp_pitch_mono_hits=" +
+        std::to_string(tracker_->line_qp_pitch_monotonic_hits()) +
+        " reverse_last_line=" +
+        std::string(tracker_->reverse_last_line_enabled() ? "1" : "0") +
         " line_planning=" + std::to_string(line_future_.valid()) +
         " line_plan_builds=" + std::to_string(line_plan_builds_) +
         " line_plan_discards=" + std::to_string(line_plan_discards_) +
@@ -2027,6 +2065,9 @@ class KmpcNode : public rclcpp::Node {
       kmpc::CartesianTracker::kDefaultLinePaceMode;
   double line_brake_distance_m_ = 0.08;
   bool line_pose_pref_enable_ = false;
+  bool line_pitch_straighten_enable_ = false;
+  bool line_qp_pitch_monotonic_enable_ = true;
+  bool reverse_last_line_enable_ = true;
   bool line_diag_enable_ = false;
   bool layer_diag_on_ = false;
   uint64_t run_id_ = 0;

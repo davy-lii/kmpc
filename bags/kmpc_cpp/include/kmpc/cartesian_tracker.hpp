@@ -162,8 +162,33 @@ class CartesianTracker {
   bool line_pose_pref_enabled() const { return line_pose_pref_enable_; }
   void set_line_pose_pref_q(const Vec18& q_pref) { line_q_pref_ = q_pref; }
 
+  // P0 isolation switches (scheme 20261109). Pitch straighten experiment default OFF.
+  void set_line_pitch_straighten_enable(bool enable) {
+    line_pitch_straighten_enable_ = enable;
+  }
+  bool line_pitch_straighten_enabled() const { return line_pitch_straighten_enable_; }
+  uint64_t line_pitch_straighten_hits() const { return line_pitch_straighten_hits_; }
+
+  // Keep ON for the first field对照 that only flips straighten.
+  void set_line_qp_pitch_monotonic_enable(bool enable) {
+    line_qp_pitch_monotonic_enable_ = enable;
+  }
+  bool line_qp_pitch_monotonic_enabled() const {
+    return line_qp_pitch_monotonic_enable_;
+  }
+  uint64_t line_qp_pitch_monotonic_hits() const {
+    return line_qp_pitch_monotonic_hits_;
+  }
+
+  // Restored off switch. Default ON preserves r12 retreat behavior while forward
+  // isolation turns straighten off first.
+  void set_reverse_last_line_enable(bool enable) {
+    reverse_last_line_enable_ = enable;
+  }
+  bool reverse_last_line_enabled() const { return reverse_last_line_enable_; }
+
   // Immediate return reuses the last successful nominal samples in reverse.
-  // Not a servo-time-series reverse. There is no off switch.
+  // Not a servo-time-series reverse. Gated by reverse_last_line_enable_.
   const std::string& reverse_line_decision() const { return reverse_decision_; }
   void clear_last_line_cache();
   // Snapshot/import so async prepare_line workers can see the main-tracker cache.
@@ -405,6 +430,14 @@ class CartesianTracker {
   // trials improved elbow ~14° with ~26–31° extra waist path; keep margin.
   double line_pose_pref_waist_budget_ = 35.0 * kPi / 180.0;
   double line_pose_pref_wrist_budget_ = 25.0 * kPi / 180.0;
+
+  // Experiment default OFF: same-q0 replay matched r10b when this block was removed.
+  bool line_pitch_straighten_enable_ = false;
+  // line_fit is const; hits are diagnostics only.
+  mutable uint64_t line_pitch_straighten_hits_ = 0;
+  bool line_qp_pitch_monotonic_enable_ = true;
+  uint64_t line_qp_pitch_monotonic_hits_ = 0;
+  bool reverse_last_line_enable_ = true;
 
   std::string reverse_decision_ = "skipped";
   LastLineCache last_line_cache_{};

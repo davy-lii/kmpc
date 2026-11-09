@@ -246,6 +246,12 @@ def _real_setup(context, *args, **kwargs):
             LaunchConfiguration('stream_debug_q_hz'), value_type=float),
         'line_pose_pref_enable': ParameterValue(
             LaunchConfiguration('line_pose_pref_enable'), value_type=bool),
+        'line_pitch_straighten_enable': ParameterValue(
+            LaunchConfiguration('line_pitch_straighten_enable'), value_type=bool),
+        'line_qp_pitch_monotonic_enable': ParameterValue(
+            LaunchConfiguration('line_qp_pitch_monotonic_enable'), value_type=bool),
+        'reverse_last_line_enable': ParameterValue(
+            LaunchConfiguration('reverse_last_line_enable'), value_type=bool),
         'line_diag_enable': ParameterValue(
             LaunchConfiguration('line_diag_enable'), value_type=bool),
         'layer_diag_path': LaunchConfiguration('layer_diag_path'),
@@ -298,6 +304,15 @@ def generate_real_launch():
         DeclareLaunchArgument(
             'line_pose_pref_enable', default_value='false',
             description='直线段默认关闭的姿态偏好候选'),
+        DeclareLaunchArgument(
+            'line_pitch_straighten_enable', default_value='false',
+            description='P0：line_fit 俯仰拉直；实验默认关（对齐 r10b 路径）'),
+        DeclareLaunchArgument(
+            'line_qp_pitch_monotonic_enable', default_value='true',
+            description='P0：line_qp 俯仰单调方向约束；默认开，可独立关掉对照'),
+        DeclareLaunchArgument(
+            'reverse_last_line_enable', default_value='true',
+            description='P0：reverse_cache 复用上一段名义样点；默认开，可独立关掉对照'),
         DeclareLaunchArgument(
             'line_diag_enable', default_value='false',
             description='启动晃动分层诊断环（默认关闭）'),

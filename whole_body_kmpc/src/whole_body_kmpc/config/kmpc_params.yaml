@@ -105,6 +105,10 @@ kmpc_node:
     line_pace_mode: r10b_first_order
     # 只影响 path_remain 刹车比例；冻结距离仍固定 0.08 m。
     line_brake_distance_m: 0.08
+    # P0 路径层隔离开关（与 launch 默认一致；真机以 launch/节点参数为准）。
+    line_pitch_straighten_enable: false
+    line_qp_pitch_monotonic_enable: true
+    reverse_last_line_enable: true
     joint_states_topic: /joint_states
     enable_topic: /kmpc/enable
     mode_topic: /kmpc/mode

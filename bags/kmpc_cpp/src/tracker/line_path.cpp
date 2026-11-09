@@ -147,7 +147,7 @@ void CartesianTracker::line_clear() {
   line_tip_.reset();
   line_reference_.reset();
   last_line_cache_committed_ = false;
-  reverse_decision_ = "skipped";
+  reverse_decision_ = reverse_last_line_enable_ ? "skipped" : "disabled";
 }
 
 void CartesianTracker::clear_last_line_cache() {
@@ -264,7 +264,7 @@ void CartesianTracker::line_diag_push_feedback(const Vec18& q_meas, double sourc
 }
 
 void CartesianTracker::maybe_commit_last_line_cache(const Vec18& q_meas) {
-  if (last_line_cache_committed_ || !line_.on ||
+  if (!reverse_last_line_enable_ || last_line_cache_committed_ || !line_.on ||
       line_.samples.size() < 2 || !line_.hold) {
     return;
   }
@@ -853,7 +853,9 @@ bool CartesianTracker::line_fit(
 
   // 俯仰和是一个冗余量，直线只约束手。端点不动，中间点只在手的零空间里拉回两端连线。
   // 拉完仍要过 3 mm 管子；拉不动就留在原来的可行解上，不把整段判失败。
-  if (!lock_waist && n > 1) {
+  // P0: experiment default OFF (line_pitch_straighten_enable_).
+  if (line_pitch_straighten_enable_ && !lock_waist && n > 1) {
+    ++line_pitch_straighten_hits_;
     const auto pitch_of = [](const Red& y) { return y.head<3>().sum(); };
     const double p0 = pitch_of(path[0]);
     const double pN = pitch_of(path[static_cast<std::size_t>(n)]);
@@ -1082,7 +1084,7 @@ bool CartesianTracker::line_build(
   line_.reason = "geometry_or_orientation";
   line_.cascade_checked=line_tip_.has_value();
   line_.cascade_passed=false;
-  reverse_decision_="skipped";
+  reverse_decision_=reverse_last_line_enable_ ? "skipped" : "disabled";
   if(torso_pitch_max_>0 && std::abs(q0.head<3>().sum())>torso_pitch_max_+0.001) {
     line_.reason="start_pitch_outside"; return false;
   }
@@ -1102,7 +1104,7 @@ bool CartesianTracker::line_build(
   bool locked=true;
   std::string candidate="none";
   std::string pose_decision="disabled";
-  std::string reverse_decision="skipped";
+  std::string reverse_decision=reverse_last_line_enable_ ? "skipped" : "disabled";
   const bool recovering_pitch=torso_pitch_max_>0 && std::abs(q0.head<3>().sum())>torso_pitch_max_+1e-6;
   if (recovering_pitch && upper_.waist_locked) { line_.reason="waist_locked_outside"; return false; }
 
@@ -1110,7 +1112,9 @@ bool CartesianTracker::line_build(
     return (a-b).cwiseAbs().maxCoeff()<=reverse_q_tol_;
   };
   auto reverse_intent=[&](){
-    if(!last_line_cache_.valid || line_tip_.has_value()) return false;
+    if(!reverse_last_line_enable_ || !last_line_cache_.valid || line_tip_.has_value()) {
+      return false;
+    }
     const auto& c=last_line_cache_;
     if(c.left!=left || c.frame!=frame || c.ori_on!=ori_on) return false;
     if((target-c.start_xyz).norm()>reverse_xyz_tol_) return false;
@@ -1163,7 +1167,7 @@ bool CartesianTracker::line_build(
         }
       }
     }
-  } else {
+  } else if (reverse_last_line_enable_) {
     reverse_decision="skipped_no_match";
   }
 
