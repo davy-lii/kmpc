@@ -145,6 +145,7 @@ void CartesianTracker::reset() {
   last_g_.setZero();
   last_n_ineq_ = 0;
   line_clear();
+  successor_plan_ = SuccessorPlan{};
   line_tip_.reset();
   line_reference_.reset();
 }

@@ -15,6 +15,7 @@
 #include "kmpc/config.hpp"
 #include "kmpc/constraints.hpp"
 #include "kmpc/kinematics.hpp"
+#include "kmpc/line_contract.hpp"
 #include "kmpc/qp_solver.hpp"
 #include "kmpc/types.hpp"
 #include "kmpc/upper_command.hpp"
@@ -200,8 +201,16 @@ class CartesianTracker {
   bool line_cascade_full_body() const { return line_.cascade_full_body; }
   bool line_waist_locked() const { return line_.waist_locked; }
   const std::string& line_reason() const { return line_.reason; }
+  // Category only — never replaces root reason (e.g. pitch_recovery_infeasible).
+  const std::string& line_failure_category() const { return line_.failure_category; }
   const std::string& line_candidate() const { return line_.candidate; }
   const std::string& line_pose_pref_decision() const { return line_.pose_pref_decision; }
+  const DirectionContract& line_direction_contract() const {
+    return line_.direction_contract;
+  }
+  const DirectionCheckResult& line_direction_check() const {
+    return line_.direction_check;
+  }
   double line_max_arm_fold() const { return line_.max_arm_fold; }
   double line_build_ms() const { return line_.build_ms; }
   double line_progress() const { return line_.prog; }
@@ -233,6 +242,15 @@ class CartesianTracker {
     return line_qp_pitch_monotonic_hits_;
   }
 
+  // Strict waist J1/J2/J3 + pitch-sum direction contract for single-arm line.
+  // Default ON. Soft costs may guide search; hard final validation never relaxes.
+  void set_line_direction_strict_enable(bool enable) {
+    line_direction_strict_enable_ = enable;
+  }
+  bool line_direction_strict_enabled() const {
+    return line_direction_strict_enable_;
+  }
+
   // Restored off switch. Default ON preserves r12 retreat behavior while forward
   // isolation turns straighten off first.
   void set_reverse_last_line_enable(bool enable) {
@@ -259,7 +277,25 @@ class CartesianTracker {
     Vec18 q_end = Vec18::Zero();
     std::vector<Vec18, Eigen::aligned_allocator<Vec18>> samples;
     uint64_t generation = 0;
+    // Metadata for reverse admission — never a safety exemption.
+    std::string candidate_source = "none";
+    DirectionContract direction_contract{};
+    DirectionCheckResult direction_check{};
+    bool direction_ok = false;
   };
+
+  // Paired successor commitment for cascade prepare→operate (not auto-exec).
+  struct SuccessorPlan {
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    bool valid = false;
+    Vec3 tip_xyz = Vec3::Zero();
+    Vec4 tip_quat = Vec4(0, 0, 0, 1);
+    bool tip_ori_on = false;
+    std::vector<Vec18, Eigen::aligned_allocator<Vec18>> tip_samples;
+    DirectionContract tip_contract{};
+    DirectionCheckResult tip_check{};
+  };
+  const SuccessorPlan& successor_plan() const { return successor_plan_; }
   LastLineCache last_line_cache() const { return last_line_cache_; }
   void import_last_line_cache(const LastLineCache& cache) { last_line_cache_ = cache; }
   // Call once when the active line first reaches measured/command hold.
@@ -416,6 +452,10 @@ class CartesianTracker {
     std::string reverse_decision = "skipped";
     double max_arm_fold = 0.0;
     std::string reason;
+    // Category only (pitch_recovery_infeasible / direction_search_exhausted / …).
+    std::string failure_category;
+    DirectionContract direction_contract{};
+    DirectionCheckResult direction_check{};
     // 异步建线线程的诊断副本。adopt 后拆走，不参与跟踪计算。
     std::vector<LineDiagEvent> diag_events;
     double build_ms = 0.0;
@@ -516,10 +556,12 @@ class CartesianTracker {
   bool line_qp_pitch_monotonic_enable_ = true;
   uint64_t line_qp_pitch_monotonic_hits_ = 0;
   bool reverse_last_line_enable_ = true;
+  bool line_direction_strict_enable_ = true;
 
   std::string reverse_decision_ = "skipped";
   LastLineCache last_line_cache_{};
   bool last_line_cache_committed_ = false;
+  SuccessorPlan successor_plan_{};
   // Joint-space match for reverse start (~2°/axis) and Cartesian end match (3 mm).
   double reverse_q_tol_ = 2.0 * kPi / 180.0;
   double reverse_xyz_tol_ = 0.003;

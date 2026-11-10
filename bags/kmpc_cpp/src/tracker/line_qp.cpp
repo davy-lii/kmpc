@@ -1,6 +1,7 @@
 // Line-only full-stage QP. Every predicted stage has its own 11-DOF correction;
 // the generic 36-variable endpoint QP is deliberately untouched.
 #include "kmpc/cartesian_tracker.hpp"
+#include "kmpc/line_contract.hpp"
 #include "kmpc/path_progress.hpp"
 #include "kmpc/tracker_math.hpp"  // kStartPitchAdmitRad
 #include <algorithm>
@@ -170,7 +171,13 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
     // box (field A). After back in box, mono uses clamped endpoints so the flat
     // band sits on ±limit instead of fighting it.
     if (line_qp_pitch_monotonic_enable_ && !pitch_recovering) {
-      constexpr double kPitchSlack=2e-4;
+      // Constrain adjacent predicted pitch: pitch(qhat_k)-pitch(qhat_{k-1}).
+      // qhat = q_nom + T*delta, so for k>0 use previous=true on the pitch row.
+      // Old code only bounded pitch·delta_k vs nominal prev — opposite-signed
+      // adjacent deltas could still reverse the actual predicted sequence.
+      // Pitch-sum slack stays numeric-only; waist axes use kAxisSlack=0 below.
+      // Zeroing pitch slack made approach QP report qp_pitch_monotonic_infeasible.
+      constexpr double kPitchSlack = 2e-4;
       const double p_prev=prev.head<3>().sum();
       const double p_q=q.head<3>().sum();
       const double dp=p_q-p_prev;
@@ -183,18 +190,81 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
       if(std::abs(netm)<=1e-4) {
         lo=p0m-kPitchSlack-p_q;
         hi=p0m+kPitchSlack-p_q;
-      } else if(netm>0.0) {
-        lo=-dp-kPitchSlack;
+        if(lo<hi) {
+          row(k,pitch,lo,hi,false);
+          ++line_qp_pitch_monotonic_hits_;
+        } else {
+          return reject("qp_pitch_monotonic_infeasible");
+        }
+      } else if(k==0) {
+        // Anchor stage 0 to the live stream `from`, not a fictitious delta_-1.
+        const double p_from=from.head<3>().sum();
+        const double dp0=p_q-p_from;
+        if(netm>0.0) {
+          lo=-dp0-kPitchSlack;
+        } else {
+          hi=-dp0+kPitchSlack;
+        }
+        lo=std::max(lo,std::min(p_from,pNm)-kPitchSlack-p_q);
+        hi=std::min(hi,std::max(p_from,pNm)+kPitchSlack-p_q);
+        if(lo<hi) {
+          row(k,pitch,lo,hi,false);
+          ++line_qp_pitch_monotonic_hits_;
+        } else {
+          return reject("qp_pitch_monotonic_infeasible");
+        }
       } else {
-        hi=-dp+kPitchSlack;
+        if(netm>0.0) {
+          lo=-dp-kPitchSlack;
+        } else {
+          hi=-dp+kPitchSlack;
+        }
+        lo=std::max(lo,std::min(p_prev,pNm)-kPitchSlack-p_q);
+        hi=std::min(hi,std::max(p_prev,pNm)+kPitchSlack-p_q);
+        if(lo<hi) {
+          row(k,pitch,lo,hi,/*previous=*/true);
+          ++line_qp_pitch_monotonic_hits_;
+        } else {
+          return reject("qp_pitch_monotonic_infeasible");
+        }
       }
-      lo=std::max(lo,std::min(p_prev,pNm)-kPitchSlack-p_q);
-      hi=std::min(hi,std::max(p_prev,pNm)+kPitchSlack-p_q);
-      if(lo<hi) {
-        row(k,pitch,lo,hi);
-        ++line_qp_pitch_monotonic_hits_;
-      } else {
-        return reject("qp_pitch_monotonic_infeasible");
+    }
+
+    // Strict waist-axis adjacent direction from the accepted line contract.
+    // Zero slack: any non-zero reverse on J1/J2/J3 is forbidden. The old
+    // 2e-4 rad (~0.0115°) per-tick allowance was saturated by QP and stacked
+    // across ticks (anchor=previous command), producing ~0.024° chord fold on
+    // mock_eye approach while samples stayed monotone.
+    if (line_direction_strict_enable_ && line_.direction_check.ok && !pitch_recovering) {
+      constexpr double kAxisSlack = 0.0;
+      for(int a=0;a<3;++a) {
+        const int sgn=line_.direction_contract.sign[a];
+        Eigen::Matrix<double,1,d> axis=Eigen::Matrix<double,1,d>::Zero();
+        axis[a]=1.0;
+        if(sgn==0) {
+          // Frozen net axis: hold at the live command chain (from/prev), not
+          // the path-contract anchor. Anchoring to the contract after tracking
+          // drift made insert-stage QP primal-infeasible.
+          if (k == 0) {
+            row(k, axis, from[a] - q[a], from[a] - q[a], false);
+          } else {
+            row(k, axis, prev[a] - q[a], prev[a] - q[a], /*previous=*/true);
+          }
+          continue;
+        }
+        if(k==0) {
+          const double step0=q[a]-from[a];
+          double lo=-1e9, hi=1e9;
+          if(sgn>0) lo=-step0-kAxisSlack;
+          else hi=-step0+kAxisSlack;
+          if(lo<=hi) row(k,axis,lo,hi,false);
+        } else {
+          const double step=q[a]-prev[a];
+          double lo=-1e9, hi=1e9;
+          if(sgn>0) lo=-step-kAxisSlack;
+          else hi=-step+kAxisSlack;
+          if(lo<=hi) row(k,axis,lo,hi,/*previous=*/true);
+        }
       }
     }
     if(yaw_max_>0) {
@@ -291,7 +361,46 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
       if(line_.ori_on && ori_error_xyzw(quat_slerp_xyzw(ori_start,line_.quat,(1-a)*previous_t+a*t),
           rot_to_quat_xyzw(pose.block<3,3>(0,0))).norm()>arrived_ori_rad_+1e-6) return reject("qp_nonlinear_orientation");
     }
-    if(k==0) to=q;
+    if (k == 0) {
+      to = q;
+      // Final emit projection: QP half-spaces stop intentional reverse, but
+      // float crumbs and pitch-sum coupling can still wiggle. Enforce the live
+      // command monotone half-spaces on stage-0 before it leaves the tracker.
+      if (line_direction_strict_enable_ && line_.direction_check.ok) {
+        for (int a = 0; a < 3; ++a) {
+          const int sgn = line_.direction_contract.sign[a];
+          if (sgn > 0) {
+            to[a] = std::max(to[a], from[a]);
+          } else if (sgn < 0) {
+            to[a] = std::min(to[a], from[a]);
+          } else {
+            to[a] = from[a];
+          }
+        }
+        const int psgn =
+            line_.direction_contract
+                .sign[static_cast<int>(DirectionAxisId::PitchSum)];
+        const double p_from = from[0] + from[1] + from[2];
+        const double p_to = to[0] + to[1] + to[2];
+        if (psgn > 0 && p_to < p_from) {
+          double need = p_from - p_to;
+          for (int a = 0; a < 3 && need > 0.0; ++a) {
+            if (line_.direction_contract.sign[a] > 0) {
+              to[a] += need;
+              need = 0.0;
+            }
+          }
+        } else if (psgn < 0 && p_to > p_from) {
+          double need = p_to - p_from;
+          for (int a = 0; a < 3 && need > 0.0; ++a) {
+            if (line_.direction_contract.sign[a] < 0) {
+              to[a] -= need;
+              need = 0.0;
+            }
+          }
+        }
+      }
+    }
     prev=q; previous_t=t;
   }
   // Success clears the fail latch so notes only show the last real refusal.

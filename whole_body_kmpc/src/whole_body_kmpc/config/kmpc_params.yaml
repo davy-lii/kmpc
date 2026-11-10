@@ -115,6 +115,10 @@ kmpc_node:
     line_pitch_straighten_enable: true
     line_qp_pitch_monotonic_enable: true
     reverse_last_line_enable: true
+    # Strict waist J1/J2/J3 + pitch-sum direction contract on single-arm line.
+    # Fold/backtracking on these axes refuses the candidate; final-send hard gate
+    # never publishes a reversing packet. Do not silently shrink this mask.
+    line_direction_strict_enable: true
     joint_states_topic: /joint_states
     enable_topic: /kmpc/enable
     mode_topic: /kmpc/mode

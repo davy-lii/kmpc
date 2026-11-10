@@ -869,7 +869,7 @@
   <joint name="Chassis_Z_Joint4" type="revolute">
     <parent link="Leg_Y_Link3" />
     <child link="Body_Link" />
-    <origin xyz="0 0.000999 0.1408" rpy="0 0 0" />
+    <origin xyz="0 0.000999 0.1805" rpy="0 0 0" />
     <axis xyz="0 0 1" />
     <limit lower="-3.106686" upper="3.106686" effort="300" velocity="1.884956" />
   </joint>

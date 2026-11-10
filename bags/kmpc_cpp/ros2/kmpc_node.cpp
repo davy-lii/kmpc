@@ -258,6 +258,9 @@ class KmpcNode : public rclcpp::Node {
         line_qp_pitch_monotonic_enable_);
     reverse_last_line_enable_ = bool_param("reverse_last_line_enable", true);
     tracker_->set_reverse_last_line_enable(reverse_last_line_enable_);
+    line_direction_strict_enable_ =
+        bool_param("line_direction_strict_enable", true);
+    tracker_->set_line_direction_strict_enable(line_direction_strict_enable_);
     line_diag_enable_ = bool_param("line_diag_enable", false);
     tracker_->set_line_diag_enable(line_diag_enable_);
     run_id_ = kmpc::ros2io::layer_diag_mono_ns();
@@ -532,6 +535,7 @@ class KmpcNode : public rclcpp::Node {
     declare_parameter("line_pitch_straighten_enable", true);
     declare_parameter("line_qp_pitch_monotonic_enable", true);
     declare_parameter("reverse_last_line_enable", true);
+    declare_parameter("line_direction_strict_enable", true);
     declare_parameter("line_diag_enable", false);
     declare_parameter<std::string>("layer_diag_path", "");
     declare_parameter<std::string>("config_snapshot_path", "");
@@ -693,12 +697,26 @@ class KmpcNode : public rclcpp::Node {
                          stream_goal_gen_, line_gen, "smoothed", 0, false);
       }
       if(!fault) fault=stream_filtered_fault(filtered,extra);
+      // Final-send hard gate: never publish a waist/pitch reversal vs the
+      // accepted direction contract, even if raw/QP were monotone.
+      if(!fault && line_direction_strict_enable_ && stream_dir_env_.active) {
+        // Probe without mutating envelope until commit succeeds.
+        kmpc::DirectionEnvelope probe_env=stream_dir_env_;
+        const auto dir=kmpc::direction_envelope_accept(&probe_env,filtered);
+        if(!dir.ok) {
+          fault="final_send_direction_violation";
+          stream_line_fault_=std::string(fault)+";"+dir.reason;
+        } else {
+          stream_dir_env_=probe_env;
+        }
+      }
       if(fault) {
         RCLCPP_ERROR(get_logger(),"line stream fault gen=%llu reason=%s pitch=%.9fdeg limit=%.9fdeg start_excess=%.9frad allowed_extra=%.9frad recovery_ticks=%d",
           static_cast<unsigned long long>(stream_line_gen_),fault,filtered.head<3>().sum()*180/kmpc::kPi,
           cfg_.params.torso_pitch_max_deg,stream_pitch_initial_,extra,stream_pitch_ticks_);
         const kmpc::Vec18 hold=interpolator_.q_ref();
-        stream_enter_hold(hold);stream_line_fault_=fault;
+        stream_enter_hold(hold);
+        if(stream_line_fault_.empty()) stream_line_fault_=fault;
         *q_out=hold;
       } else {
         *q_out=filtered;interpolator_.set_q_ref(*q_out);
@@ -800,6 +818,7 @@ class KmpcNode : public rclcpp::Node {
     stream_have_qp_ = false;
     stream_line_ = false;
     stream_pitch_recovery_ = false;
+    kmpc::direction_envelope_reset(&stream_dir_env_);
     interpolator_.clear_q_star();
   }
 
@@ -817,6 +836,8 @@ class KmpcNode : public rclcpp::Node {
     interpolator_.set_goal(q);
     interpolator_.clear_segment();
     safety_->seed(q);
+    // Keep envelope extrema across pause/hold so resume cannot reset fold budget.
+    // Clear only when leaving the line contract entirely via stream_clear_modes.
   }
 
   // 直线段：250Hz 只在两个路径点之间线性插。不走各轴自己的加减速。
@@ -828,7 +849,17 @@ class KmpcNode : public rclcpp::Node {
     stream_hold_ = false;
     stream_fixed_ = false;
     stream_line_from_ = continuing?stream_raw_ref_:interpolator_.q_ref();
-    if(!continuing) {stream_raw_ref_=stream_line_from_;line_smoother_.reset(stream_line_from_);}
+    if(!continuing) {
+      stream_raw_ref_=stream_line_from_;
+      line_smoother_.reset(stream_line_from_);
+      if(line_direction_strict_enable_) {
+        kmpc::direction_envelope_seed(
+            &stream_dir_env_, tracker_->line_direction_contract(),
+            stream_line_from_);
+      } else {
+        kmpc::direction_envelope_reset(&stream_dir_env_);
+      }
+    }
     stream_line_gen_ = tracker_->line_gen();
     stream_goal_gen_ = tracker_->goal_generation();
     const kmpc::Vec18 cap=tracker_->effective_dq_max()*cfg_.params.dt*line_dq_scale_;
@@ -1289,6 +1320,7 @@ class KmpcNode : public rclcpp::Node {
         const bool pitch_straighten=line_pitch_straighten_enable_;
         const bool qp_pitch_mono=line_qp_pitch_monotonic_enable_;
         const bool reverse_last=reverse_last_line_enable_;
+        const bool direction_strict=line_direction_strict_enable_;
         const bool diag=line_diag_enable_;
         const auto pace_mode=line_pace_mode_;
         const double brake_m=line_brake_distance_m_;
@@ -1300,7 +1332,7 @@ class KmpcNode : public rclcpp::Node {
         const uint64_t run_id=run_id_;
         line_future_=std::async(std::launch::async,
             [config,source,xml,target,q0,is_left,upper,pose_pref,pitch_straighten,
-             qp_pitch_mono,reverse_last,diag,pace_mode,brake_m,brake_floor,
+             qp_pitch_mono,reverse_last,direction_strict,diag,pace_mode,brake_m,brake_floor,
              brake_profile,qp_max_iter,q_pref,line_cache,run_id]() {
           kmpc::Kinematics model(source,xml?kmpc::Kinematics::UrdfInput::Xml:kmpc::Kinematics::UrdfInput::Path);
           kmpc::CartesianTracker worker(model,config);
@@ -1310,6 +1342,7 @@ class KmpcNode : public rclcpp::Node {
           worker.set_line_pitch_straighten_enable(pitch_straighten);
           worker.set_line_qp_pitch_monotonic_enable(qp_pitch_mono);
           worker.set_reverse_last_line_enable(reverse_last);
+          worker.set_line_direction_strict_enable(direction_strict);
           worker.set_line_pace_mode(pace_mode);
           if (!worker.set_line_brake_distance_m(brake_m)) {
             throw kmpc::ConfigError("line_brake_distance_m must be finite and > 0");
@@ -1705,6 +1738,7 @@ class KmpcNode : public rclcpp::Node {
     ros_bool("line_pitch_straighten_enable", true);
     ros_bool("line_qp_pitch_monotonic_enable", true);
     ros_bool("reverse_last_line_enable", true);
+    ros_bool("line_direction_strict_enable", true);
     ros_num("stream_hz", 250.0, stream_hz_, "Hz", ">0");
     ros_num("interp_catch_s", 0.02, interp_catch_s_, "s", ">0");
     ros_num("interp_accel_s", 0.50, interp_accel_s_, "s", ">0");
@@ -2216,6 +2250,8 @@ class KmpcNode : public rclcpp::Node {
   bool line_pitch_straighten_enable_ = true;
   bool line_qp_pitch_monotonic_enable_ = true;
   bool reverse_last_line_enable_ = true;
+  bool line_direction_strict_enable_ = true;
+  kmpc::DirectionEnvelope stream_dir_env_{};
   bool line_diag_enable_ = false;
   bool layer_diag_on_ = false;
   uint64_t run_id_ = 0;

@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <chrono>
 #include <limits>
 
@@ -184,6 +185,9 @@ void CartesianTracker::line_clear() {
   line_tip_.reset();
   line_reference_.reset();
   last_line_cache_committed_ = false;
+  // SuccessorPlan is a chain commitment across rearm/generation. Cleared only
+  // when consumed, mismatched, or explicitly invalidated — not on every segment
+  // reset.
   reverse_decision_ = reverse_last_line_enable_ ? "skipped" : "disabled";
   line_seg_start_s_ = -1.0;
   line_tail_enter_brake_s_ = -1.0;
@@ -330,6 +334,10 @@ void CartesianTracker::maybe_commit_last_line_cache(const Vec18& q_meas) {
   cache.q_end = line_.samples.back();
   cache.samples = line_.samples;
   cache.generation = goal_generation_;
+  cache.candidate_source = line_.candidate;
+  cache.direction_contract = line_.direction_contract;
+  cache.direction_check = line_.direction_check;
+  cache.direction_ok = line_.direction_check.ok;
   last_line_cache_ = std::move(cache);
   last_line_cache_committed_ = true;
 }
@@ -1060,6 +1068,7 @@ void CartesianTracker::refuse_line(const std::string& reason) {
   line_rate_ = 0.0;
   line_rate_acc_ = 0.0;
   clear_last_line_cache();
+  successor_plan_ = SuccessorPlan{};
 }
 
 bool CartesianTracker::line_needs_build(bool left, const Vec3& target, const Vec4* quat) const {
@@ -1075,15 +1084,42 @@ bool CartesianTracker::line_validate(
   const Vec3 start = kin_.fk_pos(samples.front(), frame);
   const Vec4 start_ori = rot_to_quat_xyzw(kin_.fk(samples.front(), frame).block<3,3>(0,0));
   const int n = static_cast<int>(samples.size()) - 1;
+  // Soft-limit policy: the live start may already sit on / slightly past the
+  // soft wall after tracking (common on retreat). Do not reject that. Still
+  // enforce hard limits everywhere, and forbid soft excess from growing past
+  // the start sample — retreat that moves away from the wall stays legal.
+  const Vec18& q_start = samples.front();
+  Vec18 start_soft_lo_ex = Vec18::Zero();
+  Vec18 start_soft_hi_ex = Vec18::Zero();
+  for (int k = 0; k < 18; ++k) {
+    const double soft_lo = limits_.q_min[k] + q_limit_margin_;
+    const double soft_hi = limits_.q_max[k] - q_limit_margin_;
+    start_soft_lo_ex[k] = std::max(0.0, soft_lo - q_start[k]);
+    start_soft_hi_ex[k] = std::max(0.0, q_start[k] - soft_hi);
+  }
+  auto joints_ok = [&](const Vec18& q) -> bool {
+    if (!q.allFinite()) return false;
+    for (int k = 0; k < 18; ++k) {
+      if (q[k] < limits_.q_min[k] - 1e-9 || q[k] > limits_.q_max[k] + 1e-9) {
+        return false;
+      }
+      const double soft_lo = limits_.q_min[k] + q_limit_margin_;
+      const double soft_hi = limits_.q_max[k] - q_limit_margin_;
+      const double lo_ex = std::max(0.0, soft_lo - q[k]);
+      const double hi_ex = std::max(0.0, q[k] - soft_hi);
+      if (lo_ex > start_soft_lo_ex[k] + 1e-9 ||
+          hi_ex > start_soft_hi_ex[k] + 1e-9) {
+        return false;
+      }
+    }
+    return true;
+  };
   for (int i = 0; i < n; ++i) {
     // Match joint-linear streaming, including all four 250 Hz interior ticks.
     for (int j = 0; j <= 5; ++j) {
       const double a = j / 5.0;
       const Vec18 q = (1-a)*samples[i] + a*samples[i+1];
-      if (!q.allFinite() ||
-          (q.array() < (limits_.q_min.array()+q_limit_margin_-1e-9)).any() ||
-          (q.array() > (limits_.q_max.array()-q_limit_margin_+1e-9)).any() ||
-          !guards_.com_xy_inside(kin_.com(q))) return false;
+      if (!joints_ok(q) || !guards_.com_xy_inside(kin_.com(q))) return false;
       const double t = (i+a)/n;
       const auto pose = kin_.fk(q, frame);
       if ((pose.col(3).head<3>() - ((1-t)*start+t*target)).norm() > kLineSampleTolM) return false;
@@ -1201,6 +1237,8 @@ bool CartesianTracker::line_build(
   std::string reverse_decision=reverse_last_line_enable_ ? "skipped" : "disabled";
   const bool recovering_pitch=torso_pitch_max_>0 && std::abs(q0.head<3>().sum())>torso_pitch_max_+1e-6;
   if (recovering_pitch && upper_.waist_locked) { line_.reason="waist_locked_outside"; return false; }
+  // A new preparation+tip probe replaces any prior chain commitment.
+  if(line_tip_.has_value()) successor_plan_=SuccessorPlan{};
 
   auto q_near=[&](const Vec18& a,const Vec18& b){
     return (a-b).cwiseAbs().maxCoeff()<=reverse_q_tol_;
@@ -1218,6 +1256,164 @@ bool CartesianTracker::line_build(
   };
   bool ok=false;
   bool straighten_axis_reverted=false;
+  bool have_accepted_dir=false;
+  DirectionContract accepted_contract{};
+  DirectionCheckResult accepted_dir{};
+  // Rebuild waist as a linear interpolation q0→qN (monotone by construction on
+  // each waist axis and on pitch sum), then re-IK the active arm to the
+  // original Cartesian waypoints. Soft IK seeds may fold; hard contract still
+  // decides acceptance after repair.
+  auto repair_direction=[&](std::vector<Vec18,Eigen::aligned_allocator<Vec18>>& path)->bool {
+    if(path.size()<2) return false;
+    std::vector<Vec18,Eigen::aligned_allocator<Vec18>> repaired=path;
+    const Vec18& q_start=path.front();
+    const Vec18& q_end=path.back();
+    const int n=static_cast<int>(repaired.size())-1;
+    for(int i=1;i<=n;++i) {
+      const double s=static_cast<double>(i)/static_cast<double>(n);
+      repaired[static_cast<std::size_t>(i)].head<kNWaist>()=
+          (1.0-s)*q_start.head<kNWaist>()+s*q_end.head<kNWaist>();
+      for(int j=0;j<kNWaist;++j) {
+        const double lo=limits_.q_min[j]+q_limit_margin_;
+        const double hi=limits_.q_max[j]-q_limit_margin_;
+        if(hi>lo) {
+          repaired[static_cast<std::size_t>(i)][j]=
+              std::clamp(repaired[static_cast<std::size_t>(i)][j],lo,hi);
+        }
+      }
+    }
+    const Vec3 p0=kin_.fk_pos(path.front(),frame);
+    const int idle=arm==kSliceLeft.begin?kSliceRight.begin:kSliceLeft.begin;
+    Vec4 q_ori0(0,0,0,1), q_ori1(0,0,0,1);
+    if(ori_on && quat) {
+      q_ori0=rot_to_quat_xyzw(kin_.fk(path.front(),frame).block<3,3>(0,0));
+      q_ori1=*quat;
+    }
+    for(int i=1;i<=n;++i) {
+      const double s=static_cast<double>(i)/static_cast<double>(n);
+      const Vec3 p_des=(1.0-s)*p0+s*target;
+      const Vec4 q_s=quat_slerp_xyzw(q_ori0,q_ori1,s);
+      Vec18 q=repaired[static_cast<std::size_t>(i)];
+      q.head<kNWaist>()=repaired[static_cast<std::size_t>(i)].head<kNWaist>();
+      q.segment<kNArm>(idle)=path.front().segment<kNArm>(idle);
+      bool ok_ik=false;
+      for(int it=0;it<40;++it) {
+        const auto posed=kin_.fk(q,frame);
+        const Vec3 e_p=p_des-posed.col(3).head<3>();
+        Vec3 e_o=ori_on?ori_error_xyzw(q_s,rot_to_quat_xyzw(posed.block<3,3>(0,0))):Vec3::Zero();
+        if(e_p.norm()<kLineSolveTolM && (!ori_on || e_o.norm()<0.05)) { ok_ik=true; break; }
+        Mat6x18 jac=kin_.jacobian_spatial(q,frame);
+        Eigen::Matrix<double,6,1> err;
+        err.head<3>()=e_p;
+        err.tail<3>()=ori_on?(0.15*e_o).eval():Vec3::Zero();
+        if(ori_on) jac.bottomRows<3>()*=0.15; else jac.bottomRows<3>().setZero();
+        jac.leftCols<kNWaist>().setZero();
+        jac.middleCols<kNArm>(idle).setZero();
+        Mat18 gram=jac.transpose()*jac;
+        Vec18 damp=Vec18::Constant(kWArm);
+        damp.segment<2>(kSliceRight.begin+5).setConstant(kWWrist);
+        damp.segment<2>(kSliceLeft.begin+5).setConstant(kWWrist);
+        damp.head<kNWaist>().setConstant(1e3);
+        damp.segment<kNArm>(idle).setConstant(1e3);
+        gram.diagonal()+=damp;
+        const Eigen::LDLT<Mat18> ldlt(gram);
+        if(ldlt.info()!=Eigen::Success) break;
+        Vec18 dq=ldlt.solve(jac.transpose()*err);
+        const double peak=dq.cwiseAbs().maxCoeff();
+        if(peak>0.08) dq*=0.08/peak;
+        Vec18 qn=q+dq;
+        for(int j=0;j<kNDof;++j) {
+          const double lo=limits_.q_min[j]+q_limit_margin_;
+          const double hi=limits_.q_max[j]-q_limit_margin_;
+          if(hi>lo) qn[j]=std::clamp(qn[j],lo,hi);
+        }
+        qn.head<kNWaist>()=repaired[static_cast<std::size_t>(i)].head<kNWaist>();
+        qn.segment<kNArm>(idle)=path.front().segment<kNArm>(idle);
+        if(!qn.allFinite()) break;
+        q=qn;
+      }
+      if(!ok_ik) return false;
+      repaired[static_cast<std::size_t>(i)]=q;
+    }
+    if(!line_validate(repaired,target,quat,ori_on,frame)) return false;
+    if(torso_pitch_max_>0) {
+      const double start_ex=std::max(0.0,std::abs(path.front().head<3>().sum())-torso_pitch_max_);
+      for(const auto& q:repaired) {
+        const double ex=std::max(0.0,std::abs(q.head<3>().sum())-torso_pitch_max_);
+        if(ex>start_ex+1e-9 && ex>1e-9 &&
+           std::abs(q.head<3>().sum())>torso_pitch_max_+1e-7) {
+          // Allow shrinking excess; reject growth beyond start.
+          if(ex>start_ex+1e-9) return false;
+        }
+      }
+    }
+    path=std::move(repaired);
+    return true;
+  };
+  auto accept_direction=[&](std::vector<Vec18,Eigen::aligned_allocator<Vec18>>& path,
+                            DirectionContract* out_c, DirectionCheckResult* out_r,
+                            bool allow_repair=true)->bool {
+    if(!line_direction_strict_enable_) {
+      if(out_c) *out_c=DirectionContract{};
+      if(out_r) {
+        *out_r=DirectionCheckResult{};
+        std::snprintf(out_r->reason,sizeof(out_r->reason),"skipped_strict_off");
+      }
+      return true;
+    }
+    DirectionContract c=make_path_direction_contract(path);
+    DirectionCheckResult chk=check_path_direction(path,c);
+    if(!chk.ok && allow_repair && repair_direction(path)) {
+      c=make_path_direction_contract(path);
+      chk=check_path_direction(path,c);
+    }
+    if(out_c) *out_c=c;
+    if(out_r) *out_r=chk;
+    return chk.ok;
+  };
+
+  // Reuse a paired successor commitment when the real next goal matches the
+  // cascade tip that was validated together with the preparation segment.
+  if(successor_plan_.valid && !line_tip_.has_value() &&
+     (target-successor_plan_.tip_xyz).norm()<=reverse_xyz_tol_ &&
+     ori_on==successor_plan_.tip_ori_on &&
+     (!ori_on || !quat ||
+      ori_error_xyzw(*quat,successor_plan_.tip_quat).norm()<=arrived_ori_rad_) &&
+     successor_plan_.tip_samples.size()>=2) {
+    std::vector<Vec18,Eigen::aligned_allocator<Vec18>> tip=successor_plan_.tip_samples;
+    DirectionContract tip_c;
+    DirectionCheckResult tip_dir;
+    auto take_succ=[&](std::vector<Vec18,Eigen::aligned_allocator<Vec18>>& path,
+                       const DirectionContract& c,const DirectionCheckResult& d){
+      samples=std::move(path);
+      locked=(samples.back().head<kNWaist>()-samples.front().head<kNWaist>())
+                 .cwiseAbs().maxCoeff()<=waist_lock_eps_;
+      ok=true;
+      candidate="successor_plan";
+      accepted_contract=c;
+      accepted_dir=d;
+      have_accepted_dir=true;
+      successor_plan_=SuccessorPlan{};
+    };
+    if(!q_near(q0,tip.front())) tip.front()=q0;
+    if(line_validate(tip,target,quat,ori_on,frame) &&
+       accept_direction(tip,&tip_c,&tip_dir)) {
+      take_succ(tip,tip_c,tip_dir);
+    } else {
+      // Live start drifted: re-solve to the committed tip endpoint under the
+      // same strict direction contract instead of dropping the chain.
+      std::vector<Vec18,Eigen::aligned_allocator<Vec18>> seeded;
+      bool seed_locked=false;
+      const Vec18 tip_q=successor_plan_.tip_samples.back();
+      if(!upper_.waist_locked &&
+         line_fit(q0,arm,target,quat,ori_on,false,frame,seeded,seed_locked,false,&tip_q) &&
+         accept_direction(seeded,&tip_c,&tip_dir) &&
+         line_validate(seeded,target,quat,ori_on,frame)) {
+        take_succ(seeded,tip_c,tip_dir);
+      }
+    }
+  }
+
   if(reverse_intent()) {
     const auto& c=last_line_cache_;
     if(!q_near(q0,c.q_end)) {
@@ -1261,8 +1457,17 @@ bool CartesianTracker::line_build(
           if(upper_.waist_locked && waist_moves) {
             reverse_decision="rejected_waist_locked";
           } else {
-            samples=std::move(rev); locked=!waist_moves; ok=true;
-            candidate="reverse_cache"; reverse_decision="accepted";
+            DirectionContract rev_c;
+            DirectionCheckResult rev_dir;
+            // Same final contract as every other candidate — reverse cache is
+            // never a safety exemption for waist/pitch fold.
+            if(!accept_direction(rev,&rev_c,&rev_dir)) {
+              reverse_decision=std::string("rejected_direction;")+rev_dir.reason;
+            } else {
+              samples=std::move(rev); locked=!waist_moves; ok=true;
+              candidate="reverse_cache"; reverse_decision="accepted";
+              accepted_contract=rev_c; accepted_dir=rev_dir; have_accepted_dir=true;
+            }
           }
         }
       }
@@ -1270,15 +1475,19 @@ bool CartesianTracker::line_build(
         // Second candidate: re-solve B→A with terminal seed = cached qA.
         std::vector<Vec18,Eigen::aligned_allocator<Vec18>> seeded;
         bool seed_locked=false;
+        DirectionContract seed_c;
+        DirectionCheckResult seed_dir;
         if(!upper_.waist_locked &&
            line_fit(q0,arm,target,quat,ori_on,false,frame,seeded,seed_locked,true,&c.q_start) &&
            (!recovering_pitch || (!seed_locked && !seeded.empty() &&
              std::abs(seeded.back().head<3>().sum())<=torso_pitch_max_+1e-7)) &&
-           probe(seeded) && line_validate(seeded,target,quat,ori_on,frame)) {
+           probe(seeded) && line_validate(seeded,target,quat,ori_on,frame) &&
+           accept_direction(seeded,&seed_c,&seed_dir)) {
           straighten_axis_reverted=line_fit_straighten_axis_reverted_;
           samples=std::move(seeded); locked=seed_locked; ok=true;
           candidate="qa_seed";
-          reverse_decision="qa_seed_accepted;reverse_rejected_validate";
+          reverse_decision="qa_seed_accepted;"+reverse_decision;
+          accepted_contract=seed_c; accepted_dir=seed_dir; have_accepted_dir=true;
         } else {
           reverse_decision=reverse_decision+";qa_seed_rejected";
         }
@@ -1288,28 +1497,58 @@ bool CartesianTracker::line_build(
     reverse_decision="skipped_no_match";
   }
 
-  if(!ok) ok=line_arm_only(q0,arm,target,quat,ori_on,frame,samples);
+  if(!ok) {
+    std::vector<Vec18,Eigen::aligned_allocator<Vec18>> arm_samples;
+    if(line_arm_only(q0,arm,target,quat,ori_on,frame,arm_samples)) {
+      samples=std::move(arm_samples);
+      ok=true;
+    }
+  }
   constexpr double fold_ok=16.0*kPi/180.0;
   bool forced=false;
-  if(candidate!="reverse_cache" && candidate!="qa_seed") {
+  if(candidate!="reverse_cache" && candidate!="qa_seed" && candidate!="successor_plan") {
+    DirectionContract trial_c;
+    DirectionCheckResult trial_dir;
     const double arm_fold=ok?max_arm_fold(samples,arm):0.0;
-    const bool locked_pass=!recovering_pitch && ok && arm_fold<fold_ok && probe(samples);
+    const bool locked_pass=!recovering_pitch && ok && arm_fold<fold_ok && probe(samples) &&
+                           accept_direction(samples,&trial_c,&trial_dir);
     if (locked_pass) {
       candidate="arm_only";
+      accepted_contract=trial_c; accepted_dir=trial_dir; have_accepted_dir=true;
     } else {
+      if(ok && line_direction_strict_enable_ && arm_fold<fold_ok && probe(samples) &&
+         !accept_direction(samples,&trial_c,&trial_dir)) {
+        line_.reason=std::string("candidate_direction_violation;")+trial_dir.reason;
+      }
       std::vector<Vec18,Eigen::aligned_allocator<Vec18>> free_samples;
       bool free_locked=false;
       const Vec18* recovery_seed=(recovering_pitch && ok && !samples.empty()) ? &samples.back() : nullptr;
       const bool free_ok=!upper_.waist_locked && line_fit(q0,arm,target,quat,ori_on,false,
           frame,free_samples,free_locked,!line_tip_.has_value() && !recovering_pitch,recovery_seed);
-      if (free_ok && (!recovering_pitch || (!free_locked && std::abs(free_samples.back().head<3>().sum())<=torso_pitch_max_+1e-7)) && probe(free_samples)) {
+      DirectionContract free_c;
+      DirectionCheckResult free_dir;
+      const bool free_pitch_ok=!recovering_pitch ||
+          (!free_locked && !free_samples.empty() &&
+           std::abs(free_samples.back().head<3>().sum())<=torso_pitch_max_+1e-7);
+      // Repair may change the waist endpoint — probe after direction acceptance.
+      bool free_dir_ok=false;
+      if(free_ok && free_pitch_ok && accept_direction(free_samples,&free_c,&free_dir)) {
+        free_dir_ok=probe(free_samples);
+        if(!free_dir_ok && line_tip_) {
+          line_.reason="cascade_unreachable";
+        }
+      } else if(free_ok && free_pitch_ok && line_direction_strict_enable_ && !free_dir.ok) {
+        line_.reason=std::string("candidate_direction_violation;")+free_dir.reason;
+      }
+      if (free_dir_ok) {
         straighten_axis_reverted=line_fit_straighten_axis_reverted_;
         samples=std::move(free_samples); locked=free_locked; ok=true;
         forced=line_tip_.has_value();
         candidate="free_fit";
+        accepted_contract=free_c; accepted_dir=free_dir; have_accepted_dir=true;
       } else {
         ok=false;
-        if (line_tip_) line_.reason="cascade_unreachable";
+        if (line_tip_ && line_.reason.empty()) line_.reason="cascade_unreachable";
       }
     }
   }
@@ -1320,15 +1559,19 @@ bool CartesianTracker::line_build(
     const auto& tip=*line_tip_;
     std::vector<Vec18,Eigen::aligned_allocator<Vec18>> tip_path,back_path,trial;
     bool dummy=false,trial_locked=false;
+    DirectionContract tip_c;
+    DirectionCheckResult tip_dir;
     if(line_fit(q0,arm,tip.xyz,tip.ori_on?&tip.quat_xyzw:nullptr,tip.ori_on,false,
         frame,tip_path,dummy,false) &&
        line_arm_only(tip_path.back(),arm,target,quat,ori_on,frame,back_path)) {
       const Vec18 seed=back_path.back();
       if(line_fit(q0,arm,target,quat,ori_on,false,frame,trial,trial_locked,false,&seed) &&
-         (!recovering_pitch || (!trial_locked && !trial.empty() && std::abs(trial.back().head<3>().sum())<=torso_pitch_max_+1e-7)) && probe(trial)) {
+         (!recovering_pitch || (!trial_locked && !trial.empty() && std::abs(trial.back().head<3>().sum())<=torso_pitch_max_+1e-7)) &&
+         probe(trial) && accept_direction(trial,&tip_c,&tip_dir)) {
         straighten_axis_reverted=line_fit_straighten_axis_reverted_;
         samples=std::move(trial);locked=trial_locked;forced=true;ok=true;
         candidate="tip_seed";
+        accepted_contract=tip_c; accepted_dir=tip_dir; have_accepted_dir=true;
       }
     }
   }
@@ -1341,15 +1584,27 @@ bool CartesianTracker::line_build(
     const auto& tip=*line_tip_;
     std::vector<Vec18,Eigen::aligned_allocator<Vec18>> trial,next;
     bool trial_locked=false,next_locked=false;
+    DirectionContract cur_c, next_c;
+    DirectionCheckResult cur_dir, next_dir;
     if(line_fit(q0,arm,target,quat,ori_on,false,frame,trial,trial_locked,false) &&
-       (!recovering_pitch || std::abs(trial.back().head<3>().sum())<=torso_pitch_max_+1e-7)) {
+       (!recovering_pitch || std::abs(trial.back().head<3>().sum())<=torso_pitch_max_+1e-7) &&
+       accept_direction(trial,&cur_c,&cur_dir)) {
       const bool trial_reverted=line_fit_straighten_axis_reverted_;
       if(line_fit(trial.back(),arm,tip.xyz,tip.ori_on?&tip.quat_xyzw:nullptr,
-                  tip.ori_on,false,frame,next,next_locked)) {
+                  tip.ori_on,false,frame,next,next_locked) &&
+         accept_direction(next,&next_c,&next_dir)) {
       straighten_axis_reverted=trial_reverted;
       samples=std::move(trial);locked=trial_locked;forced=true;ok=true;
       cascade_full_body=true;
       candidate="cascade_full_body";
+      accepted_contract=cur_c; accepted_dir=cur_dir; have_accepted_dir=true;
+      successor_plan_.valid=true;
+      successor_plan_.tip_xyz=tip.xyz;
+      successor_plan_.tip_quat=tip.ori_on?tip.quat_xyzw:Vec4(0,0,0,1);
+      successor_plan_.tip_ori_on=tip.ori_on;
+      successor_plan_.tip_samples=std::move(next);
+      successor_plan_.tip_contract=next_c;
+      successor_plan_.tip_check=next_dir;
       }
     }
   }
@@ -1407,12 +1662,16 @@ bool CartesianTracker::line_build(
             "improve_deg=%.3f;waist_extra_deg=%.3f;wrist_extra_deg=%.3f;elbow_end_err_deg=%.3f",
             improve*180.0/kPi,waist_extra*180.0/kPi,wrist_extra*180.0/kPi,
             elbow_err(pref_samples)*180.0/kPi);
+        DirectionContract pref_c;
+        DirectionCheckResult pref_dir;
         if(improve < line_pose_pref_min_improve_) {
           pose_decision=std::string("rejected_no_improve;")+metric;
         } else if(waist_extra > line_pose_pref_waist_budget_) {
           pose_decision=std::string("rejected_waist_budget;")+metric;
         } else if(wrist_extra > line_pose_pref_wrist_budget_) {
           pose_decision=std::string("rejected_wrist_budget;")+metric;
+        } else if(!accept_direction(pref_samples,&pref_c,&pref_dir)) {
+          pose_decision=std::string("rejected_direction;")+pref_dir.reason+";"+metric;
         } else {
           straighten_axis_reverted=line_fit_straighten_axis_reverted_;
           samples=std::move(pref_samples);
@@ -1420,6 +1679,7 @@ bool CartesianTracker::line_build(
           forced=line_tip_.has_value();
           candidate="pose_pref";
           pose_decision=std::string("accepted;")+metric;
+          accepted_contract=pref_c; accepted_dir=pref_dir; have_accepted_dir=true;
         }
       }
     }
@@ -1433,23 +1693,48 @@ bool CartesianTracker::line_build(
     pose_decision="skipped";
   }
 
-  // If straighten stayed, residual pitch-sum turnback is a hard refuse. When
-  // straighten was reverted for blowing a waist axis (>~1°), keep the original
-  // path even if the sum still has a small fold — do not buy sum mono with a
-  // large J3 reverse.
+  // Strict mode: absolute waist/pitch direction is the final gate for every
+  // candidate. Old sum-only straighten + axis-reverted exemption is baseline-only
+  // when strict is off; never auto-relax the hard mask.
   constexpr double kPitchTurnbackMax=0.05*kPi/180.0;
-  if (ok && line_pitch_straighten_enable_ && !straighten_axis_reverted &&
-      line_pitch_turnback(samples) > kPitchTurnbackMax) {
-    ok = false;
-    line_.reason = "pitch_turnback_unresolved";
+  if (ok && !samples.empty()) {
+    if(line_direction_strict_enable_) {
+      if(!have_accepted_dir || !accepted_dir.ok) {
+        if(!accept_direction(samples,&accepted_contract,&accepted_dir)) {
+          ok=false;
+          have_accepted_dir=true;
+          line_.reason=std::string("direction_search_exhausted;")+accepted_dir.reason;
+        } else {
+          have_accepted_dir=true;
+        }
+      }
+    } else if (line_pitch_straighten_enable_ && !straighten_axis_reverted &&
+               line_pitch_turnback(samples) > kPitchTurnbackMax) {
+      ok = false;
+      line_.reason = "pitch_turnback_unresolved";
+    }
   }
 
   const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
   reverse_decision_=reverse_decision;
   if (!ok || samples.empty()) {
-    if(recovering_pitch) line_.reason="pitch_recovery_infeasible";
+    // pitch_recovery_infeasible is a category only — never overwrite root_reason.
+    if(recovering_pitch) {
+      line_.failure_category="pitch_recovery_infeasible";
+    } else if(line_.reason.find("direction_")!=std::string::npos ||
+              line_.reason.find("candidate_direction_")!=std::string::npos) {
+      line_.failure_category="direction_search_exhausted";
+    }
+    if(line_.reason.empty() || line_.reason=="geometry_or_orientation") {
+      if(!accepted_dir.ok && accepted_dir.reason[0]!='\0' &&
+         std::strcmp(accepted_dir.reason,"ok")!=0) {
+        line_.reason=std::string("direction_search_exhausted;")+accepted_dir.reason;
+      }
+    }
     line_.build_ms=ms;
     line_.reverse_decision=reverse_decision;
+    line_.direction_contract=accepted_contract;
+    line_.direction_check=accepted_dir;
     line_diag_push(LineDiagLayer::Build,q0,Vec18::Zero(),0.0,ms,candidate.c_str(),
                    reverse_decision.c_str());
     return false;
@@ -1469,6 +1754,8 @@ bool CartesianTracker::line_build(
   built.candidate=candidate;
   built.pose_pref_decision=pose_decision;
   built.reverse_decision=reverse_decision;
+  built.direction_contract=accepted_contract;
+  built.direction_check=accepted_dir;
   built.max_arm_fold=max_arm_fold(built.samples,arm);
   built.frozen=dist<=kLineFreezeM;
   line_=std::move(built); line_q_=q0; line_rate_=0.0; line_rate_acc_=0.0; ++line_gen_;
