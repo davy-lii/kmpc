@@ -479,6 +479,7 @@ bool CartesianTracker::line_fit(
     std::vector<Vec18, Eigen::aligned_allocator<Vec18>>& samples,
     bool& waist_locked, bool allow_relock, const Vec18* goal_seed,
     const Vec18* pose_pref) const {
+  line_fit_straighten_axis_reverted_ = false;
   const Vec3 p0 = kin_.fk_pos(q0, frame);
   const double dist = (target - p0).norm();
   int n = 1;
@@ -895,7 +896,7 @@ bool CartesianTracker::line_fit(
 
   // 俯仰和是一个冗余量，直线只约束手。端点不动，中间点只在手的零空间里拉回两端连线。
   // 拉完仍要过 3 mm 管子；拉不动就留在原来的可行解上，不把整段判失败。
-  // P0: experiment default OFF (line_pitch_straighten_enable_).
+  // 总和本来就已经接近单调、拉直却挤出单轴折返时，退回拉直前的路径。
   if (line_pitch_straighten_enable_ && !lock_waist && n > 1) {
     ++line_pitch_straighten_hits_;
     const auto pitch_of = [](const Red& y) { return y.head<3>().sum(); };
@@ -968,20 +969,25 @@ bool CartesianTracker::line_fit(
         break;
       }
     }
-    std::vector<Vec18, Eigen::aligned_allocator<Vec18>> trial;
-    trial.reserve(static_cast<std::size_t>(n + 1));
-    bool finite = true;
-    for (int i = 0; i <= n; ++i) {
-      const Vec18 q = expand(path[static_cast<std::size_t>(i)]);
-      if (!q.allFinite()) {
-        finite = false;
-        break;
-      }
-      trial.push_back(q);
-    }
-    if (!finite || worst_pos(path) > kLineSampleTolM ||
-        !line_validate(trial, target, quat, ori_on, frame)) {
+    if (straighten_axis_turnback_regressed(kept, path)) {
       path = std::move(kept);
+      line_fit_straighten_axis_reverted_ = true;
+    } else {
+      std::vector<Vec18, Eigen::aligned_allocator<Vec18>> trial;
+      trial.reserve(static_cast<std::size_t>(n + 1));
+      bool finite = true;
+      for (int i = 0; i <= n; ++i) {
+        const Vec18 q = expand(path[static_cast<std::size_t>(i)]);
+        if (!q.allFinite()) {
+          finite = false;
+          break;
+        }
+        trial.push_back(q);
+      }
+      if (!finite || worst_pos(path) > kLineSampleTolM ||
+          !line_validate(trial, target, quat, ori_on, frame)) {
+        path = std::move(kept);
+      }
     }
   }
 
@@ -1209,6 +1215,7 @@ bool CartesianTracker::line_build(
     return true;
   };
   bool ok=false;
+  bool straighten_axis_reverted=false;
   if(reverse_intent()) {
     const auto& c=last_line_cache_;
     if(!q_near(q0,c.q_end)) {
@@ -1266,6 +1273,7 @@ bool CartesianTracker::line_build(
            (!recovering_pitch || (!seed_locked && !seeded.empty() &&
              std::abs(seeded.back().head<3>().sum())<=torso_pitch_max_+1e-7)) &&
            probe(seeded) && line_validate(seeded,target,quat,ori_on,frame)) {
+          straighten_axis_reverted=line_fit_straighten_axis_reverted_;
           samples=std::move(seeded); locked=seed_locked; ok=true;
           candidate="qa_seed";
           reverse_decision="qa_seed_accepted;reverse_rejected_validate";
@@ -1293,6 +1301,7 @@ bool CartesianTracker::line_build(
       const bool free_ok=!upper_.waist_locked && line_fit(q0,arm,target,quat,ori_on,false,
           frame,free_samples,free_locked,!line_tip_.has_value() && !recovering_pitch,recovery_seed);
       if (free_ok && (!recovering_pitch || (!free_locked && std::abs(free_samples.back().head<3>().sum())<=torso_pitch_max_+1e-7)) && probe(free_samples)) {
+        straighten_axis_reverted=line_fit_straighten_axis_reverted_;
         samples=std::move(free_samples); locked=free_locked; ok=true;
         forced=line_tip_.has_value();
         candidate="free_fit";
@@ -1315,6 +1324,7 @@ bool CartesianTracker::line_build(
       const Vec18 seed=back_path.back();
       if(line_fit(q0,arm,target,quat,ori_on,false,frame,trial,trial_locked,false,&seed) &&
          (!recovering_pitch || (!trial_locked && !trial.empty() && std::abs(trial.back().head<3>().sum())<=torso_pitch_max_+1e-7)) && probe(trial)) {
+        straighten_axis_reverted=line_fit_straighten_axis_reverted_;
         samples=std::move(trial);locked=trial_locked;forced=true;ok=true;
         candidate="tip_seed";
       }
@@ -1330,12 +1340,15 @@ bool CartesianTracker::line_build(
     std::vector<Vec18,Eigen::aligned_allocator<Vec18>> trial,next;
     bool trial_locked=false,next_locked=false;
     if(line_fit(q0,arm,target,quat,ori_on,false,frame,trial,trial_locked,false) &&
-       (!recovering_pitch || std::abs(trial.back().head<3>().sum())<=torso_pitch_max_+1e-7) &&
-       line_fit(trial.back(),arm,tip.xyz,tip.ori_on?&tip.quat_xyzw:nullptr,
-                tip.ori_on,false,frame,next,next_locked)) {
+       (!recovering_pitch || std::abs(trial.back().head<3>().sum())<=torso_pitch_max_+1e-7)) {
+      const bool trial_reverted=line_fit_straighten_axis_reverted_;
+      if(line_fit(trial.back(),arm,tip.xyz,tip.ori_on?&tip.quat_xyzw:nullptr,
+                  tip.ori_on,false,frame,next,next_locked)) {
+      straighten_axis_reverted=trial_reverted;
       samples=std::move(trial);locked=trial_locked;forced=true;ok=true;
       cascade_full_body=true;
       candidate="cascade_full_body";
+      }
     }
   }
 
@@ -1399,6 +1412,7 @@ bool CartesianTracker::line_build(
         } else if(wrist_extra > line_pose_pref_wrist_budget_) {
           pose_decision=std::string("rejected_wrist_budget;")+metric;
         } else {
+          straighten_axis_reverted=line_fit_straighten_axis_reverted_;
           samples=std::move(pref_samples);
           locked=pref_locked;
           forced=line_tip_.has_value();
@@ -1417,13 +1431,11 @@ bool CartesianTracker::line_build(
     pose_decision="skipped";
   }
 
-  // The optional nominal pitch repair used to fall back to the original
-  // reversing path when its nullspace pass could not make it feasible. With
-  // this policy enabled, a remaining turnback is an explicit build refusal.
-  // The QP cannot reliably remove a large turnback from an already accepted
-  // nominal path while respecting the same tube and joint constraints.
+  // Sum-only straighten that worsens a waist-axis chord turnback is reverted
+  // inside line_fit. That pre-straighten path is accepted, including residual
+  // sum turnback. A straightened path that still reverses the sum is refused.
   constexpr double kPitchTurnbackMax=0.05*kPi/180.0;
-  if (ok && line_pitch_straighten_enable_ &&
+  if (ok && line_pitch_straighten_enable_ && !straighten_axis_reverted &&
       line_pitch_turnback(samples)>kPitchTurnbackMax) {
     ok=false;
     line_.reason="pitch_turnback_unresolved";

@@ -52,8 +52,9 @@ struct KmpcParams {
   // 相对「外墙±com_margin」再缩的工作墙。0 = 墙位回到现码内墙。
   double com_work_m = 0.06;
   double q_torso = 250.0;
-  // 20261015 华成实测俯仰和 -20.2°，15° 盒会削掉安全姿势；放 22° 留余量。
-  double torso_pitch_max_deg = 22.0;
+  // 20261015 华成实测俯仰和 -20.2°，15° 盒会削掉安全姿势。
+  // 20261110 现场指令贴 -22°、实测约 -22.129° 被拒；硬盒放到 23°。
+  double torso_pitch_max_deg = 23.0;
   double torso_hold_deg = 2.0;
   double torso_step_deg = 0.08;
   double torso_drop_m = 0.40;

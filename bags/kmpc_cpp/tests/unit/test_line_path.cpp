@@ -1,4 +1,5 @@
 #include <Eigen/Geometry>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <string>
@@ -75,6 +76,64 @@ double lateral(const kmpc::Vec3& p, const kmpc::Vec3& a, const kmpc::Vec3& b) {
 }
 
 }  // namespace
+
+TEST(LinePath, SumImprovesButAxisTurnbackRevertsStraighten) {
+  using Sample = std::array<double, 3>;
+  const auto sum_turnback = [](const std::vector<Sample>& path) {
+    return kmpc::chord_turnback(static_cast<int>(path.size()), [&](int i) {
+      const Sample& q = path[static_cast<std::size_t>(i)];
+      return q[0] + q[1] + q[2];
+    });
+  };
+  // Sum was already inside 0.15°. Canceling it by folding J3 off its chord
+  // is the horizontal-line failure, so the pass is reverted.
+  const std::vector<Sample> mild_sum = {
+      {0.0, 0.0, 0.0},
+      {0.002, 0.0, 0.0},
+      {0.0, 0.0, 0.0},
+  };
+  const std::vector<Sample> axis_costly = {
+      {0.0, 0.0, 0.0},
+      {0.002, 0.0, -0.002},
+      {0.0, 0.0, 0.0},
+  };
+  EXPECT_LT(sum_turnback(axis_costly), sum_turnback(mild_sum));
+  EXPECT_TRUE(kmpc::straighten_axis_turnback_regressed(mild_sum, axis_costly));
+
+  // Startup-style: sum turnback drops by more than the new axis reversal.
+  const std::vector<Sample> sum_bump = {
+      {0.0, 0.0, 0.0},
+      {0.05, 0.0, 0.0},
+      {0.0, 0.0, 0.0},
+  };
+  const std::vector<Sample> sum_repaired = {
+      {0.0, 0.0, 0.0},
+      {0.001, 0.0, -0.01},
+      {0.002, 0.0, 0.0},
+  };
+  EXPECT_LT(sum_turnback(sum_repaired), sum_turnback(sum_bump));
+  EXPECT_FALSE(kmpc::straighten_axis_turnback_regressed(sum_bump, sum_repaired));
+
+  const double tiny = 0.04 * kmpc::kPi / 180.0;
+  const std::vector<Sample> tiny_back = {
+      {0.0, 0.0, 0.0},
+      {0.0, 0.0, -tiny},
+      {0.0, 0.0, 0.0},
+  };
+  const std::vector<Sample> flat = {
+      {0.0, 0.0, 0.0},
+      {0.0, 0.0, 0.0},
+      {0.0, 0.0, 0.0},
+  };
+  EXPECT_FALSE(kmpc::straighten_axis_turnback_regressed(flat, tiny_back));
+}
+
+TEST(LinePath, PitchBoxAndAdmitAreShared) {
+  const auto cfg_all = kmpc::Config::load(
+      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+  EXPECT_DOUBLE_EQ(cfg_all.params.torso_pitch_max_deg, 23.0);
+  EXPECT_DOUBLE_EQ(kmpc::kStartPitchAdmitRad, 0.005);
+}
 
 TEST(LinePath, SlerpTakesShortArc) {
   const kmpc::Vec4 a(0.0, 0.0, 0.0, 1.0);
@@ -1103,8 +1162,8 @@ TEST(LinePath, BrakeDistanceDoesNotChangeFreezeThreshold) {
   EXPECT_TRUE(tracker.line_frozen());
 }
 
-// r17 field: build admit must cover ~0.00108 rad feedback overshoot at −22°,
-// but still reject a clearly larger initial excess.
+// Build admit must cover the 20261110 ~0.0023 rad feedback overshoot past 22°,
+// and still reject an excess past the 0.005 rad window.
 TEST(LinePath, StartPitchAdmitWindow) {
   const auto cfg_all = kmpc::Config::load(
       cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
@@ -1135,7 +1194,7 @@ TEST(LinePath, StartPitchAdmitWindow) {
     kmpc::CartesianTracker tracker(kin, cfg_all);
     tracker.set_line_pitch_straighten_enable(false);
     tracker.set_line_pace(0.3, 0.8);
-    kmpc::Vec18 q = set_pitch(cfg_all.q_pref, -limit - 0.003);
+    kmpc::Vec18 q = set_pitch(cfg_all.q_pref, -limit - 0.008);
     const kmpc::Vec3 p0 = kin.fk_pos(q, kmpc::kEeFrameLeft);
     const auto posed = kin.fk(q, kmpc::kEeFrameLeft);
     const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));

@@ -2,6 +2,7 @@
 // 对应 Python cartesian_tracker 顶层辅助函数。对照 09-04 §3。
 // damped LS / ClampMag / 相对四元数；禁止 6 行一张 SVD（J-PARSE 在 jparse.hpp）。
 
+#include <algorithm>
 #include <cmath>
 
 #include <Eigen/Cholesky>
@@ -16,9 +17,80 @@ inline constexpr double kIdentityQuatEps = 1e-6;
 inline constexpr double kDeepExitM = 0.02;
 inline constexpr double kPitchWallEpsDeg = 0.5;
 // Shared build/QP/250Hz pitch-recovery admit: allow measured start slightly
-// outside ±torso_pitch_max, never permanently widen the hard box. Field
-// start_pitch_outside saw ~0.00108 rad overshoot; 0.001 rejected it.
-inline constexpr double kStartPitchAdmitRad = 0.002;
+// outside ±torso_pitch_max, never permanently widen the hard box.
+// 20261110: command sat on -22°, measured about -22.129°, and 0.002 rad
+// (~0.115°, gate near -22.115°) still refused. 0.005 rad (~0.286°) covers
+// that edge.
+inline constexpr double kStartPitchAdmitRad = 0.005;
+// Straighten pulls only the pitch sum. If the sum was already within 0.15° of
+// monotonic and the pass then reverses a waist pitch axis by more than 0.05°,
+// drop it and keep the pre-straighten path. A real sum repair (startup pitch)
+// is kept even when one axis moves.
+inline constexpr double kWaistAxisTurnbackRevertRad = 0.05 * kPi / 180.0;
+inline constexpr double kWaistAxisTurnbackWorseRad = 0.02 * kPi / 180.0;
+inline constexpr double kPitchSumGainWorthKeepingRad = 0.15 * kPi / 180.0;
+
+template <class SampleAt>
+inline double chord_turnback(int n, SampleAt sample_at) {
+  if (n < 2) {
+    return 0.0;
+  }
+  const double front = sample_at(0);
+  const double back = sample_at(n - 1);
+  const double net = back - front;
+  if (std::abs(net) < 1e-4) {
+    double lo = front;
+    double hi = front;
+    for (int i = 1; i < n; ++i) {
+      const double v = sample_at(i);
+      lo = std::min(lo, v);
+      hi = std::max(hi, v);
+    }
+    return hi - lo;
+  }
+  const double dir = net > 0.0 ? 1.0 : -1.0;
+  double best = dir * front;
+  double worst = 0.0;
+  for (int i = 0; i < n; ++i) {
+    const double p = dir * sample_at(i);
+    best = std::max(best, p);
+    worst = std::max(worst, best - p);
+  }
+  return worst;
+}
+
+// True when a nearly monotonic pitch sum was redistributed into a waist-axis
+// chord turnback. Callers then keep the pre-straighten samples.
+template <class Path>
+inline bool straighten_axis_turnback_regressed(const Path& before, const Path& after) {
+  const int n = static_cast<int>(before.size());
+  if (n < 2 || static_cast<int>(after.size()) != n) {
+    return true;
+  }
+  double worst_increase = 0.0;
+  for (int axis = 0; axis < 3; ++axis) {
+    const double pre = chord_turnback(n, [&](int i) {
+      return before[static_cast<std::size_t>(i)][axis];
+    });
+    const double post = chord_turnback(n, [&](int i) {
+      return after[static_cast<std::size_t>(i)][axis];
+    });
+    if (post > kWaistAxisTurnbackRevertRad &&
+        post > pre + kWaistAxisTurnbackWorseRad) {
+      worst_increase = std::max(worst_increase, post - pre);
+    }
+  }
+  if (!(worst_increase > kWaistAxisTurnbackRevertRad)) {
+    return false;
+  }
+  const auto sum_at = [&](const Path& path, int i) {
+    const auto& q = path[static_cast<std::size_t>(i)];
+    return q[0] + q[1] + q[2];
+  };
+  const double sum_gain = chord_turnback(n, [&](int i) { return sum_at(before, i); }) -
+                          chord_turnback(n, [&](int i) { return sum_at(after, i); });
+  return sum_gain < kPitchSumGainWorthKeepingRad;
+}
 inline constexpr double kStallWallEzM = 0.05;
 inline constexpr double kStallWallE0M = 0.20;
 inline constexpr double kStallJ2SlackDeg = 8.0;

@@ -511,6 +511,8 @@ class CartesianTracker {
   bool line_pitch_straighten_enable_ = true;
   // line_fit is const; hits are diagnostics only.
   mutable uint64_t line_pitch_straighten_hits_ = 0;
+  // Last line_fit kept the pre-straighten path because a waist axis turned back.
+  mutable bool line_fit_straighten_axis_reverted_ = false;
   bool line_qp_pitch_monotonic_enable_ = true;
   uint64_t line_qp_pitch_monotonic_hits_ = 0;
   bool reverse_last_line_enable_ = true;
