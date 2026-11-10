@@ -22,13 +22,14 @@ inline constexpr double kPitchWallEpsDeg = 0.5;
 // (~0.115°, gate near -22.115°) still refused. 0.005 rad (~0.286°) covers
 // that edge.
 inline constexpr double kStartPitchAdmitRad = 0.005;
-// Straighten pulls only the pitch sum. If the sum was already within 0.15° of
-// monotonic and the pass then reverses a waist pitch axis by more than 0.05°,
-// drop it and keep the pre-straighten path. A real sum repair (startup pitch)
-// is kept even when one axis moves.
+// Per-axis chord straighten: never keep a pass that makes any waist pitch
+// axis reverse more than 0.05° and worse than before by 0.02°.
 inline constexpr double kWaistAxisTurnbackRevertRad = 0.05 * kPi / 180.0;
 inline constexpr double kWaistAxisTurnbackWorseRad = 0.02 * kPi / 180.0;
-inline constexpr double kPitchSumGainWorthKeepingRad = 0.15 * kPi / 180.0;
+// Blow sum-straighten when any waist axis chord turnback *increases* by more
+// than ~1°. Absolute axis fold on the IK seed (often ~3° on J1) is not a reason
+// to drop a sum repair; the r20 horizontal failure grew J3 by ~3.5°.
+inline constexpr double kWaistAxisTurnbackSumStageBlowRad = 1.0 * kPi / 180.0;
 
 template <class SampleAt>
 inline double chord_turnback(int n, SampleAt sample_at) {
@@ -59,15 +60,15 @@ inline double chord_turnback(int n, SampleAt sample_at) {
   return worst;
 }
 
-// True when a nearly monotonic pitch sum was redistributed into a waist-axis
-// chord turnback. Callers then keep the pre-straighten samples.
+// True when any waist pitch axis chord turnback increased by more than blow_rad.
 template <class Path>
-inline bool straighten_axis_turnback_regressed(const Path& before, const Path& after) {
+inline bool straighten_axis_turnback_regressed(
+    const Path& before, const Path& after,
+    double blow_rad = kWaistAxisTurnbackRevertRad) {
   const int n = static_cast<int>(before.size());
   if (n < 2 || static_cast<int>(after.size()) != n) {
     return true;
   }
-  double worst_increase = 0.0;
   for (int axis = 0; axis < 3; ++axis) {
     const double pre = chord_turnback(n, [&](int i) {
       return before[static_cast<std::size_t>(i)][axis];
@@ -75,21 +76,11 @@ inline bool straighten_axis_turnback_regressed(const Path& before, const Path& a
     const double post = chord_turnback(n, [&](int i) {
       return after[static_cast<std::size_t>(i)][axis];
     });
-    if (post > kWaistAxisTurnbackRevertRad &&
-        post > pre + kWaistAxisTurnbackWorseRad) {
-      worst_increase = std::max(worst_increase, post - pre);
+    if (post > pre + std::max(blow_rad, kWaistAxisTurnbackWorseRad)) {
+      return true;
     }
   }
-  if (!(worst_increase > kWaistAxisTurnbackRevertRad)) {
-    return false;
-  }
-  const auto sum_at = [&](const Path& path, int i) {
-    const auto& q = path[static_cast<std::size_t>(i)];
-    return q[0] + q[1] + q[2];
-  };
-  const double sum_gain = chord_turnback(n, [&](int i) { return sum_at(before, i); }) -
-                          chord_turnback(n, [&](int i) { return sum_at(after, i); });
-  return sum_gain < kPitchSumGainWorthKeepingRad;
+  return false;
 }
 inline constexpr double kStallWallEzM = 0.05;
 inline constexpr double kStallWallE0M = 0.20;

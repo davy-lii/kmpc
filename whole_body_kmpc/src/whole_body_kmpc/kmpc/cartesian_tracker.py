@@ -270,7 +270,7 @@ class CartesianTracker:
         q_syn: float = 80.0,
         q_syn_abs: float = 80.0,
         alpha_syn: float = 1.75,
-        torso_pitch_max_deg: float = 23.0,
+        torso_pitch_max_deg: float = 32.0,
         torso_hold_deg: float = _TORSO_HOLD_DEG,
         torso_step_deg: float = _TORSO_STEP_DEG,
         torso_drop_m: float = _TORSO_DROP_M,

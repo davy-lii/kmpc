@@ -894,9 +894,10 @@ bool CartesianTracker::line_fit(
     }
   }
 
-  // 俯仰和是一个冗余量，直线只约束手。端点不动，中间点只在手的零空间里拉回两端连线。
-  // 拉完仍要过 3 mm 管子；拉不动就留在原来的可行解上，不把整段判失败。
-  // 总和本来就已经接近单调、拉直却挤出单轴折返时，退回拉直前的路径。
+  // 俯仰和是冗余量；直线只约束手。端点不动，中间点在手零空间里拉回两端弦。
+  // 架构约束：若拉直后任一腰俯仰轴弦折返超过约 1°（相对拉直前变差），整段
+  // 退回拉直前路径——禁止用 J1/J2/J3 大折返去「买」总和单调（r19/r20 水平段
+  // J3≈3.5°）。启动段总和回摆通常只需很小的单轴代价，仍可保留拉直结果。
   if (line_pitch_straighten_enable_ && !lock_waist && n > 1) {
     ++line_pitch_straighten_hits_;
     const auto pitch_of = [](const Red& y) { return y.head<3>().sum(); };
@@ -969,7 +970,8 @@ bool CartesianTracker::line_fit(
         break;
       }
     }
-    if (straighten_axis_turnback_regressed(kept, path)) {
+    if (straighten_axis_turnback_regressed(kept, path,
+                                           kWaistAxisTurnbackSumStageBlowRad)) {
       path = std::move(kept);
       line_fit_straighten_axis_reverted_ = true;
     } else {
@@ -1431,14 +1433,15 @@ bool CartesianTracker::line_build(
     pose_decision="skipped";
   }
 
-  // Sum-only straighten that worsens a waist-axis chord turnback is reverted
-  // inside line_fit. That pre-straighten path is accepted, including residual
-  // sum turnback. A straightened path that still reverses the sum is refused.
+  // If straighten stayed, residual pitch-sum turnback is a hard refuse. When
+  // straighten was reverted for blowing a waist axis (>~1°), keep the original
+  // path even if the sum still has a small fold — do not buy sum mono with a
+  // large J3 reverse.
   constexpr double kPitchTurnbackMax=0.05*kPi/180.0;
   if (ok && line_pitch_straighten_enable_ && !straighten_axis_reverted &&
-      line_pitch_turnback(samples)>kPitchTurnbackMax) {
-    ok=false;
-    line_.reason="pitch_turnback_unresolved";
+      line_pitch_turnback(samples) > kPitchTurnbackMax) {
+    ok = false;
+    line_.reason = "pitch_turnback_unresolved";
   }
 
   const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();

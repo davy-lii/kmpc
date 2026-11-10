@@ -77,16 +77,9 @@ double lateral(const kmpc::Vec3& p, const kmpc::Vec3& a, const kmpc::Vec3& b) {
 
 }  // namespace
 
-TEST(LinePath, SumImprovesButAxisTurnbackRevertsStraighten) {
+TEST(LinePath, AxisTurnbackIncreaseBlowsSumStraighten) {
   using Sample = std::array<double, 3>;
-  const auto sum_turnback = [](const std::vector<Sample>& path) {
-    return kmpc::chord_turnback(static_cast<int>(path.size()), [&](int i) {
-      const Sample& q = path[static_cast<std::size_t>(i)];
-      return q[0] + q[1] + q[2];
-    });
-  };
-  // Sum was already inside 0.15°. Canceling it by folding J3 off its chord
-  // is the horizontal-line failure, so the pass is reverted.
+  // Default 0.05° increase threshold catches a mild new J3 fold.
   const std::vector<Sample> mild_sum = {
       {0.0, 0.0, 0.0},
       {0.002, 0.0, 0.0},
@@ -97,10 +90,9 @@ TEST(LinePath, SumImprovesButAxisTurnbackRevertsStraighten) {
       {0.002, 0.0, -0.002},
       {0.0, 0.0, 0.0},
   };
-  EXPECT_LT(sum_turnback(axis_costly), sum_turnback(mild_sum));
   EXPECT_TRUE(kmpc::straighten_axis_turnback_regressed(mild_sum, axis_costly));
 
-  // Startup-style: sum turnback drops by more than the new axis reversal.
+  // r20-style: J3 grows by ~3.4° while sum improves — blow.
   const std::vector<Sample> sum_bump = {
       {0.0, 0.0, 0.0},
       {0.05, 0.0, 0.0},
@@ -108,11 +100,24 @@ TEST(LinePath, SumImprovesButAxisTurnbackRevertsStraighten) {
   };
   const std::vector<Sample> sum_repaired = {
       {0.0, 0.0, 0.0},
-      {0.001, 0.0, -0.01},
+      {0.001, 0.0, -0.06},
       {0.002, 0.0, 0.0},
   };
-  EXPECT_LT(sum_turnback(sum_repaired), sum_turnback(sum_bump));
-  EXPECT_FALSE(kmpc::straighten_axis_turnback_regressed(sum_bump, sum_repaired));
+  EXPECT_TRUE(kmpc::straighten_axis_turnback_regressed(
+      sum_bump, sum_repaired, kmpc::kWaistAxisTurnbackSumStageBlowRad));
+  // Seed already has a large J1 fold; a small extra move is not a blow.
+  const std::vector<Sample> seeded = {
+      {0.0, 0.0, 0.0},
+      {-0.05, 0.0, 0.0},
+      {0.0, 0.0, 0.0},
+  };
+  const std::vector<Sample> seeded_fixed = {
+      {0.0, 0.0, 0.0},
+      {-0.052, 0.0, 0.0},
+      {0.01, 0.0, 0.0},
+  };
+  EXPECT_FALSE(kmpc::straighten_axis_turnback_regressed(
+      seeded, seeded_fixed, kmpc::kWaistAxisTurnbackSumStageBlowRad));
 
   const double tiny = 0.04 * kmpc::kPi / 180.0;
   const std::vector<Sample> tiny_back = {
@@ -131,7 +136,7 @@ TEST(LinePath, SumImprovesButAxisTurnbackRevertsStraighten) {
 TEST(LinePath, PitchBoxAndAdmitAreShared) {
   const auto cfg_all = kmpc::Config::load(
       cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
-  EXPECT_DOUBLE_EQ(cfg_all.params.torso_pitch_max_deg, 23.0);
+  EXPECT_DOUBLE_EQ(cfg_all.params.torso_pitch_max_deg, 32.0);
   EXPECT_DOUBLE_EQ(kmpc::kStartPitchAdmitRad, 0.005);
 }
 
