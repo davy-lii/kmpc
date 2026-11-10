@@ -812,12 +812,108 @@ TEST(LinePath, LoggedFixedPointsNoPitchReversalOrOvershoot) {
   }
 }
 
+// r18 20261110T010033Z first left preparation command, q0 from the 20 ms
+// sample immediately before segment_left at t=85.975. This tests the command
+// reversal seen at startup without requiring a live robot or ROS hardware.
+TEST(LinePath, R18FirstPreparationPitchDoesNotTurnBack) {
+  const auto cfg_all = kmpc::Config::load(
+      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+  kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
+  const double raw[18] = {
+      0.69823689566079, -0.8726313364835387, -0.17452626729670775,
+      -0.026161562968393396, -0.0017104484996170166, 0.5153258154747791,
+      -0.13651925674736182, -2.126578898166196, -1.2752271109513555,
+      -0.2429110109784006, 0.013943645677382372, -0.0017104984338874557,
+      0.5153263148174834, 0.13651925674736182, -2.126578898166196,
+      1.2752278300048496, -0.24291077129390246, 0.013948439367344516};
+  kmpc::Vec18 q;
+  for (int i=0;i<18;++i) q[i]=raw[i];
+  const kmpc::Vec3 prep(0.456071795,0.272798503,0.615);
+  const kmpc::Vec3 tip_pos(0.456071795,0.272798503,0.465);
+  const kmpc::Vec4 tool_quat(0.778376915,0.229195584,-0.312912199,0.493644324);
+  const kmpc::Vec4 quat=kmpc::tool_to_flange_quat_xyzw(tool_quat);
+  kmpc::LineTarget tip;
+  tip.xyz=tip_pos;tip.quat_xyzw=quat;tip.ori_on=true;
+  kmpc::CartesianTracker tracker(kin,cfg_all);
+  tracker.set_line_pace(0.6,0.5);
+  ASSERT_TRUE(tracker.rearm_line(1,tip));
+  std::vector<kmpc::Vec18> commanded{q};
+  for(int i=0;i<2000;++i) {
+    const auto step=tracker.compute(q,cfg_all.q_pref,&prep,nullptr,&quat,nullptr);
+    ASSERT_FALSE(tracker.line_refused()) << tracker.line_reason() << " at " << i;
+    q+=step.dq;
+    commanded.push_back(q);
+    if(i==0) {
+      const std::vector<kmpc::Vec18> samples(
+          tracker.line_samples().begin(),tracker.line_samples().end());
+      EXPECT_LE(pitch_turnback(samples)*180.0/kmpc::kPi,0.05);
+    }
+    if(tracker.last_arrived()) break;
+  }
+  EXPECT_TRUE(tracker.last_arrived());
+  EXPECT_LE(pitch_turnback(commanded)*180.0/kmpc::kPi,0.10);
+}
+
+// The stream has reached an accepted endpoint, but a delayed measurement is
+// still outside arrival tolerance. It must wait for feedback without a new
+// tail QP command, then either arrive or refuse after the bounded wait.
+TEST(LinePath, TailWaitsForFeedbackThenArrivesOrRefuses) {
+  const auto cfg_all = kmpc::Config::load(
+      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+  kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
+  const kmpc::Vec18 start=cfg_all.q_pref;
+  const kmpc::Vec3 target=kin.fk_pos(start,kmpc::kEeFrameLeft)+
+      kmpc::Vec3(0.10,0.0,0.0);
+  for(const bool catch_up : {true,false}) {
+    kmpc::CartesianTracker tracker(kin,cfg_all);
+    tracker.set_line_pace(0.6,0.5);
+    ASSERT_TRUE(tracker.rearm_line(1));
+    kmpc::Vec18 measured=start;
+    kmpc::Vec18 command=start;
+    bool frozen=false;
+    bool saw_wait=false;
+    int wait_ticks=0;
+    for(int tick=0;tick<2000;++tick) {
+      tracker.set_line_reference(command);
+      const auto step=tracker.compute(measured,cfg_all.q_pref,&target,nullptr,nullptr,nullptr);
+      (void)step;
+      if(tracker.line_refused()) break;
+      const kmpc::Vec18 next=tracker.line_cmd();
+      const double measured_error=(kin.fk_pos(measured,kmpc::kEeFrameLeft)-target).norm();
+      const double command_error=(kin.fk_pos(next,kmpc::kEeFrameLeft)-target).norm();
+      if(!frozen && measured_error>0.004 && measured_error<0.006) frozen=true;
+      if(frozen && measured_error>0.003 && command_error<=0.003 &&
+         tracker.line_progress()>=static_cast<double>(tracker.line_samples().size()-1)-1e-4) {
+        saw_wait=true;
+        ++wait_ticks;
+        EXPECT_LT((next-command).cwiseAbs().maxCoeff(),1e-12)
+            << "tail command changed while feedback lagged";
+        if(catch_up && wait_ticks==3) measured=next;
+      } else if(!frozen) {
+        measured=next;
+      }
+      command=next;
+      if(tracker.last_arrived()) break;
+    }
+    ASSERT_TRUE(frozen);
+    ASSERT_TRUE(saw_wait) << "reference did not enter the tail wait branch";
+    if(catch_up) {
+      EXPECT_TRUE(tracker.last_arrived());
+      EXPECT_FALSE(tracker.line_refused());
+    } else {
+      EXPECT_TRUE(tracker.line_refused());
+      EXPECT_EQ(tracker.line_reason(),"tail_feedback_not_arrived");
+      EXPECT_GE(wait_ticks,50);
+    }
+  }
+}
+
 TEST(LinePath, P0IsolationSwitchDefaults) {
   const auto cfg_all = kmpc::Config::load(
       cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
   kmpc::CartesianTracker tracker(kin, cfg_all);
-  EXPECT_FALSE(tracker.line_pitch_straighten_enabled());
+  EXPECT_TRUE(tracker.line_pitch_straighten_enabled());
   EXPECT_TRUE(tracker.line_qp_pitch_monotonic_enabled());
   EXPECT_TRUE(tracker.reverse_last_line_enabled());
   EXPECT_EQ(tracker.line_pitch_straighten_hits(), 0u);

@@ -162,7 +162,9 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
       const double soft=limit+allowed_ex;
       row(k,pitch,-soft-q.head<3>().sum(),soft-q.head<3>().sum());
     }
-    // 名义路径的俯仰和已经定好。这一拍的修正不能把它改回反方向。x=0 不在界内就不加，避免把原来能走的段判失败。
+    // The commanded pitch must follow the nominal path's direction. A nominal
+    // reversal is rejected at build time when straightening is enabled; do
+    // not silently drop this row merely because zero correction violates it.
     // P0: independent of line_fit pitch straighten; first field对照 keeps this ON.
     // While `from` is still outside, flat mono can lock the path outside the hard
     // box (field A). After back in box, mono uses clamped endpoints so the flat
@@ -188,9 +190,11 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
       }
       lo=std::max(lo,std::min(p_prev,pNm)-kPitchSlack-p_q);
       hi=std::min(hi,std::max(p_prev,pNm)+kPitchSlack-p_q);
-      if(lo<=0.0 && hi>=0.0 && lo<hi) {
+      if(lo<hi) {
         row(k,pitch,lo,hi);
         ++line_qp_pitch_monotonic_hits_;
+      } else {
+        return reject("qp_pitch_monotonic_infeasible");
       }
     }
     if(yaw_max_>0) {

@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <chrono>
+#include <limits>
 
 #include <Eigen/Cholesky>
 
@@ -106,6 +107,26 @@ std::string line_frame(bool left, std::string_view given) {
     return std::string(given);
   }
   return std::string(left ? kEeFrameLeft : kEeFrameRight);
+}
+
+double line_pitch_turnback(
+    const std::vector<Vec18, Eigen::aligned_allocator<Vec18>>& path) {
+  if (path.size() < 2) return 0.0;
+  const auto pitch=[](const Vec18& q){return q.head<3>().sum();};
+  const double net=pitch(path.back())-pitch(path.front());
+  if (std::abs(net)<1e-4) {
+    double lo=pitch(path.front()),hi=lo;
+    for (const auto& q:path) {lo=std::min(lo,pitch(q));hi=std::max(hi,pitch(q));}
+    return hi-lo;
+  }
+  const double dir=net>0 ? 1.0 : -1.0;
+  double best=dir*pitch(path.front()),worst=0.0;
+  for (const auto& q:path) {
+    const double p=dir*pitch(q);
+    best=std::max(best,p);
+    worst=std::max(worst,best-p);
+  }
+  return worst;
 }
 
 }  // namespace
@@ -1073,25 +1094,68 @@ bool CartesianTracker::line_measured_arrived(const Vec18& q) const {
           rot_to_quat_xyzw(pose.block<3,3>(0,0))).norm()<=arrived_ori_rad_);
 }
 
-bool CartesianTracker::line_stream_segment_ok(const Vec18& from,const Vec18& to) const {
-  if(!line_.on || line_.samples.empty() || !from.allFinite() || !to.allFinite()) return false;
+CartesianTracker::LineStreamCheck CartesianTracker::line_stream_segment_check(
+    const Vec18& from, const Vec18& to) const {
+  LineStreamCheck result;
+  if (!line_.on || line_.samples.empty() || !from.allFinite() || !to.allFinite())
+    return result;
+  result.ok = true;
+  result.reason = "ok";
+  const double inf = std::numeric_limits<double>::infinity();
+  result.joint_margin_rad = inf;
+  result.com_margin_m = inf;
+  result.pitch_margin_rad = inf;
+  result.tube_margin_m = inf;
+  result.progress_margin_m = inf;
   const Vec3 start=kin_.fk_pos(line_.samples.front(),line_.frame);
   const Vec3 ab=line_.target-start;
   double previous=(kin_.fk_pos(from,line_.frame)-start).dot(ab);
   const double pitch_bound=std::max(torso_pitch_max_,std::abs(line_.samples.front().head<3>().sum()));
   for(int i=1;i<=5;++i) {
     const Vec18 q=from+(i/5.0)*(to-from);
-    if((q.array()<(limits_.q_min.array()+q_limit_margin_-1e-8)).any() ||
-       (q.array()>(limits_.q_max.array()-q_limit_margin_+1e-8)).any() ||
-       !guards_.com_xy_inside(kin_.com(q)) ||
-       (torso_pitch_max_>0 && std::abs(q.head<3>().sum())>pitch_bound+1e-7)) return false;
+    const double joint_margin = std::min(
+        (q-limits_.q_min-Vec18::Constant(q_limit_margin_)).minCoeff(),
+        (limits_.q_max-q-Vec18::Constant(q_limit_margin_)).minCoeff());
+    const Vec3 com = kin_.com(q);
+    const double com_margin = std::min({
+        com.x()-(com_xmin_+com_margin_),
+        (com_xmax_-com_margin_)-com.x(),
+        com.y()-(com_ymin_+com_margin_),
+        (com_ymax_-com_margin_)-com.y()});
+    const double pitch_margin = torso_pitch_max_>0
+        ? pitch_bound-std::abs(q.head<3>().sum()) : inf;
+    result.joint_margin_rad = std::min(result.joint_margin_rad,joint_margin);
+    result.com_margin_m = std::min(result.com_margin_m,com_margin);
+    result.pitch_margin_rad = std::min(result.pitch_margin_rad,pitch_margin);
+    if (joint_margin < -1e-8 || !guards_.com_xy_inside(com) || pitch_margin < -1e-7) {
+      result.ok = false;
+      result.reason = joint_margin < -1e-8 ? "joint" :
+          !guards_.com_xy_inside(com) ? "com" : "pitch";
+      result.sample_index = i;
+      return result;
+    }
     const Vec3 position=kin_.fk_pos(q,line_.frame);
     const double along=(position-start).dot(ab);
     const double t=std::clamp(along/std::max(ab.squaredNorm(),1e-12),0.0,1.0);
-    if((position-(start+t*ab)).norm()>kLineSampleTolM || along<previous-1e-6*std::max(ab.norm(),1e-6)) return false;
+    const double tube_margin=kLineSampleTolM-(position-(start+t*ab)).norm();
+    // Convert the historical dot-product progress tolerance to meters.
+    const double progress_margin=(along-previous+1e-6*std::max(ab.norm(),1e-6)) /
+        std::max(ab.norm(),1e-6);
+    result.tube_margin_m=std::min(result.tube_margin_m,tube_margin);
+    result.progress_margin_m=std::min(result.progress_margin_m,progress_margin);
+    if(tube_margin<0 || progress_margin<0) {
+      result.ok=false;
+      result.reason=tube_margin<0 ? "tube" : "progress";
+      result.sample_index=i;
+      return result;
+    }
     previous=along;
   }
-  return true;
+  return result;
+}
+
+bool CartesianTracker::line_stream_segment_ok(const Vec18& from,const Vec18& to) const {
+  return line_stream_segment_check(from,to).ok;
 }
 
 bool CartesianTracker::line_build(
@@ -1353,6 +1417,18 @@ bool CartesianTracker::line_build(
     pose_decision="skipped";
   }
 
+  // The optional nominal pitch repair used to fall back to the original
+  // reversing path when its nullspace pass could not make it feasible. With
+  // this policy enabled, a remaining turnback is an explicit build refusal.
+  // The QP cannot reliably remove a large turnback from an already accepted
+  // nominal path while respecting the same tube and joint constraints.
+  constexpr double kPitchTurnbackMax=0.05*kPi/180.0;
+  if (ok && line_pitch_straighten_enable_ &&
+      line_pitch_turnback(samples)>kPitchTurnbackMax) {
+    ok=false;
+    line_.reason="pitch_turnback_unresolved";
+  }
+
   const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
   reverse_decision_=reverse_decision;
   if (!ok || samples.empty()) {
@@ -1549,9 +1625,27 @@ bool CartesianTracker::follow_line(
   }
 
   const bool at_end=nseg<=0.0 || line_.prog>=nseg-1e-4;
-  // Once the path ends inside the accepted pose tolerance, do not spend more
-  // ticks reducing a harmless residual through redundant joint motion.
-  if(at_end && remain<=kLineSampleTolM && ori_ok) {
+  // If the previously accepted command already reaches the target, wait for
+  // measured feedback to catch up instead of running a new QP at the final
+  // path point. That QP may have no forward progress left and can propose a
+  // chord outside the tube while the servo is merely lagging its command.
+  const auto ref_pose=at_end?kin_.fk(q_from,line_.frame):Eigen::Matrix4d::Identity();
+  const bool ref_at_goal=at_end &&
+      (ref_pose.col(3).head<3>()-line_.target).norm()<=kLineSampleTolM &&
+      (!line_.ori_on ||
+       ori_error_xyzw(line_.quat,
+          rot_to_quat_xyzw(ref_pose.block<3,3>(0,0))).norm()<=arrived_ori_rad_);
+  if(ref_at_goal) {
+    if(remain>kLineSampleTolM || !ori_ok) {
+      constexpr int kTailFeedbackWaitTicks=50; // 1 s at the 50 Hz tracker rate.
+      if(++line_.tail_feedback_wait_ticks>kTailFeedbackWaitTicks) {
+        refuse_line("tail_feedback_not_arrived");
+        out.dq.setZero();return false;
+      }
+      line_q_=q_from;
+      out.dq.setZero();return true;
+    }
+    line_.tail_feedback_wait_ticks=0;
     // 人已经在终点公差里。速度还没收完也不再解 QP，避免在预备点/抓取点上折返微调。
     if(line_rate_<=0.1*line_speed_scale_+1e-9) {
       line_.hold=true;line_q_=q_from;line_rate_=0;line_rate_acc_=0;last_arrived_=true;
@@ -1568,6 +1662,7 @@ bool CartesianTracker::follow_line(
     }
     out.dq.setZero();return true;
   }
+  line_.tail_feedback_wait_ticks=0;
   Vec18 next = q_from;
   if (line_rate_ > 1e-4 && !line_path_qp(q_from,line_.prog,step_lim,next)) {
     line_.prog=old_prog;

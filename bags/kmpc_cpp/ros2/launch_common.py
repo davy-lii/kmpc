@@ -319,8 +319,8 @@ def generate_real_launch():
             'line_pose_pref_enable', default_value='false',
             description='直线段默认关闭的姿态偏好候选'),
         DeclareLaunchArgument(
-            'line_pitch_straighten_enable', default_value='false',
-            description='P0：line_fit 俯仰拉直；实验默认关（对齐 r10b 路径）'),
+            'line_pitch_straighten_enable', default_value='true',
+            description='直线名义路径俯仰单调化；不可行时显式拒绝'),
         DeclareLaunchArgument(
             'line_qp_pitch_monotonic_enable', default_value='true',
             description='P0：line_qp 俯仰单调方向约束；默认开，可独立关掉对照'),

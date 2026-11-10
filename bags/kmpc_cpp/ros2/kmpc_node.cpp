@@ -12,6 +12,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -249,7 +250,7 @@ class KmpcNode : public rclcpp::Node {
     tracker_->set_line_pose_pref_q(cfg_.q_pref);
     // P0 path-layer isolation switches (scheme defaults).
     line_pitch_straighten_enable_ =
-        bool_param("line_pitch_straighten_enable", false);
+        bool_param("line_pitch_straighten_enable", true);
     tracker_->set_line_pitch_straighten_enable(line_pitch_straighten_enable_);
     line_qp_pitch_monotonic_enable_ =
         bool_param("line_qp_pitch_monotonic_enable", true);
@@ -528,7 +529,7 @@ class KmpcNode : public rclcpp::Node {
             kmpc::CartesianTracker::kDefaultLineBrakeProfile));
     declare_parameter("line_qp_max_iter", 200);
     declare_parameter("line_pose_pref_enable", false);
-    declare_parameter("line_pitch_straighten_enable", false);
+    declare_parameter("line_pitch_straighten_enable", true);
     declare_parameter("line_qp_pitch_monotonic_enable", true);
     declare_parameter("reverse_last_line_enable", true);
     declare_parameter("line_diag_enable", false);
@@ -839,13 +840,13 @@ class KmpcNode : public rclcpp::Node {
           static_cast<unsigned long long>(tracker_->goal_generation()),j,q_path[j]-stream_line_from_[j],cap[j],q_path[j]-planning_from[j],stream_line_from_[j]-planning_from[j]);
       }
       tracker_->refuse_line("stream_first_step_limit");
-      stream_enter_hold(stream_line_from_);
+      stream_enter_hold(interpolator_.q_ref());
       return;
     }
     const auto bounded=kmpc::ros2io::bound_line_stream_step(stream_line_from_,q_path,cap);
     if(!bounded) {
       tracker_->refuse_line("stream_nonfinite_or_invalid_cap");
-      stream_enter_hold(stream_line_from_); return;
+      stream_enter_hold(interpolator_.q_ref()); return;
     }
     line_commit_scale_=bounded->scale;
     line_commit_peak_ratio_=0.0;
@@ -854,9 +855,28 @@ class KmpcNode : public rclcpp::Node {
     if(line_commit_scale_<1.0-1e-9) ++line_limited_steps_;
     // Validate the actual chord after limiting; velocity, line tube and
     // forward progress remain acceptance conditions.
-    if(!tracker_->line_stream_segment_ok(stream_line_from_,bounded->target)) {
+    const auto check=tracker_->line_stream_segment_check(stream_line_from_,bounded->target);
+    if(!check.ok) {
+      const auto vec_csv=[](const kmpc::Vec18& q) {
+        std::ostringstream out;
+        out.precision(12);
+        for(int j=0;j<kmpc::kNDof;++j) {
+          if(j) out << ',';
+          out << q[j];
+        }
+        return out.str();
+      };
+      const kmpc::Vec18 sent=interpolator_.q_ref();
+      RCLCPP_ERROR(get_logger(),
+        "line stream reject gen=%llu check=%s sample=%d joint_margin_rad=%.9g com_margin_m=%.9g pitch_margin_rad=%.9g tube_margin_m=%.9g progress_margin_m=%.9g raw_to_sent_max_rad=%.9g from=[%s] to=[%s] sent=[%s]",
+        static_cast<unsigned long long>(tracker_->goal_generation()),check.reason,
+        check.sample_index,check.joint_margin_rad,check.com_margin_m,
+        check.pitch_margin_rad,check.tube_margin_m,check.progress_margin_m,
+        (stream_line_from_-sent).cwiseAbs().maxCoeff(),
+        vec_csv(stream_line_from_).c_str(),vec_csv(bounded->target).c_str(),
+        vec_csv(sent).c_str());
       tracker_->refuse_line("stream_tube_or_progress");
-      stream_enter_hold(stream_line_from_);
+      stream_enter_hold(interpolator_.q_ref());
       return;
     }
     stream_line_ = true;
@@ -1682,7 +1702,7 @@ class KmpcNode : public rclcpp::Node {
           raw == 200 ? "node_default" : "ros_override", "[1,10000]", true);
     }
     add("line_freeze_distance_m", "0.08", "m", "compile_const", "=0.08", true);
-    ros_bool("line_pitch_straighten_enable", false);
+    ros_bool("line_pitch_straighten_enable", true);
     ros_bool("line_qp_pitch_monotonic_enable", true);
     ros_bool("reverse_last_line_enable", true);
     ros_num("stream_hz", 250.0, stream_hz_, "Hz", ">0");
@@ -2193,7 +2213,7 @@ class KmpcNode : public rclcpp::Node {
       kmpc::CartesianTracker::kDefaultLineBrakeProfile;
   int line_qp_max_iter_ = 200;
   bool line_pose_pref_enable_ = false;
-  bool line_pitch_straighten_enable_ = false;
+  bool line_pitch_straighten_enable_ = true;
   bool line_qp_pitch_monotonic_enable_ = true;
   bool reverse_last_line_enable_ = true;
   bool line_diag_enable_ = false;

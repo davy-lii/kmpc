@@ -110,8 +110,8 @@ kmpc_node:
     line_brake_profile: sqrt
     # 直线 sparse ProxQP 迭代预算；非 SOLVED 仍拒绝。
     line_qp_max_iter: 200
-    # P0 路径层隔离开关（与 launch 默认一致；真机以 launch/节点参数为准）。
-    line_pitch_straighten_enable: false
+    # 直线名义路径俯仰单调化（与 launch 默认一致；真机以 launch/节点参数为准）。
+    line_pitch_straighten_enable: true
     line_qp_pitch_monotonic_enable: true
     reverse_last_line_enable: true
     joint_states_topic: /joint_states

@@ -305,6 +305,19 @@ class CartesianTracker {
 
   bool line_needs_build(bool left, const Vec3& target, const Vec4* quat) const;
   bool line_measured_arrived(const Vec18& q) const;
+  struct LineStreamCheck {
+    bool ok = false;
+    const char* reason = "invalid";
+    int sample_index = 0;
+    // Minimum signed clearance over the five interpolation samples. Negative
+    // means the corresponding constraint is violated (radians or meters).
+    double joint_margin_rad = 0.0;
+    double com_margin_m = 0.0;
+    double pitch_margin_rad = 0.0;
+    double tube_margin_m = 0.0;
+    double progress_margin_m = 0.0;
+  };
+  LineStreamCheck line_stream_segment_check(const Vec18& from, const Vec18& to) const;
   bool line_stream_segment_ok(const Vec18& from, const Vec18& to) const;
 
 
@@ -412,6 +425,7 @@ class CartesianTracker {
     std::vector<Vec18, Eigen::aligned_allocator<Vec18>> samples;
     double prog = 0.0;
     double length_m = 0.0;
+    int tail_feedback_wait_ticks = 0;
   };
 
   LineRun prepare_line(const Vec18& q, bool left, const Vec3& target, const Vec4* quat) {
@@ -492,8 +506,9 @@ class CartesianTracker {
   double line_pose_pref_waist_budget_ = 35.0 * kPi / 180.0;
   double line_pose_pref_wrist_budget_ = 25.0 * kPi / 180.0;
 
-  // Experiment default OFF: same-q0 replay matched r10b when this block was removed.
-  bool line_pitch_straighten_enable_ = false;
+  // Shape nominal pitch before the QP so startup cannot inherit a reversing
+  // path; unresolved turnback is refused by line_build.
+  bool line_pitch_straighten_enable_ = true;
   // line_fit is const; hits are diagnostics only.
   mutable uint64_t line_pitch_straighten_hits_ = 0;
   bool line_qp_pitch_monotonic_enable_ = true;
