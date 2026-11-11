@@ -35,10 +35,6 @@ struct PoseMm {
   double x, y, z, qx, qy, qz, qw;
 };
 
-kmpc::Vec3 xyz_m(const PoseMm& p) {
-  return kmpc::Vec3(p.x * 1e-3, p.y * 1e-3, p.z * 1e-3);
-}
-
 kmpc::Vec4 flange_quat(const PoseMm& p) {
   return kmpc::tool_to_flange_quat_xyzw(kmpc::Vec4(p.qx, p.qy, p.qz, p.qw));
 }
