@@ -61,8 +61,11 @@ int main(int argc,char**argv) {
       const Vec18 next=tracker.line_cmd();
       if(!next.allFinite())return 4;
 #ifndef KMPC_BASELINE
-      if(!tracker.line_holding() && !tracker.line_stream_segment_ok(q,next)) {
-        tracker.refuse_line("stream_tube_or_progress");break;
+      if(!tracker.line_holding()) {
+        const auto chk=tracker.line_stream_segment_check(q,next);
+        if(!chk.ok) {
+          tracker.refuse_line(std::string("stream_")+chk.reason);break;
+        }
       }
 #endif
       const double sr=((next-q).cwiseAbs().array()/(cfg.limits.dq_max.array()*cfg.params.dt*0.6)).maxCoeff();

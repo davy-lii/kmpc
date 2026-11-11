@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 #include <Eigen/Cholesky>
 
@@ -21,7 +22,77 @@ inline constexpr double kPitchWallEpsDeg = 0.5;
 // 20261110: command sat on -22°, measured about -22.129°, and 0.002 rad
 // (~0.115°, gate near -22.115°) still refused. 0.005 rad (~0.286°) covers
 // that edge.
+// This is a recovery envelope for starts already outside — never an ordinary
+// planning target allowance and never a permanent 250 Hz hard-gate widen.
 inline constexpr double kStartPitchAdmitRad = 0.005;
+// Rounding / float judgment only (gates). Not a planning target budget.
+inline constexpr double kPitchRoundEpsRad = 1e-6;
+
+// Absolute pitch bound for one sample.
+// Ordinary (start inside hard): planning uses hard; gates add only round eps.
+// Recovery (start outside): envelope is |start|, no growth; gates add round eps.
+// Never treat kStartPitchAdmitRad as an ordinary-segment overshoot quota.
+inline double pitch_abs_bound(double hard, double start_abs, bool for_gate) {
+  if (hard <= 0.0) {
+    return std::numeric_limits<double>::infinity();
+  }
+  const double eps = for_gate ? kPitchRoundEpsRad : 0.0;
+  if (start_abs > hard + kPitchRoundEpsRad) {
+    return start_abs + eps;
+  }
+  return hard + eps;
+}
+
+inline bool pitch_abs_ok(double pitch_abs, double hard, double start_abs,
+                         bool for_gate) {
+  return pitch_abs <= pitch_abs_bound(hard, start_abs, for_gate) +
+                         (for_gate ? 0.0 : 1e-9);
+}
+
+// Cubic Hermite on joint knots (C1). Tangents are centered finite differences;
+// endpoints use one-sided chords. Progress is continuous in [0, n-1].
+template <class Samples>
+inline Vec18 hermite_joint_at(const Samples& samples, double prog) {
+  const int n = static_cast<int>(samples.size());
+  if (n <= 0) {
+    return Vec18::Zero();
+  }
+  if (n == 1) {
+    return samples[0];
+  }
+  const double hi = static_cast<double>(n - 1);
+  double p = prog;
+  if (p < 0.0) {
+    p = 0.0;
+  } else if (p > hi) {
+    p = hi;
+  }
+  const int i = static_cast<int>(std::floor(p));
+  if (i >= n - 1) {
+    return samples[static_cast<std::size_t>(n - 1)];
+  }
+  const double u = p - static_cast<double>(i);
+  auto at = [&](int k) -> const Vec18& {
+    return samples[static_cast<std::size_t>(k)];
+  };
+  auto tangent = [&](int k) -> Vec18 {
+    if (k <= 0) {
+      return at(1) - at(0);
+    }
+    if (k >= n - 1) {
+      return at(n - 1) - at(n - 2);
+    }
+    return 0.5 * (at(k + 1) - at(k - 1));
+  };
+  const Vec18& p0 = at(i);
+  const Vec18& p1 = at(i + 1);
+  const Vec18 m0 = tangent(i);
+  const Vec18 m1 = tangent(i + 1);
+  const double u2 = u * u;
+  const double u3 = u2 * u;
+  return (2.0 * u3 - 3.0 * u2 + 1.0) * p0 + (u3 - 2.0 * u2 + u) * m0 +
+         (-2.0 * u3 + 3.0 * u2) * p1 + (u3 - u2) * m1;
+}
 // Per-axis chord straighten: never keep a pass that makes any waist pitch
 // axis reverse more than 0.05° and worse than before by 0.02°.
 inline constexpr double kWaistAxisTurnbackRevertRad = 0.05 * kPi / 180.0;

@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <deque>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -266,6 +267,8 @@ class KmpcNode : public rclcpp::Node {
     run_id_ = kmpc::ros2io::layer_diag_mono_ns();
     tracker_->set_line_diag_run_id(run_id_);
     layer_diag_path_ = str_or("layer_diag_path", "");
+    qp_fail_dump_dir_ = str_or(
+        "qp_fail_dump_dir", "/home/nvidia/ljw/issues/kmpc/qp_fail_dumps");
     config_snapshot_path_ = str_or("config_snapshot_path", "");
     t0_ = now().seconds();
     configure_command_io();
@@ -538,6 +541,8 @@ class KmpcNode : public rclcpp::Node {
     declare_parameter("line_direction_strict_enable", true);
     declare_parameter("line_diag_enable", false);
     declare_parameter<std::string>("layer_diag_path", "");
+    declare_parameter<std::string>(
+        "qp_fail_dump_dir", "/home/nvidia/ljw/issues/kmpc/qp_fail_dumps");
     declare_parameter<std::string>("config_snapshot_path", "");
     declare_parameter("stream_hz", 250.0);
     declare_parameter("interp_catch_s", 0.02);
@@ -634,7 +639,14 @@ class KmpcNode : public rclcpp::Node {
     if((q.array()<cfg_.limits.q_min.array()+cfg_.params.q_limit_margin-1e-7).any() ||
        (q.array()>cfg_.limits.q_max.array()-cfg_.params.q_limit_margin+1e-7).any()) return "stream_filtered_joint_limit";
     const double limit=cfg_.params.torso_pitch_max_deg*kmpc::kPi/180;
-    if(limit>0 && std::abs(q.head<3>().sum())>limit+pitch_extra+1e-6) return "stream_filtered_pitch";
+    // Ordinary final gate: hard + recovery extra + round eps only.
+    // Never add kStartPitchAdmitRad here — that admit is for start-outside
+    // recovery / validate residue, not a permanent 250 Hz widen.
+    if(limit>0 &&
+       std::abs(q.head<3>().sum())>
+           limit+pitch_extra+kmpc::kPitchRoundEpsRad) {
+      return "stream_filtered_pitch";
+    }
     if(!stream_guards_->com_xy_inside(stream_kin_->com(q))) return "stream_filtered_com";
     const auto pose=stream_kin_->fk(q,stream_geo_frame_);
     const kmpc::Vec3 ab=stream_geo_target_-stream_geo_start_;
@@ -906,7 +918,9 @@ class KmpcNode : public rclcpp::Node {
         (stream_line_from_-sent).cwiseAbs().maxCoeff(),
         vec_csv(stream_line_from_).c_str(),vec_csv(bounded->target).c_str(),
         vec_csv(sent).c_str());
-      tracker_->refuse_line("stream_tube_or_progress");
+      // Preserve the concrete gate (pitch/tube/progress/…) — never collapse to
+      // the historical stream_tube_or_progress alias that hid pitch hard-box stops.
+      tracker_->refuse_line(std::string("stream_") + check.reason);
       stream_enter_hold(interpolator_.q_ref());
       return;
     }
@@ -1577,6 +1591,142 @@ class KmpcNode : public rclcpp::Node {
     sdk_notes_.push_back(sample);
   }
 
+  void drain_qp_fail_dump() {
+    if (!tracker_ || qp_fail_dump_dir_.empty()) {
+      return;
+    }
+    // Dump is ~0.6MB; keep it off the stack.
+    auto dump = std::make_unique<kmpc::CartesianTracker::LineQpFailDump>();
+    if (!tracker_->take_line_qp_fail_dump(dump.get()) || !dump->valid) {
+      return;
+    }
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::create_directories(qp_fail_dump_dir_, ec);
+    if (ec) {
+      RCLCPP_ERROR(get_logger(), "qp fail dump mkdir %s failed: %s",
+                   qp_fail_dump_dir_.c_str(), ec.message().c_str());
+      return;
+    }
+    char name[256];
+    std::snprintf(name, sizeof(name), "qp_fail_gen%llu_mono%llu.json",
+                  static_cast<unsigned long long>(dump->goal_generation),
+                  static_cast<unsigned long long>(dump->mono_ns));
+    const fs::path path = fs::path(qp_fail_dump_dir_) / name;
+    std::ofstream out(path);
+    if (!out) {
+      RCLCPP_ERROR(get_logger(), "qp fail dump open failed: %s", path.c_str());
+      return;
+    }
+    auto csv18 = [](const kmpc::Vec18& q) {
+      std::ostringstream oss;
+      oss.setf(std::ios::scientific);
+      oss.precision(17);
+      for (int i = 0; i < 18; ++i) {
+        if (i) oss << ',';
+        oss << q[i];
+      }
+      return oss.str();
+    };
+    out << "{\n";
+    out << "  \"schema\":\"kmpc_line_qp_fail_v1\",\n";
+    out << "  \"note\":\"worst_c is the max violation index on the solver return; "
+           "it does not prove a unique conflicting constraint\",\n";
+    out << "  \"truncated\":" << (dump->truncated ? "true" : "false") << ",\n";
+    out << "  \"mono_ns\":" << dump->mono_ns << ",\n";
+    out << "  \"goal_generation\":" << dump->goal_generation << ",\n";
+    out << "  \"line_gen\":" << dump->line_gen << ",\n";
+    out << "  \"reason\":\"" << dump->reason << "\",\n";
+    out << "  \"status\":" << dump->status << ",\n";
+    out << "  \"status_name\":\"" << dump->status_name << "\",\n";
+    out << "  \"iter\":" << dump->iter << ",\n";
+    out << "  \"pri_res\":" << dump->pri_res << ",\n";
+    out << "  \"dua_res\":" << dump->dua_res << ",\n";
+    out << "  \"solve_ms\":" << dump->solve_ms << ",\n";
+    out << "  \"worst_c\":" << dump->worst_c << ",\n";
+    out << "  \"worst_tag\":\"" << dump->worst_tag << "\",\n";
+    out << "  \"worst_violation\":" << dump->worst_violation << ",\n";
+    out << "  \"prog\":" << dump->prog << ",\n";
+    out << "  \"path_remain_m\":" << dump->path_remain_m << ",\n";
+    out << "  \"pitch_deg\":" << dump->pitch_deg << ",\n";
+    out << "  \"ee_err_m\":" << dump->ee_err_m << ",\n";
+    out << "  \"n_horizon\":" << dump->n_horizon << ",\n";
+    out << "  \"nx\":" << dump->nx << ",\n";
+    out << "  \"nc\":" << dump->nc << ",\n";
+    out << "  \"n_triplets\":" << dump->n_triplets << ",\n";
+    out << "  \"waist_locked\":" << (dump->waist_locked ? "true" : "false") << ",\n";
+    out << "  \"ori_on\":" << (dump->ori_on ? "true" : "false") << ",\n";
+    out << "  \"pitch_mono_enable\":" << (dump->pitch_mono_enable ? "true" : "false")
+        << ",\n";
+    out << "  \"direction_strict\":" << (dump->direction_strict ? "true" : "false")
+        << ",\n";
+    out << "  \"candidate\":\"" << dump->candidate << "\",\n";
+    out << "  \"frame\":\"" << dump->frame << "\",\n";
+    out << "  \"torso_pitch_max\":" << dump->torso_pitch_max << ",\n";
+    out << "  \"q_limit_margin\":" << dump->q_limit_margin << ",\n";
+    out << "  \"com_box\":[" << dump->com_xmin << "," << dump->com_xmax << ","
+        << dump->com_ymin << "," << dump->com_ymax << "],\n";
+    out << "  \"com_margin\":" << dump->com_margin << ",\n";
+    out << "  \"direction_sign\":[" << dump->direction_sign[0] << ","
+        << dump->direction_sign[1] << "," << dump->direction_sign[2] << ","
+        << dump->direction_sign[3] << "],\n";
+    out << "  \"from\":[" << csv18(dump->from) << "],\n";
+    out << "  \"cap\":[" << csv18(dump->cap) << "],\n";
+    out << "  \"target\":[" << dump->target[0] << "," << dump->target[1] << ","
+        << dump->target[2] << "],\n";
+    out << "  \"quat_xyzw\":[" << dump->quat[0] << "," << dump->quat[1] << ","
+        << dump->quat[2] << "," << dump->quat[3] << "],\n";
+    out << "  \"progress\":[";
+    for (int k = 0; k < dump->n_horizon; ++k) {
+      if (k) out << ",";
+      out << dump->progress[k];
+    }
+    out << "],\n  \"nominal\":[";
+    for (int k = 0; k < dump->n_horizon; ++k) {
+      if (k) out << ",";
+      out << "[";
+      for (int j = 0; j < 18; ++j) {
+        if (j) out << ",";
+        out << dump->nominal[k][j];
+      }
+      out << "]";
+    }
+    out << "],\n  \"g\":[";
+    for (int i = 0; i < dump->nx; ++i) {
+      if (i) out << ",";
+      out << dump->g[i];
+    }
+    out << "],\n  \"lo\":[";
+    for (int i = 0; i < dump->nc; ++i) {
+      if (i) out << ",";
+      out << dump->lo[i];
+    }
+    out << "],\n  \"hi\":[";
+    for (int i = 0; i < dump->nc; ++i) {
+      if (i) out << ",";
+      out << dump->hi[i];
+    }
+    out << "],\n  \"tags\":[";
+    for (int i = 0; i < dump->nc; ++i) {
+      if (i) out << ",";
+      out << "\"" << dump->tags[i] << "\"";
+    }
+    out << "],\n  \"C_triplets\":[";
+    for (int i = 0; i < dump->n_triplets; ++i) {
+      if (i) out << ",";
+      out << "[" << dump->trip_r[i] << "," << dump->trip_c[i] << ","
+          << dump->trip_v[i] << "]";
+    }
+    out << "]\n}\n";
+    out.close();
+    RCLCPP_ERROR(get_logger(),
+                 "qp fail dump written path=%s worst_c=%d worst_tag=%s nc=%d "
+                 "truncated=%d",
+                 path.c_str(), dump->worst_c,
+                 dump->worst_tag[0] ? dump->worst_tag : "-", dump->nc,
+                 dump->truncated ? 1 : 0);
+  }
+
   void drain_layer_diag() {
     if (!layer_diag_out_.is_open()) {
       return;
@@ -1762,6 +1912,9 @@ class KmpcNode : public rclcpp::Node {
         "ros_param", "nonempty", true);
     add("layer_diag_path", layer_diag_path_, "path",
         layer_diag_path_.empty() ? "node_default" : "ros_override", "empty_or_writable",
+        true);
+    add("qp_fail_dump_dir", qp_fail_dump_dir_, "path",
+        qp_fail_dump_dir_.empty() ? "disabled" : "ros_or_default", "empty_or_writable",
         true);
     add("config_snapshot_path", config_snapshot_path_, "path",
         config_snapshot_path_.empty() ? "node_default" : "ros_override", "empty_or_writable",
@@ -1959,11 +2112,13 @@ class KmpcNode : public rclcpp::Node {
         RCLCPP_ERROR(
             get_logger(),
             "line stopped generation=%llu reason=%s status=%s(%d) iter=%d "
-            "pri_res=%.3e dua_res=%.3e solve_ms=%.3f worst_c=%d worst_viol=%.3e "
-            "path_remain_m=%.4f prog=%.4f pitch_deg=%.3f ee_err_m=%.4f",
+            "pri_res=%.3e dua_res=%.3e solve_ms=%.3f worst_c=%d worst_tag=%s "
+            "worst_viol=%.3e path_remain_m=%.4f prog=%.4f pitch_deg=%.3f "
+            "ee_err_m=%.4f",
             static_cast<unsigned long long>(tracker_->goal_generation()),
             tracker_->line_reason().c_str(), fail.status_name, fail.status,
             fail.iter, fail.pri_res, fail.dua_res, fail.solve_ms, fail.worst_c,
+            fail.worst_tag[0] ? fail.worst_tag : "-",
             fail.worst_violation, fail.path_remain_m, fail.prog, fail.pitch_deg,
             fail.ee_err_m);
       } else {
@@ -1971,6 +2126,8 @@ class KmpcNode : public rclcpp::Node {
             static_cast<unsigned long long>(tracker_->goal_generation()),
             tracker_->line_reason().c_str());
       }
+      // Off the 50/250 Hz hot path: drain a pre-filled QP input dump to disk.
+      drain_qp_fail_dump();
     }
     publish_arrived(arbiter_->enabled() && last_use_cart_ && arrived);
     const kmpc::Vec3 com = last_use_cart_ ? tracker_->last_com()
@@ -2154,6 +2311,8 @@ class KmpcNode : public rclcpp::Node {
           " qp_fail_dua_res=" + std::to_string(fail.dua_res) +
           " qp_fail_solve_ms=" + std::to_string(fail.solve_ms) +
           " qp_fail_worst_c=" + std::to_string(fail.worst_c) +
+          " qp_fail_worst_tag=" +
+          std::string(fail.worst_tag[0] ? fail.worst_tag : "-") +
           " qp_fail_worst_viol=" + std::to_string(fail.worst_violation) +
           " qp_fail_path_remain_m=" + std::to_string(fail.path_remain_m) +
           " qp_fail_pitch_deg=" + std::to_string(fail.pitch_deg) +
@@ -2267,6 +2426,7 @@ class KmpcNode : public rclcpp::Node {
   uint64_t sdk_note_drops_ = 0;
   uint64_t exported_sdk_drops_ = 0;
   std::string layer_diag_path_;
+  std::string qp_fail_dump_dir_;
   std::string config_snapshot_path_;
   std::ofstream layer_diag_out_;
   std::deque<kmpc::ros2io::LayerDiagSample> sdk_notes_;

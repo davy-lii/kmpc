@@ -194,6 +194,7 @@ void CartesianTracker::line_clear() {
   line_tail_enter_2cm_s_ = -1.0;
   line_tail_hold_s_ = -1.0;
   last_line_qp_fail_ = LineQpFailSnapshot{};
+  last_line_qp_fail_dump_ = LineQpFailDump{};
 }
 
 void CartesianTracker::clear_last_line_cache() {
@@ -356,6 +357,9 @@ bool CartesianTracker::line_target_far(const Vec3& target, const Vec4* quat) con
 }
 
 Vec18 CartesianTracker::line_at(double prog) const {
+  // Piecewise-linear on joint knots. C1 Hermite remains available
+  // (hermite_joint_at) but is not the live path until layer_diag proves the
+  // kink layer and Hermite stays inside tube/limit/direction offline.
   const int n = static_cast<int>(line_.samples.size());
   if (n <= 0) {
     return Vec18::Zero();
@@ -608,10 +612,29 @@ bool CartesianTracker::line_fit(
     return worst;
   };
   auto keep_com = [&](Aligned<Red>& ys) {
+    // Prefer a scaled waist step over an immediate full restore to the previous
+    // sample. Blind restore creates local waist plateaus that look like "waist
+    // never moves" even when free_fit was selected.
     for (int i = 1; i <= n; ++i) {
-      const Vec18 q = expand(ys[static_cast<std::size_t>(i)]);
-      if (!guards_.com_xy_inside(kin_.com(q))) {
-        ys[static_cast<std::size_t>(i)].head<kNWaist>()=ys[static_cast<std::size_t>(i-1)].head<kNWaist>();
+      Red& yi = ys[static_cast<std::size_t>(i)];
+      const Red y_prev = ys[static_cast<std::size_t>(i - 1)];
+      if (guards_.com_xy_inside(kin_.com(expand(yi)))) {
+        continue;
+      }
+      bool fixed = false;
+      for (double a : {0.75, 0.5, 0.25}) {
+        Red trial = yi;
+        trial.head<kNWaist>() =
+            y_prev.head<kNWaist>() +
+            a * (yi.head<kNWaist>() - y_prev.head<kNWaist>());
+        if (guards_.com_xy_inside(kin_.com(expand(trial)))) {
+          yi.head<kNWaist>() = trial.head<kNWaist>();
+          fixed = true;
+          break;
+        }
+      }
+      if (!fixed) {
+        yi.head<kNWaist>() = y_prev.head<kNWaist>();
       }
     }
   };
@@ -1089,6 +1112,7 @@ bool CartesianTracker::line_validate(
   // enforce hard limits everywhere, and forbid soft excess from growing past
   // the start sample — retreat that moves away from the wall stays legal.
   const Vec18& q_start = samples.front();
+  const double start_pitch_abs = std::abs(q_start.head<3>().sum());
   Vec18 start_soft_lo_ex = Vec18::Zero();
   Vec18 start_soft_hi_ex = Vec18::Zero();
   for (int k = 0; k < 18; ++k) {
@@ -1115,11 +1139,26 @@ bool CartesianTracker::line_validate(
     return true;
   };
   for (int i = 0; i < n; ++i) {
-    // Match joint-linear streaming, including all four 250 Hz interior ticks.
+    // Match joint-linear streaming / line_at, including 250 Hz interior ticks.
     for (int j = 0; j <= 5; ++j) {
       const double a = j / 5.0;
       const Vec18 q = (1-a)*samples[i] + a*samples[i+1];
       if (!joints_ok(q) || !guards_.com_xy_inside(kin_.com(q))) return false;
+      // Pitch is part of the public validate contract. Forbid excess growth past
+      // the path start (recovery envelope). Absolute ceiling for ordinary
+      // start-inside uses hard + shared admit as IK/float residue only — the
+      // 250 Hz filtered gate stays hard+round; QP projects into that hard box.
+      if (torso_pitch_max_ > 0.0) {
+        const double start_ex =
+            std::max(0.0, start_pitch_abs - torso_pitch_max_);
+        const double ex =
+            std::max(0.0, std::abs(q.head<3>().sum()) - torso_pitch_max_);
+        const double allow =
+            std::max(start_ex, kStartPitchAdmitRad) + kPitchRoundEpsRad;
+        if (ex > allow) {
+          return false;
+        }
+      }
       const double t = (i+a)/n;
       const auto pose = kin_.fk(q, frame);
       if ((pose.col(3).head<3>() - ((1-t)*start+t*target)).norm() > kLineSampleTolM) return false;
@@ -1154,7 +1193,14 @@ CartesianTracker::LineStreamCheck CartesianTracker::line_stream_segment_check(
   const Vec3 start=kin_.fk_pos(line_.samples.front(),line_.frame);
   const Vec3 ab=line_.target-start;
   double previous=(kin_.fk_pos(from,line_.frame)-start).dot(ab);
-  const double pitch_bound=std::max(torso_pitch_max_,std::abs(line_.samples.front().head<3>().sum()));
+  // Same legal pitch domain as line_validate / stream_filtered_fault:
+  // ordinary start-inside → hard + round eps only (never +kStartPitchAdmitRad);
+  // recovery start-outside → |start| envelope, no growth. QP must project into
+  // this domain; gates do not permanently widen the box for float crumbs.
+  const double start_abs=std::abs(line_.samples.front().head<3>().sum());
+  const double pitch_bound=torso_pitch_max_>0
+      ? pitch_abs_bound(torso_pitch_max_,start_abs,/*for_gate=*/true)
+      : inf;
   for(int i=1;i<=5;++i) {
     const Vec18 q=from+(i/5.0)*(to-from);
     const double joint_margin = std::min(
@@ -1533,10 +1579,17 @@ bool CartesianTracker::line_build(
     reverse_decision="skipped_no_match";
   }
 
-  if(!ok) {
-    std::vector<Vec18,Eigen::aligned_allocator<Vec18>> arm_samples;
-    if(line_arm_only(q0,arm,target,quat,ori_on,frame,arm_samples)) {
-      samples=std::move(arm_samples);
+  // arm_only is a seed, not an unconditional winner vs free_fit. reverse_cache /
+  // qa_seed / successor_plan stay exclusive when accepted: offline retreat
+  // fixtures regress when free_fit displaces them without task-chain proof.
+  // Keep one scorer for arm_only↔free_fit only; do not stack a second.
+  std::vector<Vec18,Eigen::aligned_allocator<Vec18>> arm_samples;
+  bool arm_seed_ok=false;
+  if(!ok || (candidate!="reverse_cache" && candidate!="qa_seed" &&
+             candidate!="successor_plan")) {
+    arm_seed_ok=line_arm_only(q0,arm,target,quat,ori_on,frame,arm_samples);
+    if(!ok && arm_seed_ok) {
+      samples=arm_samples;
       ok=true;
     }
   }
@@ -1545,47 +1598,92 @@ bool CartesianTracker::line_build(
   if(candidate!="reverse_cache" && candidate!="qa_seed" && candidate!="successor_plan") {
     DirectionContract trial_c;
     DirectionCheckResult trial_dir;
-    const double arm_fold=ok?max_arm_fold(samples,arm):0.0;
-    const bool locked_pass=!recovering_pitch && ok && arm_fold<fold_ok && probe(samples) &&
-                           accept_direction(samples,&trial_c,&trial_dir);
-    if (locked_pass) {
-      candidate="arm_only";
-      accepted_contract=trial_c; accepted_dir=trial_dir; have_accepted_dir=true;
-    } else {
-      if(ok && line_direction_strict_enable_ && arm_fold<fold_ok && probe(samples) &&
-         !accept_direction(samples,&trial_c,&trial_dir)) {
-        line_.reason=std::string("candidate_direction_violation;")+trial_dir.reason;
-      }
-      std::vector<Vec18,Eigen::aligned_allocator<Vec18>> free_samples;
-      bool free_locked=false;
-      const Vec18* recovery_seed=(recovering_pitch && ok && !samples.empty()) ? &samples.back() : nullptr;
-      const bool free_ok=!upper_.waist_locked && line_fit(q0,arm,target,quat,ori_on,false,
-          frame,free_samples,free_locked,!line_tip_.has_value() && !recovering_pitch,recovery_seed);
-      DirectionContract free_c;
-      DirectionCheckResult free_dir;
-      const bool free_pitch_ok=!recovering_pitch ||
-          (!free_locked && !free_samples.empty() &&
-           std::abs(free_samples.back().head<3>().sum())<=torso_pitch_max_+1e-7);
-      // Repair may change the waist endpoint — probe after direction acceptance.
-      bool free_dir_ok=false;
-      if(free_ok && free_pitch_ok && accept_direction(free_samples,&free_c,&free_dir)) {
-        free_dir_ok=probe(free_samples);
-        if(!free_dir_ok && line_tip_) {
-          line_.reason="cascade_unreachable";
+    auto path_cost=[&](const std::vector<Vec18,Eigen::aligned_allocator<Vec18>>& path){
+      if(path.empty()) return 1e9;
+      double arm_tv=0.0, waist_tv=0.0, wrist_tv=0.0, smooth=0.0;
+      for(std::size_t i=1;i<path.size();++i){
+        arm_tv+=(path[i]-path[i-1]).segment(arm,kNArm).cwiseAbs().sum();
+        waist_tv+=(path[i]-path[i-1]).head<kNWaist>().cwiseAbs().sum();
+        wrist_tv+=(path[i]-path[i-1]).segment(arm+5,2).cwiseAbs().sum();
+        if(i+1<path.size()){
+          const Vec18 d2=path[i+1]-2.0*path[i]+path[i-1];
+          smooth+=d2.segment(arm,kNArm).cwiseAbs().sum()+
+                  0.5*d2.head<kNWaist>().cwiseAbs().sum();
         }
-      } else if(free_ok && free_pitch_ok && line_direction_strict_enable_ && !free_dir.ok) {
-        line_.reason=std::string("candidate_direction_violation;")+free_dir.reason;
       }
-      if (free_dir_ok) {
+      const double elbow=std::abs(path.back()[arm+3]-line_q_pref_[arm+3]);
+      const double pitch_abs=std::abs(path.back().head<3>().sum());
+      return arm_tv + 1.5*elbow + 0.8*wrist_tv + 0.2*waist_tv + 0.25*pitch_abs +
+             0.35*smooth;
+    };
+    const double arm_fold=arm_seed_ok?max_arm_fold(arm_samples,arm):(ok?max_arm_fold(samples,arm):0.0);
+    bool arm_pass=false;
+    if(!recovering_pitch && arm_seed_ok && arm_fold<fold_ok && probe(arm_samples) &&
+       accept_direction(arm_samples,&trial_c,&trial_dir)) {
+      arm_pass=true;
+    } else if(arm_seed_ok && line_direction_strict_enable_ && arm_fold<fold_ok &&
+              probe(arm_samples) && !accept_direction(arm_samples,&trial_c,&trial_dir)) {
+      line_.reason=std::string("candidate_direction_violation;")+trial_dir.reason;
+    }
+
+    std::vector<Vec18,Eigen::aligned_allocator<Vec18>> free_samples;
+    bool free_locked=false;
+    const Vec18* recovery_seed=(recovering_pitch && ok && !samples.empty()) ? &samples.back() : nullptr;
+    const uint64_t straighten_hits_before=line_pitch_straighten_hits_;
+    const bool free_ok=!upper_.waist_locked && line_fit(q0,arm,target,quat,ori_on,false,
+        frame,free_samples,free_locked,!line_tip_.has_value() && !recovering_pitch,recovery_seed);
+    DirectionContract free_c;
+    DirectionCheckResult free_dir;
+    const bool free_pitch_ok=!recovering_pitch ||
+        (!free_locked && !free_samples.empty() &&
+         std::abs(free_samples.back().head<3>().sum())<=torso_pitch_max_+1e-7);
+    bool free_dir_ok=false;
+    if(free_ok && free_pitch_ok && accept_direction(free_samples,&free_c,&free_dir)) {
+      free_dir_ok=probe(free_samples);
+      if(!free_dir_ok && line_tip_) {
+        line_.reason="cascade_unreachable";
+      }
+    } else if(free_ok && free_pitch_ok && line_direction_strict_enable_ && !free_dir.ok) {
+      line_.reason=std::string("candidate_direction_violation;")+free_dir.reason;
+    }
+
+    if(arm_pass && free_dir_ok) {
+      const double elbow_arm=std::abs(arm_samples.back()[arm+3]-line_q_pref_[arm+3]);
+      const double elbow_free=std::abs(free_samples.back()[arm+3]-line_q_pref_[arm+3]);
+      const double c_arm=path_cost(arm_samples);
+      const double c_free=path_cost(free_samples);
+      const double pitch_arm=std::abs(arm_samples.back().head<3>().sum());
+      const double pitch_free=std::abs(free_samples.back().head<3>().sum());
+      const bool elbow_worth=
+          (elbow_arm-elbow_free)>=line_pose_pref_min_improve_;
+      const bool pitch_ok=pitch_free<=pitch_arm+2.0*kPi/180.0;
+      if(elbow_worth && pitch_ok && c_free+1e-9<c_arm) {
         straighten_axis_reverted=line_fit_straighten_axis_reverted_;
         samples=std::move(free_samples); locked=free_locked; ok=true;
         forced=line_tip_.has_value();
         candidate="free_fit";
         accepted_contract=free_c; accepted_dir=free_dir; have_accepted_dir=true;
       } else {
-        ok=false;
-        if (line_tip_ && line_.reason.empty()) line_.reason="cascade_unreachable";
+        line_pitch_straighten_hits_=straighten_hits_before;
+        samples=std::move(arm_samples); locked=true; ok=true;
+        candidate="arm_only";
+        accepted_contract=trial_c; accepted_dir=trial_dir; have_accepted_dir=true;
       }
+    } else if(arm_pass) {
+      line_pitch_straighten_hits_=straighten_hits_before;
+      samples=std::move(arm_samples); locked=true; ok=true;
+      candidate="arm_only";
+      accepted_contract=trial_c; accepted_dir=trial_dir; have_accepted_dir=true;
+    } else if(free_dir_ok) {
+      straighten_axis_reverted=line_fit_straighten_axis_reverted_;
+      samples=std::move(free_samples); locked=free_locked; ok=true;
+      forced=line_tip_.has_value();
+      candidate="free_fit";
+      accepted_contract=free_c; accepted_dir=free_dir; have_accepted_dir=true;
+    } else {
+      line_pitch_straighten_hits_=straighten_hits_before;
+      ok=false;
+      if (line_tip_ && line_.reason.empty()) line_.reason="cascade_unreachable";
     }
   }
   // A bounded second seed is derived from the real next pose: solve the tip,

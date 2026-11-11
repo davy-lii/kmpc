@@ -138,6 +138,94 @@ TEST(LinePath, PitchBoxAndAdmitAreShared) {
       cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
   EXPECT_DOUBLE_EQ(cfg_all.params.torso_pitch_max_deg, 32.0);
   EXPECT_DOUBLE_EQ(kmpc::kStartPitchAdmitRad, 0.005);
+  const double hard = 32.0 * kmpc::kPi / 180.0;
+  // Ordinary start-inside: gate = hard + round only (never +admit).
+  EXPECT_DOUBLE_EQ(kmpc::pitch_abs_bound(hard, hard - 0.01, true),
+                   hard + kmpc::kPitchRoundEpsRad);
+  EXPECT_DOUBLE_EQ(kmpc::pitch_abs_bound(hard, hard - 0.01, false), hard);
+  // Recovery start-outside: envelope is |start|, no permanent admit widen.
+  EXPECT_DOUBLE_EQ(kmpc::pitch_abs_bound(hard, hard + 0.002, true),
+                   hard + 0.002 + kmpc::kPitchRoundEpsRad);
+  EXPECT_FALSE(kmpc::pitch_abs_ok(hard + kmpc::kStartPitchAdmitRad, hard,
+                                  hard - 0.01, false));
+}
+
+// Unified pitch domain: ordinary stream gate matches filtered hard+round.
+// Field float crumbs must be projected by QP — gates do not widen by admit.
+TEST(LinePath, StreamPitchGateMatchesHardRoundDomain) {
+  const auto cfg_all = kmpc::Config::load(
+      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+  kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
+  const double limit = cfg_all.params.torso_pitch_max_deg * kmpc::kPi / 180.0;
+  ASSERT_GT(limit, 0.0);
+
+  auto set_pitch = [](kmpc::Vec18 q, double want) {
+    q[0] += want - (q[0] + q[1] + q[2]);
+    return q;
+  };
+
+  const double home_raw[18] = {
+      0.69813170, -0.87264718, -0.17453293, -0.02630211,
+      -0.00171042, 0.51532590, -0.13651965, -2.12657900,
+      -1.27522486, -0.24291493, 0.01394518,
+      -0.00171042, 0.51532590, 0.13651965, -2.12657900,
+      1.27522486, -0.24291493, 0.01394518};
+  kmpc::Vec18 q;
+  for (int i = 0; i < 18; ++i) q[i] = home_raw[i];
+  ASSERT_LT(std::abs(pitch_sum(q)), limit - 0.05);
+
+  kmpc::CartesianTracker tracker(kin, cfg_all);
+  tracker.set_line_pace(0.6, 0.0);
+  tracker.set_line_direction_strict_enable(false);
+  tracker.set_line_pitch_straighten_enable(false);
+  const kmpc::Vec3 p0 = kin.fk_pos(q, kmpc::kEeFrameLeft);
+  const auto posed = kin.fk(q, kmpc::kEeFrameLeft);
+  const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
+  const kmpc::Vec3 goal = p0 + kmpc::Vec3(0.05, 0.0, 0.0);
+  ASSERT_TRUE(tracker.rearm_line(1));
+  tracker.compute(q, cfg_all.q_pref, &goal, nullptr, &quat, nullptr);
+  ASSERT_TRUE(tracker.line_active()) << tracker.line_reason();
+  ASSERT_GE(tracker.line_sample_count(), 2u);
+
+  // Domain helper: ordinary crumb past hard is illegal for planning/gates.
+  const double field_over = 3.9e-5;
+  EXPECT_FALSE(kmpc::pitch_abs_ok(limit + field_over, limit, limit - 0.05,
+                                  /*for_gate=*/true));
+  EXPECT_TRUE(kmpc::pitch_abs_ok(limit + 0.5 * kmpc::kPitchRoundEpsRad, limit,
+                                 limit - 0.05, /*for_gate=*/true));
+
+  // Stream segment: both ends past hard so pitch trips before tube.
+  kmpc::Vec18 far = set_pitch(q, -limit - kmpc::kStartPitchAdmitRad - 1e-3);
+  const auto bad = tracker.line_stream_segment_check(far, far);
+  EXPECT_FALSE(bad.ok);
+  EXPECT_STREQ(bad.reason, "pitch");
+}
+
+TEST(LinePath, HermiteLineAtIsC1AtInteriorKnots) {
+  std::vector<kmpc::Vec18, Eigen::aligned_allocator<kmpc::Vec18>> samples(4);
+  for (int i = 0; i < 4; ++i) {
+    samples[static_cast<std::size_t>(i)].setZero();
+    samples[static_cast<std::size_t>(i)][0] = 0.01 * i * i;  // quadratic pitch axis
+    samples[static_cast<std::size_t>(i)][4] = 0.02 * i;
+  }
+  // Value continuity at knot 1 and 2.
+  for (double knot : {1.0, 2.0}) {
+    const kmpc::Vec18 a = kmpc::hermite_joint_at(samples, knot - 1e-9);
+    const kmpc::Vec18 b = kmpc::hermite_joint_at(samples, knot + 1e-9);
+    EXPECT_NEAR((a - b).norm(), 0.0, 1e-9);
+  }
+  // Tangent continuity: left/right finite differences match at interior knots.
+  auto slope = [&](double p) {
+    const double h = 1e-6;
+    return (kmpc::hermite_joint_at(samples, p + h) -
+            kmpc::hermite_joint_at(samples, p - h)) /
+           (2.0 * h);
+  };
+  for (double knot : {1.0, 2.0}) {
+    const kmpc::Vec18 sl = slope(knot - 2e-5);
+    const kmpc::Vec18 sr = slope(knot + 2e-5);
+    EXPECT_NEAR((sl - sr).norm(), 0.0, 5e-4) << "knot=" << knot;
+  }
 }
 
 TEST(LinePath, SlerpTakesShortArc) {

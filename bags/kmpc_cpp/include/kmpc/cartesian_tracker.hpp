@@ -186,8 +186,81 @@ class CartesianTracker {
     double pitch_deg = 0.0;
     double ee_err_m = 0.0;
     char reason[64]{};
+    // Tag of worst_c when a full input dump was captured; empty if unknown.
+    char worst_tag[32]{};
   };
   const LineQpFailSnapshot& last_line_qp_fail() const { return last_line_qp_fail_; }
+
+  // Bounded QP input capture for offline infeasibility analysis. Filled on the
+  // RT path without fopen; the node drains pending dumps off the control loop.
+  // Caps are hard — overflow truncates triplets / rows and sets truncated=true.
+  // worst_c alone never proves a unique conflicting constraint.
+  struct LineQpFailDump {
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    static constexpr int kMaxStages = 30;
+    static constexpr int kStageDof = kNWaist + kNArm;
+    static constexpr int kMaxNx = kMaxStages * kStageDof;
+    static constexpr int kMaxNc = 2048;
+    static constexpr int kMaxTriplets = 32768;
+    static constexpr int kTagLen = 28;
+
+    bool valid = false;
+    bool pending_write = false;
+    bool truncated = false;
+    uint64_t mono_ns = 0;
+    uint64_t goal_generation = 0;
+    int line_gen = 0;
+    int n_horizon = 0;
+    int nx = 0;
+    int nc = 0;
+    int n_triplets = 0;
+    int status = -1;
+    int iter = -1;
+    int worst_c = -1;
+    double worst_violation = 0.0;
+    double pri_res = 0.0;
+    double dua_res = 0.0;
+    double solve_ms = 0.0;
+    double prog = 0.0;
+    double path_remain_m = 0.0;
+    double pitch_deg = 0.0;
+    double ee_err_m = 0.0;
+    double torso_pitch_max = 0.0;
+    double q_limit_margin = 0.0;
+    double com_xmin = 0.0;
+    double com_xmax = 0.0;
+    double com_ymin = 0.0;
+    double com_ymax = 0.0;
+    double com_margin = 0.0;
+    int direction_sign[4]{};
+    bool waist_locked = false;
+    bool ori_on = false;
+    bool pitch_mono_enable = false;
+    bool direction_strict = false;
+    char status_name[24]{};
+    char reason[64]{};
+    char candidate[32]{};
+    char frame[32]{};
+    char worst_tag[kTagLen]{};
+    Vec18 from = Vec18::Zero();
+    Vec18 cap = Vec18::Zero();
+    Vec3 target = Vec3::Zero();
+    Vec4 quat = Vec4(0, 0, 0, 1);
+    double progress[kMaxStages]{};
+    double nominal[kMaxStages][18]{};
+    double g[kMaxNx]{};
+    double lo[kMaxNc]{};
+    double hi[kMaxNc]{};
+    char tags[kMaxNc][kTagLen]{};
+    int trip_r[kMaxTriplets]{};
+    int trip_c[kMaxTriplets]{};
+    double trip_v[kMaxTriplets]{};
+  };
+  const LineQpFailDump& last_line_qp_fail_dump() const {
+    return last_line_qp_fail_dump_;
+  }
+  // Returns a copy of a pending dump and clears pending_write (keeps valid).
+  bool take_line_qp_fail_dump(LineQpFailDump* out);
   // Explicit segment boundary. Target updates alone never clear a refusal.
   bool rearm_line(uint64_t generation, const std::optional<LineTarget>& tip = std::nullopt);
   void set_line_reference(const Vec18& q) { line_reference_ = q; }
@@ -549,6 +622,7 @@ class CartesianTracker {
   double line_tail_enter_2cm_s_ = -1.0;
   double line_tail_hold_s_ = -1.0;
   LineQpFailSnapshot last_line_qp_fail_{};
+  LineQpFailDump last_line_qp_fail_dump_{};
   bool line_pose_pref_enable_ = false;
   Vec18 line_q_pref_ = Vec18::Zero();
   // Soft posture pull and acceptance budgets (radians unless noted).
