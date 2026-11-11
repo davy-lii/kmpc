@@ -323,11 +323,42 @@ void print_report(const std::vector<SegReport>& rows) {
 }  // namespace
 
 TEST(MockEyeCycle, WaistPitchNoFoldOnGraspPlaceCycle) {
-  // mock_eye_state.py:41-44 (mm, tool quat xyzw)
+  // mock_eye_state.py 525 vision (mm, tool quat xyzw). Tips/preps apply the same
+  // arm_controller_params.yaml offsets as test_grasp_place_targets_624_525 —
+  // do not treat raw vision XYZ as flange tip.
   const PoseMm LEFT_GRASP{553.430, 284.979, 400.0, 0.0, 0.0, 0.028923, 0.999582};
   const PoseMm LEFT_PLACE{525.839, 323.452, 400.0, 0.0, 0.0, -0.018784, 0.999824};
   const PoseMm RIGHT_GRASP{558.428, -286.318, 400.0, 0.0, 0.0, 0.003054, 0.999995};
   const PoseMm RIGHT_PLACE{525.839, -323.452, 400.0, 0.0, 0.0, -0.019123, 0.999817};
+
+  auto yaw_of = [](const PoseMm& p) {
+    const double siny_cosp = 2.0 * (p.qw * p.qz + p.qx * p.qy);
+    const double cosy_cosp = 1.0 - 2.0 * (p.qy * p.qy + p.qz * p.qz);
+    return std::atan2(siny_cosp, cosy_cosp);
+  };
+  auto tip_prep_m = [&](const PoseMm& eye, bool left, bool grasp, kmpc::Vec3* tip,
+                        kmpc::Vec3* prep) {
+    if (grasp) {
+      const double ox = left ? -38.0 : -60.0;
+      const double oy = left ? -10.0 : 0.0;
+      const double oz = left ? 65.0 : 60.0;
+      const double yaw = yaw_of(eye);
+      const double c = std::cos(yaw);
+      const double s = std::sin(yaw);
+      tip->x() = (eye.x + c * ox - s * oy) * 1e-3;
+      tip->y() = (eye.y + s * ox + c * oy) * 1e-3;
+      tip->z() = (eye.z + oz) * 1e-3;
+      *prep = *tip + kmpc::Vec3(0.0, 0.0, 0.150);
+    } else {
+      const double ox = -40.0;
+      const double oy = left ? 20.0 : -68.0;
+      const double oz = 90.0;
+      tip->x() = (eye.x + ox) * 1e-3;
+      tip->y() = (eye.y + oy) * 1e-3;
+      tip->z() = (eye.z + oz) * 1e-3;
+      *prep = *tip + kmpc::Vec3(-0.240, 0.0, 0.0);
+    }
+  };
 
   // q0 from evidence 20261110T051249Z servo @ t≈28.34 (field r21 start squat)
   const double waist4[] = {40.0060, -49.9995, -10.0003, -1.4969};
@@ -344,21 +375,17 @@ TEST(MockEyeCycle, WaistPitchNoFoldOnGraspPlaceCycle) {
   tracker.set_line_pace(0.3, 0.8);
   tracker.set_line_direction_strict_enable(true);
 
-  std::cout << "version_note=local_86fe46b_plus_uncommitted_direction_strict "
-               "(field_package_was_r21; r22_not_released)\n";
-  std::cout << "urdf_note=Chassis_Z_Joint4.z=0.1805 (local uncommitted; r21 was 0.1408)\n";
+  std::cout << "version_note=8842e7e_plus_mock_eye_business_offsets\n";
+  std::cout << "urdf_note=Chassis_Z_Joint4.z=0.1805\n";
 
   uint64_t gen = 1;
   std::vector<SegReport> rows;
   auto run_arm = [&](bool left, const PoseMm& grasp, const PoseMm& place) {
-    const kmpc::Vec3 g = xyz_m(grasp);
+    kmpc::Vec3 g, g_prep, p, p_prep;
+    tip_prep_m(grasp, left, true, &g, &g_prep);
+    tip_prep_m(place, left, false, &p, &p_prep);
     const kmpc::Vec4 gq = flange_quat(grasp);
-    const kmpc::Vec3 p = xyz_m(place);
     const kmpc::Vec4 pq = flange_quat(place);
-    // Vertical grasp: prep 150mm above tip (field protocol).
-    const kmpc::Vec3 g_prep = g + kmpc::Vec3(0.0, 0.0, 0.150);
-    // Horizontal place: prep 240mm back in x (field protocol).
-    const kmpc::Vec3 p_prep = p + kmpc::Vec3(-0.240, 0.0, 0.0);
 
     const char* tag = left ? "L" : "R";
     rows.push_back(play_segment(tracker, &q, cfg_all.q_pref, gen++, left, g_prep, gq, &g,
@@ -390,12 +417,11 @@ TEST(MockEyeCycle, WaistPitchNoFoldOnGraspPlaceCycle) {
     right.set_line_direction_strict_enable(true);
     kmpc::Vec18 qr = q_from_deg(waist4, right7, left7);
     auto run_right = [&](bool left, const PoseMm& grasp, const PoseMm& place) {
-      const kmpc::Vec3 g = xyz_m(grasp);
+      kmpc::Vec3 g, g_prep, p, p_prep;
+      tip_prep_m(grasp, left, true, &g, &g_prep);
+      tip_prep_m(place, left, false, &p, &p_prep);
       const kmpc::Vec4 gq = flange_quat(grasp);
-      const kmpc::Vec3 p = xyz_m(place);
       const kmpc::Vec4 pq = flange_quat(place);
-      const kmpc::Vec3 g_prep = g + kmpc::Vec3(0.0, 0.0, 0.150);
-      const kmpc::Vec3 p_prep = p + kmpc::Vec3(-0.240, 0.0, 0.0);
       const char* tag = left ? "L" : "R";
       uint64_t ggen = 100;
       rows.push_back(play_segment(right, &qr, cfg_all.q_pref, ggen++, left, g_prep, gq, &g,
