@@ -197,3 +197,48 @@ TEST(LineContract, MonotonePathPasses) {
   const auto chk = kmpc::check_path_direction_strict(path);
   EXPECT_TRUE(chk.ok) << chk.reason;
 }
+
+// Solver internal slack must stay strictly inside the final-send frozen gate.
+TEST(LineContract, SolverSlackStrictlyInsideFinalGate) {
+  EXPECT_GT(kmpc::kDirectionSolverSlackRad, 0.0);
+  EXPECT_LT(kmpc::kDirectionSolverSlackRad, kmpc::kDirectionStrictFoldMaxRad);
+  // Historical QP pitch slack 2e-4 rad (~0.01146°) sat outside the 0.01° gate.
+  EXPECT_LT(kmpc::kDirectionSolverSlackRad, 2e-4);
+}
+
+// Frozen-pitch envelope: deviations inside fold_max pass; beyond fail.
+TEST(LineContract, FrozenPitchEnvelopeBoundaries) {
+  kmpc::DirectionContract c;
+  c.strict = true;
+  c.sign[0] = 0;
+  c.sign[1] = 0;
+  c.sign[2] = 0;
+  c.sign[3] = 0;
+  c.q_anchor = q_at(-0.20, -0.20, -0.15);
+  c.pitch_anchor = c.q_anchor.head<3>().sum();
+  c.fold_max_rad = kmpc::kDirectionStrictFoldMaxRad;
+
+  const double deg = kmpc::kPi / 180.0;
+  const double deltas_deg[] = {0.0, 0.009, 0.010, 0.011, 0.01146};
+  for (double d_deg : deltas_deg) {
+    kmpc::DirectionEnvelope env;
+    kmpc::direction_envelope_seed(&env, c, c.q_anchor);
+    kmpc::Vec18 q = c.q_anchor;
+    // Put the entire pitch delta on J1 so waist frozen axes also move — pitch
+    // gate is the one under test (sign[3]==0).
+    q[0] += d_deg * deg;
+    // Waist J1 is also frozen; for pitch-only check temporarily mark J1 free
+    // with zero step intent by matching extremum via non-frozen mask.
+    env.mask.waist_j1 = false;
+    env.mask.waist_j2 = false;
+    env.mask.waist_j3 = false;
+    const auto r = kmpc::direction_envelope_accept(&env, q);
+    const double band = c.fold_max_rad + c.numeric_eps_rad;
+    if (std::abs(d_deg * deg) <= band) {
+      EXPECT_TRUE(r.ok) << "delta_deg=" << d_deg << " reason=" << r.reason;
+    } else {
+      EXPECT_FALSE(r.ok) << "delta_deg=" << d_deg;
+      EXPECT_STREQ(r.reason, "final_send_pitch_frozen");
+    }
+  }
+}

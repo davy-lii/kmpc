@@ -24,6 +24,14 @@ inline constexpr double kDirectionQualityTargetDeg = 0.02;
 // Absolute fold hard gate under strict mode (waist axes + pitch sum).
 inline constexpr double kDirectionStrictFoldMaxRad =
     kDirectionReportDeadbandDeg * kPi / 180.0;
+// QP / internal projection band must stay strictly inside the final-send gate
+// so a solved step cannot pass the solver yet fail final_send_*_frozen.
+// Half of the hard gate leaves float/interp margin (~0.005°).
+inline constexpr double kDirectionSolverSlackRad =
+    0.5 * kDirectionStrictFoldMaxRad;
+// Near-zero net displacement: treat as frozen when |net| is at or below this.
+// Kept identical to numeric eps used when minting DirectionContract signs.
+inline constexpr double kDirectionZeroNetEpsRad = kDirectionNumericEpsRad;
 
 enum class DirectionAxisId : int {
   WaistJ1 = 0,

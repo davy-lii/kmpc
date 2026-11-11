@@ -163,66 +163,67 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
       const double soft=limit+allowed_ex;
       row(k,pitch,-soft-q.head<3>().sum(),soft-q.head<3>().sum());
     }
-    // The commanded pitch must follow the nominal path's direction. A nominal
-    // reversal is rejected at build time when straightening is enabled; do
-    // not silently drop this row merely because zero correction violates it.
-    // P0: independent of line_fit pitch straighten; first field对照 keeps this ON.
-    // While `from` is still outside, flat mono can lock the path outside the hard
-    // box (field A). After back in box, mono uses clamped endpoints so the flat
-    // band sits on ±limit instead of fighting it.
+    // Pitch-sum and waist axes share the accepted DirectionContract. Internal
+    // slack is kDirectionSolverSlackRad (strictly < final-send fold_max) so QP
+    // cannot mint a step that final_send_pitch_frozen must reject. Never re-judge
+    // sign from clamped path endpoints — that disagreed with the contract.
     if (line_qp_pitch_monotonic_enable_ && !pitch_recovering) {
-      // Constrain adjacent predicted pitch: pitch(qhat_k)-pitch(qhat_{k-1}).
-      // qhat = q_nom + T*delta, so for k>0 use previous=true on the pitch row.
-      // Old code only bounded pitch·delta_k vs nominal prev — opposite-signed
-      // adjacent deltas could still reverse the actual predicted sequence.
-      // Pitch-sum slack stays numeric-only; waist axes use kAxisSlack=0 below.
-      // Zeroing pitch slack made approach QP report qp_pitch_monotonic_infeasible.
-      constexpr double kPitchSlack = 2e-4;
+      const double kPitchSlack = kDirectionSolverSlackRad;
       const double p_prev=prev.head<3>().sum();
       const double p_q=q.head<3>().sum();
-      const double dp=p_q-p_prev;
-      const double p0m=
-          (limit>0)?std::clamp(pitch0,-limit,limit):pitch0;
-      const double pNm=
-          (limit>0)?std::clamp(pitchN,-limit,limit):pitchN;
-      const double netm=pNm-p0m;
+      const double p_from=from.head<3>().sum();
+      // Prefer the committed contract sign; fall back to raw path net only when
+      // the contract was not accepted (legacy / strict-off path).
+      int psgn = 0;
+      if (line_direction_strict_enable_ && line_.direction_check.ok) {
+        psgn = line_.direction_contract
+                   .sign[static_cast<int>(DirectionAxisId::PitchSum)];
+      } else {
+        psgn = direction_sign_from_net(pitchN - pitch0, kDirectionZeroNetEpsRad);
+      }
       double lo=-1e9, hi=1e9;
-      if(std::abs(netm)<=1e-4) {
-        lo=p0m-kPitchSlack-p_q;
-        hi=p0m+kPitchSlack-p_q;
-        if(lo<hi) {
-          row(k,pitch,lo,hi,false);
+      if (psgn == 0) {
+        // Frozen pitch: hold every stage to the live stream pitch (from), not a
+        // sliding nominal-prev band. Adjacent-only freeze can stack slack past
+        // the final-send envelope. Band stays inside kDirectionStrictFoldMaxRad.
+        lo = p_from - kPitchSlack - p_q;
+        hi = p_from + kPitchSlack - p_q;
+        if (lo <= hi) {
+          row(k, pitch, lo, hi, false);
           ++line_qp_pitch_monotonic_hits_;
         } else {
           return reject("qp_pitch_monotonic_infeasible");
         }
-      } else if(k==0) {
-        // Anchor stage 0 to the live stream `from`, not a fictitious delta_-1.
-        const double p_from=from.head<3>().sum();
-        const double dp0=p_q-p_from;
-        if(netm>0.0) {
-          lo=-dp0-kPitchSlack;
+      } else if (k == 0) {
+        const double dp0 = p_q - p_from;
+        if (psgn > 0) {
+          lo = -dp0 - kPitchSlack;
         } else {
-          hi=-dp0+kPitchSlack;
+          hi = -dp0 + kPitchSlack;
         }
-        lo=std::max(lo,std::min(p_from,pNm)-kPitchSlack-p_q);
-        hi=std::min(hi,std::max(p_from,pNm)+kPitchSlack-p_q);
-        if(lo<hi) {
-          row(k,pitch,lo,hi,false);
+        const double p_goal =
+            (limit > 0) ? std::clamp(pitchN, -limit, limit) : pitchN;
+        lo = std::max(lo, std::min(p_from, p_goal) - kPitchSlack - p_q);
+        hi = std::min(hi, std::max(p_from, p_goal) + kPitchSlack - p_q);
+        if (lo < hi) {
+          row(k, pitch, lo, hi, false);
           ++line_qp_pitch_monotonic_hits_;
         } else {
           return reject("qp_pitch_monotonic_infeasible");
         }
       } else {
-        if(netm>0.0) {
-          lo=-dp-kPitchSlack;
+        const double dp = p_q - p_prev;
+        if (psgn > 0) {
+          lo = -dp - kPitchSlack;
         } else {
-          hi=-dp+kPitchSlack;
+          hi = -dp + kPitchSlack;
         }
-        lo=std::max(lo,std::min(p_prev,pNm)-kPitchSlack-p_q);
-        hi=std::min(hi,std::max(p_prev,pNm)+kPitchSlack-p_q);
-        if(lo<hi) {
-          row(k,pitch,lo,hi,/*previous=*/true);
+        const double p_goal =
+            (limit > 0) ? std::clamp(pitchN, -limit, limit) : pitchN;
+        lo = std::max(lo, std::min(p_prev, p_goal) - kPitchSlack - p_q);
+        hi = std::min(hi, std::max(p_prev, p_goal) + kPitchSlack - p_q);
+        if (lo < hi) {
+          row(k, pitch, lo, hi, /*previous=*/true);
           ++line_qp_pitch_monotonic_hits_;
         } else {
           return reject("qp_pitch_monotonic_infeasible");
@@ -231,10 +232,7 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
     }
 
     // Strict waist-axis adjacent direction from the accepted line contract.
-    // Zero slack: any non-zero reverse on J1/J2/J3 is forbidden. The old
-    // 2e-4 rad (~0.0115°) per-tick allowance was saturated by QP and stacked
-    // across ticks (anchor=previous command), producing ~0.024° chord fold on
-    // mock_eye approach while samples stayed monotone.
+    // Zero slack on signed axes; frozen axes hold the live command chain.
     if (line_direction_strict_enable_ && line_.direction_check.ok && !pitch_recovering) {
       constexpr double kAxisSlack = 0.0;
       for(int a=0;a<3;++a) {
@@ -381,23 +379,52 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
             line_.direction_contract
                 .sign[static_cast<int>(DirectionAxisId::PitchSum)];
         const double p_from = from[0] + from[1] + from[2];
-        const double p_to = to[0] + to[1] + to[2];
-        if (psgn > 0 && p_to < p_from) {
-          double need = p_from - p_to;
-          for (int a = 0; a < 3 && need > 0.0; ++a) {
-            if (line_.direction_contract.sign[a] > 0) {
+        double p_to = to[0] + to[1] + to[2];
+        auto apply_pitch_need = [&](double need) {
+          // Prefer frozen waist axes (they can absorb pitch without breaking
+          // per-axis mono). Then only move a signed axis in its allowed dir.
+          for (int a = 0; a < 3 && std::abs(need) > 1e-15; ++a) {
+            if (line_.direction_contract.sign[a] == 0) {
               to[a] += need;
               need = 0.0;
             }
           }
-        } else if (psgn < 0 && p_to > p_from) {
-          double need = p_to - p_from;
-          for (int a = 0; a < 3 && need > 0.0; ++a) {
-            if (line_.direction_contract.sign[a] < 0) {
-              to[a] -= need;
+          for (int a = 0; a < 3 && std::abs(need) > 1e-15; ++a) {
+            const int s = line_.direction_contract.sign[a];
+            if (s == 0) {
+              continue;
+            }
+            if (need * static_cast<double>(s) > 0.0) {
+              to[a] += need;
               need = 0.0;
             }
           }
+        };
+        if (psgn == 0) {
+          apply_pitch_need(p_from - p_to);
+        } else if (psgn > 0 && p_to < p_from) {
+          apply_pitch_need(p_from - p_to);
+        } else if (psgn < 0 && p_to > p_from) {
+          apply_pitch_need(p_from - p_to);
+        }
+        // Re-clamp signed waist axes after pitch redistribution.
+        for (int a = 0; a < 3; ++a) {
+          const int sgn = line_.direction_contract.sign[a];
+          if (sgn > 0) {
+            to[a] = std::max(to[a], from[a]);
+          } else if (sgn < 0) {
+            to[a] = std::min(to[a], from[a]);
+          } else {
+            to[a] = from[a];
+          }
+        }
+        p_to = to[0] + to[1] + to[2];
+        if (psgn == 0 &&
+            std::abs(p_to - p_from) > kDirectionStrictFoldMaxRad +
+                                          kDirectionNumericEpsRad) {
+          // Projection could not restore frozen pitch inside the final gate —
+          // refuse rather than emit a step final_send must reject.
+          return reject("qp_pitch_frozen_projection");
         }
       }
     }

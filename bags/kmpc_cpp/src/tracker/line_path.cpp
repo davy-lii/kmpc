@@ -1350,6 +1350,31 @@ bool CartesianTracker::line_build(
     path=std::move(repaired);
     return true;
   };
+  // Alternate endpoint: freeze near-zero waist axes / pitch sum at the start
+  // so repair_direction can rebuild a monotone waist without keeping a tiny
+  // opposing net that still forces mid-path fold under free_fit's q_end.
+  auto freeze_near_zero_end=[&](std::vector<Vec18,Eigen::aligned_allocator<Vec18>>& path){
+    if(path.size()<2) return;
+    Vec18& q_end=path.back();
+    const Vec18& q_start=path.front();
+    constexpr double kFreezeNet=2e-3;  // ~0.115°
+    for(int a=0;a<3;++a) {
+      if(std::abs(q_end[a]-q_start[a])<=kFreezeNet) q_end[a]=q_start[a];
+    }
+    const double p0=q_start.head<3>().sum();
+    const double pN=q_end.head<3>().sum();
+    if(std::abs(pN-p0)<=kFreezeNet) {
+      // Hold pitch sum at start by adjusting the least-moving waist axis.
+      double need=p0-pN;
+      int best=2;
+      double best_abs=std::abs(q_end[2]-q_start[2]);
+      for(int a=0;a<3;++a) {
+        const double m=std::abs(q_end[a]-q_start[a]);
+        if(m<=best_abs) { best_abs=m; best=a; }
+      }
+      q_end[best]+=need;
+    }
+  };
   auto accept_direction=[&](std::vector<Vec18,Eigen::aligned_allocator<Vec18>>& path,
                             DirectionContract* out_c, DirectionCheckResult* out_r,
                             bool allow_repair=true)->bool {
@@ -1363,9 +1388,20 @@ bool CartesianTracker::line_build(
     }
     DirectionContract c=make_path_direction_contract(path);
     DirectionCheckResult chk=check_path_direction(path,c);
-    if(!chk.ok && allow_repair && repair_direction(path)) {
-      c=make_path_direction_contract(path);
-      chk=check_path_direction(path,c);
+    if(!chk.ok && allow_repair) {
+      if(repair_direction(path)) {
+        c=make_path_direction_contract(path);
+        chk=check_path_direction(path,c);
+      } else {
+        // Second try: freeze near-zero end axes then rebuild monotone waist.
+        auto alt=path;
+        freeze_near_zero_end(alt);
+        if(repair_direction(alt)) {
+          c=make_path_direction_contract(alt);
+          chk=check_path_direction(alt,c);
+          if(chk.ok) path=std::move(alt);
+        }
+      }
     }
     if(out_c) *out_c=c;
     if(out_r) *out_r=chk;
@@ -1580,6 +1616,23 @@ bool CartesianTracker::line_build(
   // whole-body solver that will execute it. Arm-only failure is not evidence
   // that a task permitting waist motion is unreachable.
   bool cascade_full_body=false;
+  auto commit_successor=[&](const LineTarget& tip,
+                            std::vector<Vec18,Eigen::aligned_allocator<Vec18>>&& next,
+                            const DirectionContract& next_c,
+                            const DirectionCheckResult& next_dir,
+                            const Vec18& q_boundary) {
+    successor_plan_.valid=true;
+    successor_plan_.tip_xyz=tip.xyz;
+    successor_plan_.tip_quat=tip.ori_on?tip.quat_xyzw:Vec4(0,0,0,1);
+    successor_plan_.tip_ori_on=tip.ori_on;
+    successor_plan_.tip_samples=std::move(next);
+    successor_plan_.tip_contract=next_c;
+    successor_plan_.tip_check=next_dir;
+    successor_plan_.generation=goal_generation_;
+    successor_plan_.left=left;
+    successor_plan_.frame=frame;
+    successor_plan_.q_boundary=q_boundary;
+  };
   if(!ok && line_tip_ && !upper_.waist_locked) {
     const auto& tip=*line_tip_;
     std::vector<Vec18,Eigen::aligned_allocator<Vec18>> trial,next;
@@ -1598,13 +1651,122 @@ bool CartesianTracker::line_build(
       cascade_full_body=true;
       candidate="cascade_full_body";
       accepted_contract=cur_c; accepted_dir=cur_dir; have_accepted_dir=true;
-      successor_plan_.valid=true;
-      successor_plan_.tip_xyz=tip.xyz;
-      successor_plan_.tip_quat=tip.ori_on?tip.quat_xyzw:Vec4(0,0,0,1);
-      successor_plan_.tip_ori_on=tip.ori_on;
-      successor_plan_.tip_samples=std::move(next);
-      successor_plan_.tip_contract=next_c;
-      successor_plan_.tip_check=next_dir;
+      commit_successor(tip,std::move(next),next_c,next_dir,samples.back());
+      }
+    }
+  }
+  // Bounded multi-seed prep+work search: share one q_prep boundary, keep waist
+  // monotone inside generation (repair_direction), and try both "prep carries
+  // waist / tip locks" and "tip continues same-direction waist".
+  if(!ok && !upper_.waist_locked) {
+    std::vector<Vec18,Eigen::aligned_allocator<Vec18>> seed_pool;
+    seed_pool.reserve(10);
+    auto push_seed=[&](const Vec18& q){
+      if(!q.allFinite()) return;
+      for(const auto& s:seed_pool) {
+        if((s.head<kNWaist>()-q.head<kNWaist>()).cwiseAbs().maxCoeff()<1e-4) return;
+      }
+      seed_pool.push_back(q);
+    };
+    push_seed(q0);  // lock-waist prep
+    {
+      std::vector<Vec18,Eigen::aligned_allocator<Vec18>> tip_path;
+      bool dummy=false;
+      if(line_tip_ &&
+         line_fit(q0,arm,line_tip_->xyz,
+                  line_tip_->ori_on?&line_tip_->quat_xyzw:nullptr,
+                  line_tip_->ori_on,false,frame,tip_path,dummy,false) &&
+         !tip_path.empty()) {
+        push_seed(tip_path.back());  // tip waist at prep
+        Vec18 mid=q0;
+        mid.head<kNWaist>()=
+            0.5*(q0.head<kNWaist>()+tip_path.back().head<kNWaist>());
+        push_seed(mid);
+        Vec18 qtr=q0;
+        qtr.head<kNWaist>()=
+            0.75*q0.head<kNWaist>()+0.25*tip_path.back().head<kNWaist>();
+        push_seed(qtr);
+        Vec18 qfr=q0;
+        qfr.head<kNWaist>()=
+            0.25*q0.head<kNWaist>()+0.75*tip_path.back().head<kNWaist>();
+        push_seed(qfr);
+        Vec18 frozen=tip_path.back();
+        for(int a=0;a<3;++a) {
+          if(std::abs(frozen[a]-q0[a])<=2e-3) frozen[a]=q0[a];
+        }
+        push_seed(frozen);
+      }
+    }
+    {
+      std::vector<Vec18,Eigen::aligned_allocator<Vec18>> free_path;
+      bool free_locked=false;
+      if(line_fit(q0,arm,target,quat,ori_on,false,frame,free_path,free_locked,false) &&
+         !free_path.empty()) {
+        push_seed(free_path.back());
+        std::vector<Vec18,Eigen::aligned_allocator<Vec18>> tmp={q0,free_path.back()};
+        freeze_near_zero_end(tmp);
+        push_seed(tmp.back());
+      }
+    }
+    for(const auto& seed:seed_pool) {
+      if(ok) break;
+      std::vector<Vec18,Eigen::aligned_allocator<Vec18>> trial;
+      bool trial_locked=false;
+      DirectionContract cur_c;
+      DirectionCheckResult cur_dir;
+      if(!line_fit(q0,arm,target,quat,ori_on,false,frame,trial,trial_locked,false,&seed)) {
+        continue;
+      }
+      if(recovering_pitch &&
+         std::abs(trial.back().head<3>().sum())>torso_pitch_max_+1e-7) {
+        continue;
+      }
+      if(!accept_direction(trial,&cur_c,&cur_dir)) continue;
+      if(!line_tip_) {
+        if(!probe(trial)) continue;
+        straighten_axis_reverted=line_fit_straighten_axis_reverted_;
+        samples=std::move(trial); locked=trial_locked; ok=true; forced=false;
+        candidate="seed_monotone";
+        accepted_contract=cur_c; accepted_dir=cur_dir; have_accepted_dir=true;
+        break;
+      }
+      const auto& tip=*line_tip_;
+      // Variant A: tip locks waist at prep end (arm-only successor).
+      {
+        std::vector<Vec18,Eigen::aligned_allocator<Vec18>> next;
+        DirectionContract next_c;
+        DirectionCheckResult next_dir;
+        if(line_arm_only(trial.back(),arm,tip.xyz,tip.ori_on?&tip.quat_xyzw:nullptr,
+                         tip.ori_on,frame,next) &&
+           accept_direction(next,&next_c,&next_dir)) {
+          straighten_axis_reverted=line_fit_straighten_axis_reverted_;
+          const Vec18 boundary=trial.back();
+          samples=std::move(trial); locked=trial_locked; forced=true; ok=true;
+          cascade_full_body=true;
+          candidate="seed_chain_lock_tip";
+          accepted_contract=cur_c; accepted_dir=cur_dir; have_accepted_dir=true;
+          commit_successor(tip,std::move(next),next_c,next_dir,boundary);
+          break;
+        }
+      }
+      // Variant B: tip may continue waist in the same contract-compatible way.
+      {
+        std::vector<Vec18,Eigen::aligned_allocator<Vec18>> next;
+        bool next_locked=false;
+        DirectionContract next_c;
+        DirectionCheckResult next_dir;
+        if(line_fit(trial.back(),arm,tip.xyz,tip.ori_on?&tip.quat_xyzw:nullptr,
+                    tip.ori_on,false,frame,next,next_locked) &&
+           accept_direction(next,&next_c,&next_dir)) {
+          straighten_axis_reverted=line_fit_straighten_axis_reverted_;
+          const Vec18 boundary=trial.back();
+          samples=std::move(trial); locked=trial_locked; forced=true; ok=true;
+          cascade_full_body=true;
+          candidate="seed_chain_free_tip";
+          accepted_contract=cur_c; accepted_dir=cur_dir; have_accepted_dir=true;
+          commit_successor(tip,std::move(next),next_c,next_dir,boundary);
+          break;
+        }
       }
     }
   }

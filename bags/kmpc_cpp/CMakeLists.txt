@@ -155,6 +155,8 @@ if(BUILD_TESTING)
   kmpc_add_test(test_line_path tests/unit/test_line_path.cpp)
   kmpc_add_test(test_line_contract tests/unit/test_line_contract.cpp)
   kmpc_add_test(test_mock_eye_cycle_fold tests/unit/test_mock_eye_cycle_fold.cpp)
+  kmpc_add_test(test_grasp_place_targets_624_525
+                tests/unit/test_grasp_place_targets_624_525.cpp)
   kmpc_add_test(test_layer_diag tests/unit/test_layer_diag.cpp)
   target_include_directories(test_layer_diag PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/ros2")
   kmpc_add_test(test_line_segment tests/unit/test_line_segment.cpp)

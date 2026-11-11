@@ -1329,11 +1329,12 @@ class KmpcNode : public rclcpp::Node {
         const int qp_max_iter=line_qp_max_iter_;
         const kmpc::Vec18 q_pref=cfg_.q_pref;
         const auto line_cache=tracker_->last_line_cache();
+        const auto successor_plan=tracker_->successor_plan();
         const uint64_t run_id=run_id_;
         line_future_=std::async(std::launch::async,
             [config,source,xml,target,q0,is_left,upper,pose_pref,pitch_straighten,
              qp_pitch_mono,reverse_last,direction_strict,diag,pace_mode,brake_m,brake_floor,
-             brake_profile,qp_max_iter,q_pref,line_cache,run_id]() {
+             brake_profile,qp_max_iter,q_pref,line_cache,successor_plan,run_id]() {
           kmpc::Kinematics model(source,xml?kmpc::Kinematics::UrdfInput::Xml:kmpc::Kinematics::UrdfInput::Path);
           kmpc::CartesianTracker worker(model,config);
           worker.set_upper_commands(upper);
@@ -1355,11 +1356,14 @@ class KmpcNode : public rclcpp::Node {
             throw kmpc::ConfigError("line_qp_max_iter must be in [1,10000]");
           }
           worker.import_last_line_cache(line_cache);
+          worker.import_successor_plan(successor_plan);
           worker.set_line_diag_enable(diag);
           worker.set_line_diag_run_id(run_id);
           worker.rearm_line(target.generation,target.cascade);
           auto plan = worker.prepare_line(q0,is_left,target.xyz,&target.quat_xyzw);
           plan.diag_events = worker.line_diag_take();
+          // prepare_line already copies successor into plan; keep explicit.
+          plan.successor = worker.successor_plan();
           return plan;
         });
         publish_cmd(q0,kmpc::Vec18::Zero(),0.0,true); return;

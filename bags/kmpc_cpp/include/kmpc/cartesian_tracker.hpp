@@ -294,8 +294,14 @@ class CartesianTracker {
     std::vector<Vec18, Eigen::aligned_allocator<Vec18>> tip_samples;
     DirectionContract tip_contract{};
     DirectionCheckResult tip_check{};
+    // Match key so the next worker can reuse only the paired tip commitment.
+    uint64_t generation = 0;
+    bool left = true;
+    std::string frame;
+    Vec18 q_boundary = Vec18::Zero();
   };
   const SuccessorPlan& successor_plan() const { return successor_plan_; }
+  void import_successor_plan(const SuccessorPlan& plan) { successor_plan_ = plan; }
   LastLineCache last_line_cache() const { return last_line_cache_; }
   void import_last_line_cache(const LastLineCache& cache) { last_line_cache_ = cache; }
   // Call once when the active line first reaches measured/command hold.
@@ -456,6 +462,8 @@ class CartesianTracker {
     std::string failure_category;
     DirectionContract direction_contract{};
     DirectionCheckResult direction_check{};
+    // Worker→main handoff of the paired tip commitment (cascade_full_body).
+    SuccessorPlan successor{};
     // 异步建线线程的诊断副本。adopt 后拆走，不参与跟踪计算。
     std::vector<LineDiagEvent> diag_events;
     double build_ms = 0.0;
@@ -471,6 +479,9 @@ class CartesianTracker {
   LineRun prepare_line(const Vec18& q, bool left, const Vec3& target, const Vec4* quat) {
     if (!line_build(q,left,target,quat,std::string(left?kEeFrameLeft:kEeFrameRight)))
       refuse_line(line_.reason);
+    // Always export the current successor commitment with the LineRun so an
+    // async worker's cascade tip plan survives into the main tracker.
+    line_.successor = successor_plan_;
     return line_;
   }
   void adopt_line(LineRun plan) {
@@ -479,6 +490,8 @@ class CartesianTracker {
       plan.diag_events.clear();
     }
     reverse_decision_ = plan.reverse_decision.empty() ? reverse_decision_ : plan.reverse_decision;
+    successor_plan_ = std::move(plan.successor);
+    plan.successor = SuccessorPlan{};
     line_ = std::move(plan);
     if (!line_.samples.empty()) line_q_=line_.samples.front();
     line_rate_=0; line_rate_acc_=0; ++line_gen_; last_arrived_=false;
