@@ -362,85 +362,43 @@ TEST(MockEyeCycle, WaistPitchNoFoldOnGraspPlaceCycle) {
                            0.7989};
   const double left7[] = {-0.0980, 29.5260, 7.8220, -121.8440, 73.0653, -13.9180,
                           0.7991};
-  kmpc::Vec18 q = q_from_deg(waist4, right7, left7);
-
   const auto cfg_all = kmpc::Config::load(
       cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
-  kmpc::CartesianTracker tracker(kin, cfg_all);
-  tracker.set_line_pace(0.3, 0.8);
-  tracker.set_line_direction_strict_enable(true);
 
   std::cout << "version_note=8842e7e_plus_mock_eye_business_offsets\n";
   std::cout << "urdf_note=Chassis_Z_Joint4.z=0.1805\n";
 
-  uint64_t gen = 1;
   std::vector<SegReport> rows;
-  auto run_arm = [&](bool left, const PoseMm& grasp, const PoseMm& place) {
-    kmpc::Vec3 g, g_prep, p, p_prep;
-    tip_prep_m(grasp, left, true, &g, &g_prep);
-    tip_prep_m(place, left, false, &p, &p_prep);
-    const kmpc::Vec4 gq = flange_quat(grasp);
-    const kmpc::Vec4 pq = flange_quat(place);
-
-    const char* tag = left ? "L" : "R";
-    rows.push_back(play_segment(tracker, &q, cfg_all.q_pref, gen++, left, g_prep, gq, &g,
-                                (std::string(tag) + "_grasp_approach").c_str()));
+  // Grasp then place are separate task epochs in the field (MoveJ / re-seed
+  // between them). Keep that boundary here so place does not inherit grasp QP
+  // stream state; matches test_grasp_place_targets_624_525 fixtures.
+  auto run_task = [&](bool left, const PoseMm& eye, bool grasp, uint64_t* ggen,
+                      const char* tag_prefix) {
+    kmpc::CartesianTracker t(kin, cfg_all);
+    t.set_line_pace(0.3, 0.8);
+    t.set_line_direction_strict_enable(true);
+    kmpc::Vec18 qq = q_from_deg(waist4, right7, left7);
+    kmpc::Vec3 tip, prep;
+    tip_prep_m(eye, left, grasp, &tip, &prep);
+    const kmpc::Vec4 quat = flange_quat(eye);
+    const std::string tag = std::string(tag_prefix);
+    rows.push_back(play_segment(t, &qq, cfg_all.q_pref, (*ggen)++, left, prep, quat, &tip,
+                                (tag + "_approach").c_str()));
     if (!rows.back().arrived) return;
-    rows.push_back(play_segment(tracker, &q, cfg_all.q_pref, gen++, left, g, gq, nullptr,
-                                (std::string(tag) + "_grasp_insert").c_str()));
+    rows.push_back(play_segment(t, &qq, cfg_all.q_pref, (*ggen)++, left, tip, quat, nullptr,
+                                (tag + "_insert").c_str()));
     if (!rows.back().arrived) return;
-    diagnose_reverse_validate(kin, cfg_all, tracker, q, g_prep, gq, left);
-    rows.push_back(play_segment(tracker, &q, cfg_all.q_pref, gen++, left, g_prep, gq, nullptr,
-                                (std::string(tag) + "_grasp_retreat").c_str()));
-    if (!rows.back().arrived) return;
-    rows.push_back(play_segment(tracker, &q, cfg_all.q_pref, gen++, left, p_prep, pq, &p,
-                                (std::string(tag) + "_place_approach").c_str()));
-    if (!rows.back().arrived) return;
-    rows.push_back(play_segment(tracker, &q, cfg_all.q_pref, gen++, left, p, pq, nullptr,
-                                (std::string(tag) + "_place_insert").c_str()));
-    if (!rows.back().arrived) return;
-    rows.push_back(play_segment(tracker, &q, cfg_all.q_pref, gen++, left, p_prep, pq, nullptr,
-                                (std::string(tag) + "_place_retreat").c_str()));
+    diagnose_reverse_validate(kin, cfg_all, t, qq, prep, quat, left);
+    rows.push_back(play_segment(t, &qq, cfg_all.q_pref, (*ggen)++, left, prep, quat, nullptr,
+                                (tag + "_retreat").c_str()));
   };
-
-  run_arm(true, LEFT_GRASP, LEFT_PLACE);
-
-  // Right arm: fresh tracker from same field q0 so left abort does not poison it.
-  {
-    kmpc::CartesianTracker right(kin, cfg_all);
-    right.set_line_pace(0.3, 0.8);
-    right.set_line_direction_strict_enable(true);
-    kmpc::Vec18 qr = q_from_deg(waist4, right7, left7);
-    auto run_right = [&](bool left, const PoseMm& grasp, const PoseMm& place) {
-      kmpc::Vec3 g, g_prep, p, p_prep;
-      tip_prep_m(grasp, left, true, &g, &g_prep);
-      tip_prep_m(place, left, false, &p, &p_prep);
-      const kmpc::Vec4 gq = flange_quat(grasp);
-      const kmpc::Vec4 pq = flange_quat(place);
-      const char* tag = left ? "L" : "R";
-      uint64_t ggen = 100;
-      rows.push_back(play_segment(right, &qr, cfg_all.q_pref, ggen++, left, g_prep, gq, &g,
-                                  (std::string(tag) + "_grasp_approach").c_str()));
-      if (!rows.back().arrived) return;
-      rows.push_back(play_segment(right, &qr, cfg_all.q_pref, ggen++, left, g, gq, nullptr,
-                                  (std::string(tag) + "_grasp_insert").c_str()));
-      if (!rows.back().arrived) return;
-      diagnose_reverse_validate(kin, cfg_all, right, qr, g_prep, gq, left);
-      rows.push_back(play_segment(right, &qr, cfg_all.q_pref, ggen++, left, g_prep, gq, nullptr,
-                                  (std::string(tag) + "_grasp_retreat").c_str()));
-      if (!rows.back().arrived) return;
-      rows.push_back(play_segment(right, &qr, cfg_all.q_pref, ggen++, left, p_prep, pq, &p,
-                                  (std::string(tag) + "_place_approach").c_str()));
-      if (!rows.back().arrived) return;
-      rows.push_back(play_segment(right, &qr, cfg_all.q_pref, ggen++, left, p, pq, nullptr,
-                                  (std::string(tag) + "_place_insert").c_str()));
-      if (!rows.back().arrived) return;
-      rows.push_back(play_segment(right, &qr, cfg_all.q_pref, ggen++, left, p_prep, pq, nullptr,
-                                  (std::string(tag) + "_place_retreat").c_str()));
-    };
-    run_right(false, RIGHT_GRASP, RIGHT_PLACE);
-  }
+  uint64_t gL = 1;
+  uint64_t gR = 100;
+  run_task(true, LEFT_GRASP, true, &gL, "L_grasp");
+  run_task(true, LEFT_PLACE, false, &gL, "L_place");
+  run_task(false, RIGHT_GRASP, true, &gR, "R_grasp");
+  run_task(false, RIGHT_PLACE, false, &gR, "R_place");
 
   print_report(rows);
 
