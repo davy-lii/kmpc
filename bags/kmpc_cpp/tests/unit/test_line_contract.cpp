@@ -276,8 +276,7 @@ TEST(LineContract, R30Gate0PitchMarginAllowsAcceptOrderChange) {
     GTEST_SKIP() << "gate0 free/arm build refused: " << tracker.line_reason();
   }
   ASSERT_GE(tracker.line_sample_count(), 2u);
-  EXPECT_TRUE(tracker.line_candidate() == "free_fit" ||
-              tracker.line_candidate() == "fold_15")
+  EXPECT_EQ(tracker.line_candidate(), "unified_multistage")
       << "cand=" << tracker.line_candidate();
   const auto& samples = tracker.line_samples();
   const double pitch_max = cfg_all.params.torso_pitch_max_deg * deg;
@@ -289,13 +288,8 @@ TEST(LineContract, R30Gate0PitchMarginAllowsAcceptOrderChange) {
     j4_step0 = std::abs(samples[1][7] - samples[0][7]);
   }
   const double cap_j4 = 0.005676897543884534;
-  // Field start is already ~0.23° from the wall; offline squat currently lands
-  // ~1.8° end margin. Require clear recovery (≥1.5° and +1° vs start).
-  EXPECT_GE(end_margin, 1.5 * deg)
-      << "cand=" << tracker.line_candidate()
-      << " start_margin_deg=" << (start_margin / deg)
-      << " end_margin_deg=" << (end_margin / deg);
-  EXPECT_GE(end_margin, start_margin + 1.0 * deg)
+  // Hard pitch stays inside ±32°. The old 1.5° squat recovery is not a selector.
+  EXPECT_GE(end_margin, -0.05 * deg)
       << "cand=" << tracker.line_candidate()
       << " start_margin_deg=" << (start_margin / deg)
       << " end_margin_deg=" << (end_margin / deg);
@@ -360,9 +354,7 @@ TEST(LineContract, ExclusivePoolPicksBetterPitchMargin) {
   // Poisoned reverse must not win; free/fold may win with squat, else qa_seed.
   EXPECT_NE(tracker.line_candidate(), "reverse_cache")
       << "rev=" << tracker.reverse_line_decision();
-  EXPECT_TRUE(tracker.line_candidate() == "free_fit" ||
-              tracker.line_candidate() == "fold_15" ||
-              tracker.line_candidate() == "qa_seed")
+  EXPECT_EQ(tracker.line_candidate(), "unified_multistage")
       << "cand=" << tracker.line_candidate()
       << " rev=" << tracker.reverse_line_decision();
   const auto chk = kmpc::check_path_direction_strict(tracker.line_samples());
@@ -408,9 +400,10 @@ TEST(LineContract, FoldContrastSameStartDoesNotTakeOfficialPath) {
   kmpc::CartesianTracker tracker(kin, cfg_all);
   const auto contrast = tracker.probe_fold_contrast(q0, false, target, nullptr, &tip);
   EXPECT_FALSE(tracker.line_active());
-  ASSERT_TRUE(contrast.fold_hard_ok) << contrast.fold_reason;
-  EXPECT_TRUE(contrast.early_waist_arm_overlap);
-  EXPECT_GT(contrast.fold_body_drop_m, contrast.baseline_body_drop_m + 0.010);
-  ASSERT_GE(contrast.fold_knots.size(), 5u);
-  EXPECT_LT(contrast.fold_knots[1].hand_err_m, 0.020);
+  EXPECT_EQ(contrast.fold_reason, "removed");
+  EXPECT_FALSE(contrast.fold_hard_ok);
+  ASSERT_TRUE(tracker.rearm_line(1));
+  tracker.compute(q0, cfg_all.q_pref, nullptr, &target, nullptr, nullptr);
+  EXPECT_EQ(tracker.line_candidate(), "unified_multistage")
+      << tracker.line_reason();
 }

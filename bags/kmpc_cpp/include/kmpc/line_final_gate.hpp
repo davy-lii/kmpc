@@ -9,6 +9,7 @@
 #include <string>
 
 #include "kmpc/config.hpp"
+#include "kmpc/constraint_policy.hpp"
 #include "kmpc/kinematics.hpp"
 #include "kmpc/tracker_math.hpp"
 #include "kmpc/types.hpp"
@@ -43,10 +44,9 @@ inline const char* line_final_filtered_fault(
   if (!q.allFinite()) {
     return "stream_filtered_nonfinite";
   }
-  // Hard joint box only — soft margin must not stop a stream that is already
-  // past soft while moving away from the hard wall (r39 s0_qlim_j0 / rise).
-  if ((q.array() < lim.q_min.array() - 1e-7).any() ||
-      (q.array() > lim.q_max.array() + 1e-7).any()) {
+  // Hard joint box only. q_limit_margin is not a reject. Same slack as
+  // line_stream_segment_check (kHardBoxSlackRad).
+  if (joint_violates_hard_box(q, lim.q_min, lim.q_max)) {
     return "stream_filtered_joint_limit";
   }
   if (lim.torso_pitch_max_rad > 0.0 &&

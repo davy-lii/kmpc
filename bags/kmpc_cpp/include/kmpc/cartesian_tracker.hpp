@@ -361,7 +361,7 @@ class CartesianTracker {
   const std::string& line_failure_category() const { return line_.failure_category; }
   const std::string& line_candidate() const { return line_.candidate; }
   const std::string& line_pose_report() const { return line_.pose_report; }
-  // 不改 line_、不改候选胜出。折叠初值只用来证明有没有共同硬门下的对照解。
+  // Does not select a pose. Fold-seed search is not part of the planner.
   LineFoldContrast probe_fold_contrast(
       const Vec18& q0, bool left, const Vec3& target, const Vec4* quat,
       const LineTarget* successor = nullptr) const;
@@ -580,6 +580,8 @@ class CartesianTracker {
     int sample_index = 0;
     // Minimum signed clearance over the five interpolation samples. Negative
     // means the corresponding constraint is violated (radians or meters).
+    // joint_margin_rad is distance to the hard q_min/q_max box, not to
+    // q_limit_margin. A pose 0.3° inside the hard stop is still legal.
     double joint_margin_rad = 0.0;
     double com_margin_m = 0.0;
     double pitch_margin_rad = 0.0;
@@ -746,6 +748,8 @@ class CartesianTracker {
     line_rate_=0; line_rate_acc_=0; ++line_gen_; last_arrived_=false;
     last_line_cache_committed_ = false;
   }
+  // False: the snapped start left the certified curve. Caller plans again.
+  bool recertify_line_start(LineRun& plan, const Vec18& q_meas) const;
  private:
   void line_clear();
   bool follow_line(
@@ -755,18 +759,6 @@ class CartesianTracker {
   bool line_build(
       const Vec18& q0, bool left, const Vec3& target, const Vec4* quat,
       const std::string& frame);
-  bool line_arm_only(
-      const Vec18& q0, int arm_begin, const Vec3& target, const Vec4* quat,
-      bool ori_on, const std::string& frame,
-      std::vector<Vec18, Eigen::aligned_allocator<Vec18>>& samples) const;
-  bool line_fit(
-      const Vec18& q0, int arm_begin, const Vec3& target, const Vec4* quat,
-      bool ori_on, bool lock_waist, const std::string& frame,
-      std::vector<Vec18, Eigen::aligned_allocator<Vec18>>& samples,
-      bool& waist_locked, bool allow_relock = true, const Vec18* goal_seed = nullptr,
-      const Vec18* pose_pref = nullptr, double sample_step_m = -1.0) const;
-  bool line_validate(const std::vector<Vec18, Eigen::aligned_allocator<Vec18>>& samples,
-      const Vec3& target, const Vec4* quat, bool ori_on, const std::string& frame) const;
   bool line_path_qp(const Vec18& from, double next_prog, const Vec18& cap, Vec18& to);
 
   Vec18 line_at(double prog) const;

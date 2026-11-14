@@ -9,6 +9,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <iomanip>
+#include <sstream>
 #include <Eigen/SparseCore>
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-parameter"
@@ -559,7 +561,14 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
     if((cx.array()<lo.array()-2e-7).any() || (cx.array()>hi.array()+2e-7).any()) {
       fill_worst(x);
       finish_dump();
-      return reject("qp_primal_residual");
+      std::ostringstream os;
+      os << std::setprecision(8) << "qp_primal_residual v="
+         << last_line_qp_fail_.worst_violation << " "
+         << (last_line_qp_fail_.worst_c >= 0 &&
+                     last_line_qp_fail_.worst_c < static_cast<int>(row_tags.size())
+                 ? row_tags[static_cast<std::size_t>(last_line_qp_fail_.worst_c)]
+                 : "?");
+      return reject(os.str());
     }
   }
   last_line_qp_dx_norm_ = x.norm();
@@ -645,8 +654,8 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
       auto apply_pitch_need_recover = [&](double need) {
         for (int ax : {1, 0, 2}) {
           if (std::abs(need) <= 1e-15) break;
-          const double lo = limits_.q_min[ax] + q_limit_margin_;
-          const double hi = limits_.q_max[ax] - q_limit_margin_;
+          const double lo = limits_.q_min[ax];
+          const double hi = limits_.q_max[ax];
           const double room = need > 0.0 ? (hi - to[ax]) : (lo - to[ax]);
           const double capped =
               need > 0.0 ? std::min(need, std::min(room, from[ax] + cap[ax] - to[ax]))
@@ -658,8 +667,10 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
       // Direction freeze must not cancel pitch recovery: wall-hug hold paths
       // often have psgn==0, and pinning to `from` made stream_pitch_recovery
       // timeout deterministic (r32). While recovering, only shrink |pitch|.
+      // Certified unified paths already chose the joint motion, including a
+      // single smooth reversal. Do not force the net-sign monotone clamp.
       if (line_direction_strict_enable_ && line_.direction_check.ok &&
-          !pitch_recovering_from) {
+          !pitch_recovering_from && line_.candidate != "unified_multistage") {
         reclamp_axes();
         double p_to = to[0] + to[1] + to[2];
         if (psgn == 0) {
@@ -793,7 +804,7 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
       // Recovery may move frozen waist axes / pitch toward the hard box; the
       // QP already skipped direction rows while pitch_recovering.
       if (line_direction_strict_enable_ && line_.direction_check.ok &&
-          !pitch_recovering_from) {
+          !pitch_recovering_from && line_.candidate != "unified_multistage") {
         for (int a = 0; a < 3; ++a) {
           const int sgn = line_.direction_contract.sign[a];
           const double dq = to[a] - from[a];

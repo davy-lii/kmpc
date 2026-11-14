@@ -93,6 +93,11 @@ add_library(kmpc_core
   src/tracker/line_path.cpp
   src/tracker/line_qp.cpp
   src/planner/upper_planner.cpp
+  src/planner/motion_evaluator.cpp
+  src/planner/trajectory_cost.cpp
+  src/planner/trajectory_package.cpp
+  src/planner/trajectory_validator.cpp
+  src/planner/unified_multistage_planner.cpp
 )
 target_include_directories(kmpc_core PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -154,6 +159,10 @@ if(BUILD_TESTING)
   kmpc_add_interp_test()
   kmpc_add_test(test_line_path tests/unit/test_line_path.cpp)
   kmpc_add_test(test_line_contract tests/unit/test_line_contract.cpp)
+  kmpc_add_test(test_constraint_policy tests/unit/test_constraint_policy.cpp)
+  kmpc_add_test(test_motion_evaluator tests/unit/test_motion_evaluator.cpp)
+  kmpc_add_test(test_r40_rise_soft_wall tests/unit/test_r40_rise_soft_wall.cpp)
+  kmpc_add_test(test_unified_planner tests/unit/test_unified_planner.cpp)
   kmpc_add_test(test_mock_eye_cycle_fold tests/unit/test_mock_eye_cycle_fold.cpp)
   kmpc_add_test(test_grasp_place_targets_624_525
                 tests/unit/test_grasp_place_targets_624_525.cpp)

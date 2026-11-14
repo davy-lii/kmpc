@@ -393,10 +393,10 @@ TEST(LinePath, LoggedPrepAtScaleStaysOnLine) {
   EXPECT_TRUE(arrived)<<"prog="<<tracker.line_progress()<<" samples="<<tracker.line_sample_count()<<" e="<<tracker.last_e0()
       <<" cand="<<tracker.line_candidate()<<" pose="<<tracker.line_pose_report();
   // Soft tube (build/QP mid cap 0.20 m): fold_15 on this fixture bows ~33 mm.
-  EXPECT_LE(worst, 0.050);
+  EXPECT_LE(worst, 0.008);
   EXPECT_LT((kin.fk_pos(q, kmpc::kEeFrameRight) - goal).norm(), 0.003);
-  EXPECT_EQ(tracker.line_candidate(), "fold_15");
-  EXPECT_NE(tracker.line_pose_report().find("foldx_mm=-"), std::string::npos);
+  EXPECT_EQ(tracker.line_candidate(), "unified_multistage");
+  EXPECT_NE(tracker.line_pose_report().find("planner=unified_multistage"), std::string::npos);
   const auto held = tracker.compute(q, cfg_all.q_pref, nullptr, &goal, nullptr, &quat);
   EXPECT_LT(held.dq.cwiseAbs().maxCoeff(), 1e-9);
   EXPECT_TRUE(tracker.line_holding());
@@ -500,7 +500,11 @@ TEST(LinePath, LoggedGraspAndPlaceDoNotFold) {
     pitch_lo = std::min(pitch_lo, pitch);
     pitch_hi = std::max(pitch_hi, pitch);
   }
-  EXPECT_LT((pitch_hi - pitch_lo) * 180.0 / kmpc::kPi, 1.5);
+  // The logged down is reachable, and the arm-first step does not finish it, so
+  // the waist pitch moves. Measured range is about 8°. 12° still rejects a
+  // collapse onto the ±32° hard cap. The old 1.5° budget belonged to the
+  // deleted fold-seed selector.
+  EXPECT_LT((pitch_hi - pitch_lo) * 180.0 / kmpc::kPi, 12.0);
 
   walk_line(kin, cfg_all, load(place_raw), true, kmpc::Vec3(0.4858, 0.3435, 0.6900),
             place_quat, lat, end_err, arrived, refused, path);
@@ -647,9 +651,8 @@ TEST(LinePath, Robot03PlacementAllowsConstrainedWaistInSuccessor) {
   q+=tracker.compute(q,cfg_all.q_pref,&goal,nullptr,&quat,nullptr).dq;
   ASSERT_FALSE(tracker.line_refused()) << tracker.line_reason();
   EXPECT_TRUE(tracker.line_cascade_passed());
-  // Successor is no longer refit during candidate search, so this prep does
-  // not carry a prebuilt full-body next segment.
-  EXPECT_FALSE(tracker.line_cascade_full_body());
+  // PRE and the known tip are one joint plan.
+  EXPECT_TRUE(tracker.line_cascade_full_body());
   for (const auto& p : {goal, tip.xyz}) {
     kmpc::CartesianTracker single(kin,cfg_all); single.rearm_line(1);
     single.compute(q,cfg_all.q_pref,&p,nullptr,&quat,nullptr);
@@ -710,12 +713,7 @@ TEST(LinePath, ReverseLastLineRestoresQa) {
   ASSERT_TRUE(tracker.rearm_line(2));
   const auto step0 = tracker.compute(q, cfg_all.q_pref, &pA, nullptr, &quat, nullptr);
   ASSERT_FALSE(tracker.line_refused()) << tracker.line_reason();
-  // M03: reverse_cache stays hard-gated in the pool but may lose to free_fit/
-  // fold_15 when those keep more pitch/CoM margin (no arm_only lock-waist).
-  EXPECT_TRUE(tracker.line_candidate() == "reverse_cache" ||
-              tracker.line_candidate() == "qa_seed" ||
-              tracker.line_candidate() == "free_fit" ||
-              tracker.line_candidate() == "fold_15")
+  EXPECT_EQ(tracker.line_candidate(), "unified_multistage")
       << tracker.line_candidate() << " " << tracker.reverse_line_decision();
   if (tracker.line_candidate() == "reverse_cache") {
     EXPECT_EQ(tracker.reverse_line_decision(), "accepted");
@@ -751,8 +749,14 @@ TEST(LinePath, ReverseLastLineRestoresQa) {
   }
   if (back_ok) {
     EXPECT_LT((kin.fk_pos(q, kmpc::kEeFrameLeft) - pA).norm(), 0.003);
-    EXPECT_LT((q - qA).cwiseAbs().maxCoeff(), 2.0 * kmpc::kPi / 180.0)
-        << "qA recovery " << (q - qA).cwiseAbs().transpose();
+    // Cartesian return, not the deleted reverse-cache joint seed. A few
+    // degrees at the same hand pose is accepted; a branch flip is not.
+    EXPECT_LT((q - qA).cwiseAbs().maxCoeff(), 6.0 * kmpc::kPi / 180.0);
+    EXPECT_LT(kmpc::ori_error_xyzw(
+                  quat, kmpc::rot_to_quat_xyzw(kin.fk(q, kmpc::kEeFrameLeft)
+                                                   .block<3, 3>(0, 0)))
+                  .norm(),
+              0.08);
   } else if (retreat_cand == "reverse_cache" || retreat_cand == "qa_seed") {
     // Pool selected a cache candidate; arrival/tail-feedback is outside M03.
     SUCCEED() << "cache cand=" << retreat_cand << " refuse=" << refuse_reason;
@@ -784,9 +788,9 @@ TEST(LinePath, ReverseRejectsQbMismatch) {
   q[4] += 10.0 * kmpc::kPi / 180.0;  // spoil qB
   ASSERT_TRUE(tracker.rearm_line(2));
   tracker.compute(q, cfg_all.q_pref, &pA, nullptr, &quat, nullptr);
+  EXPECT_EQ(tracker.line_candidate(), "unified_multistage");
   EXPECT_NE(tracker.line_candidate(), "reverse_cache");
-  EXPECT_EQ(tracker.reverse_line_decision(), "rejected_qb_mismatch");
-  EXPECT_FALSE(tracker.last_line_cache().valid);
+  EXPECT_EQ(tracker.reverse_line_decision(), "not_a_selector");
 }
 
 TEST(LinePath, LineDiagRingDefaultOffBounded) {
@@ -998,10 +1002,7 @@ TEST(LinePath, LoggedFixedPointsNoPitchReversalOrOvershoot) {
       // and fall back to qa_seed; both are valid retreat candidates.
       play(tracker, q, 3, nullptr, grasp_prep, grasp_quat, (tag + " retreat").c_str(),
            nullptr);
-      EXPECT_TRUE(tracker.line_candidate() == "reverse_cache" ||
-                  tracker.line_candidate() == "qa_seed" ||
-                  tracker.line_candidate() == "free_fit" ||
-                  tracker.line_candidate() == "fold_15")
+      EXPECT_EQ(tracker.line_candidate(), "unified_multistage")
           << tag << " retreat cand=" << tracker.line_candidate()
           << " rev=" << tracker.reverse_line_decision();
     }
@@ -1019,10 +1020,7 @@ TEST(LinePath, LoggedFixedPointsNoPitchReversalOrOvershoot) {
          nullptr);
     play(place_tracker, q, 3, nullptr, place_prep, place_quat, (ptag + " retreat").c_str(),
          nullptr);
-    EXPECT_TRUE(place_tracker.line_candidate() == "reverse_cache" ||
-                place_tracker.line_candidate() == "qa_seed" ||
-                place_tracker.line_candidate() == "free_fit" ||
-                place_tracker.line_candidate() == "fold_15")
+    EXPECT_EQ(place_tracker.line_candidate(), "unified_multistage")
         << ptag << " retreat cand=" << place_tracker.line_candidate()
         << " rev=" << place_tracker.reverse_line_decision();
   }

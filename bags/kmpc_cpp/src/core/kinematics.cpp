@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <stdexcept>
 #include <utility>
 
@@ -37,6 +38,18 @@ struct Kinematics::Impl {
   std::array<int, kNDof> idx_q{};
   std::array<int, kNDof> idx_v{};
   double total_mass = 0.0;
+  // level: 0 empty, 1 FK placements, 2 joint Jacobians. Exact q match only.
+  mutable int level = 0;
+  mutable Vec18 cached_q = Vec18::Zero();
+  mutable bool com_ready = false;
+  mutable bool jcom_ready = false;
+  mutable bool mdiag_ready = false;
+  mutable Vec3 cached_com = Vec3::Zero();
+  mutable Mat3x18 cached_jcom = Mat3x18::Zero();
+  mutable Vec18 cached_mdiag = Vec18::Zero();
+  mutable uint64_t n_fk = 0;
+  mutable uint64_t n_jac = 0;
+  mutable uint64_t n_crba = 0;
 
   void apply_q(const Vec18& q18) const {
     for (int i = 0; i < kNDof; ++i) {
@@ -52,16 +65,105 @@ struct Kinematics::Impl {
     return model.getFrameId(name);
   }
 
-  void update_fk(const Vec18& q18) const {
+  bool same_q(const Vec18& q18) const {
+    return level > 0 && (cached_q - q18).squaredNorm() == 0.0;
+  }
+
+  void forget_derived() const {
+    com_ready = false;
+    jcom_ready = false;
+    mdiag_ready = false;
+  }
+
+  void ensure_fk(const Vec18& q18) const {
+    if (same_q(q18) && level >= 1) {
+      return;
+    }
     apply_q(q18);
     pinocchio::forwardKinematics(model, data, q_pin);
     pinocchio::updateFramePlacements(model, data);
+    cached_q = q18;
+    level = 1;
+    forget_derived();
+    ++n_fk;
   }
 
-  void update_fk_jac(const Vec18& q18) const {
+  void ensure_jac(const Vec18& q18) const {
+    if (same_q(q18) && level >= 2) {
+      return;
+    }
     apply_q(q18);
     pinocchio::computeJointJacobians(model, data, q_pin);
     pinocchio::updateFramePlacements(model, data);
+    cached_q = q18;
+    level = 2;
+    forget_derived();
+    ++n_jac;
+  }
+
+  void update_fk(const Vec18& q18) const { ensure_fk(q18); }
+
+  void update_fk_jac(const Vec18& q18) const { ensure_jac(q18); }
+
+  Vec3 com_cached() const {
+    if (com_ready) {
+      return cached_com;
+    }
+    Vec3 s = Vec3::Zero();
+    for (pinocchio::JointIndex j = 0; j < model.inertias.size(); ++j) {
+      const double m = model.inertias[j].mass();
+      if (m <= 0.0) {
+        continue;
+      }
+      s += m * body_com_world(j);
+    }
+    cached_com.setZero();
+    if (total_mass > 1e-12) {
+      cached_com = s / total_mass;
+    }
+    com_ready = true;
+    return cached_com;
+  }
+
+  Mat3x18 jcom_cached() const {
+    if (jcom_ready) {
+      return cached_jcom;
+    }
+    cached_jcom.setZero();
+    const double M = total_mass;
+    for (int i = 0; i < kNDof; ++i) {
+      const pinocchio::JointIndex joint = jid[static_cast<std::size_t>(i)];
+      const int iv = idx_v[static_cast<std::size_t>(i)];
+      double m_c = 0.0;
+      Vec3 p_c = Vec3::Zero();
+      subtree_mass_com(joint, &m_c, &p_c);
+      Jjoint.setZero();
+      pinocchio::getJointJacobian(
+          model, data, joint, pinocchio::LOCAL_WORLD_ALIGNED, Jjoint);
+      const Vec3 z = Jjoint.block<3, 1>(3, iv);
+      const Vec3 p_j = data.oMi[joint].translation();
+      if (m_c > 1e-12 && M > 1e-12) {
+        cached_jcom.col(i) = (m_c / M) * z.cross(p_c - p_j);
+      }
+    }
+    jcom_ready = true;
+    return cached_jcom;
+  }
+
+  void ensure_mdiag(const Vec18& q18) const {
+    ensure_fk(q18);
+    if (mdiag_ready) {
+      return;
+    }
+    // LOCAL CRBA writes M. It does not replace oMi. data.J is left as the last
+    // computeJointJacobians wrote it; jacobian_pos() after this must still match.
+    pinocchio::crba(model, data, q_pin);
+    for (int i = 0; i < kNDof; ++i) {
+      const int iv = idx_v[static_cast<std::size_t>(i)];
+      cached_mdiag[i] = std::max(data.M(iv, iv), 0.0);
+    }
+    mdiag_ready = true;
+    ++n_crba;
   }
 
   Mat6x18 extract_spatial(pinocchio::FrameIndex fid, const Vec3* p_local) const {
@@ -185,55 +287,42 @@ Mat3x18 Kinematics::jacobian_pos(const Vec18& q18, std::string_view link) const 
 
 InertialQuantities Kinematics::inertial_quantities(const Vec18& q18) const {
   Impl& im = *impl_;
-  im.update_fk_jac(q18);
+  im.ensure_jac(q18);
   InertialQuantities out;
-  Vec3 s = Vec3::Zero();
-  for (pinocchio::JointIndex j = 0; j < im.model.inertias.size(); ++j) {
-    const double m = im.model.inertias[j].mass();
-    if (m <= 0.0) {
-      continue;
-    }
-    s += m * im.body_com_world(j);
-  }
-  const double M = im.total_mass;
-  if (M > 1e-12) {
-    out.p_com = s / M;
-  }
-
-  for (int i = 0; i < kNDof; ++i) {
-    const pinocchio::JointIndex jid = im.jid[static_cast<std::size_t>(i)];
-    const int iv = im.idx_v[static_cast<std::size_t>(i)];
-    double m_c = 0.0;
-    Vec3 p_c = Vec3::Zero();
-    im.subtree_mass_com(jid, &m_c, &p_c);
-    im.Jjoint.setZero();
-    pinocchio::getJointJacobian(
-        im.model, im.data, jid, pinocchio::LOCAL_WORLD_ALIGNED, im.Jjoint);
-    const Vec3 z = im.Jjoint.block<3, 1>(3, iv);
-    const Vec3 p_j = im.data.oMi[jid].translation();
-    if (m_c > 1e-12 && M > 1e-12) {
-      out.J_com.col(i) = (m_c / M) * z.cross(p_c - p_j);
-    }
-  }
-
-  pinocchio::crba(im.model, im.data, im.q_pin);
-  for (int i = 0; i < kNDof; ++i) {
-    const int iv = im.idx_v[static_cast<std::size_t>(i)];
-    out.mdiag[i] = std::max(im.data.M(iv, iv), 0.0);
-  }
+  out.p_com = im.com_cached();
+  out.J_com = im.jcom_cached();
+  im.ensure_mdiag(q18);
+  out.mdiag = im.cached_mdiag;
   return out;
 }
 
 Vec3 Kinematics::com(const Vec18& q18) const {
-  return inertial_quantities(q18).p_com;
+  impl_->ensure_fk(q18);
+  return impl_->com_cached();
 }
 
 Mat3x18 Kinematics::jacobian_com(const Vec18& q18) const {
-  return inertial_quantities(q18).J_com;
+  impl_->ensure_jac(q18);
+  return impl_->jcom_cached();
 }
 
 Vec18 Kinematics::mass_matrix_diag(const Vec18& q18) const {
-  return inertial_quantities(q18).mdiag;
+  impl_->ensure_mdiag(q18);
+  return impl_->cached_mdiag;
+}
+
+KinEvalStats Kinematics::kin_eval_stats() const {
+  KinEvalStats stats;
+  stats.fk_updates = impl_->n_fk;
+  stats.jac_updates = impl_->n_jac;
+  stats.crba_updates = impl_->n_crba;
+  return stats;
+}
+
+void Kinematics::reset_kin_eval_stats() const {
+  impl_->n_fk = 0;
+  impl_->n_jac = 0;
+  impl_->n_crba = 0;
 }
 
 double Kinematics::inertia_lambda(const Vec18& q18, double r_arm) const {

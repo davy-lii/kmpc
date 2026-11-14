@@ -1432,34 +1432,41 @@ class KmpcNode : public rclcpp::Node {
         const bool current=kmpc::line_async_plan_matches_live(
             pending,target.generation,is_left,result.command.waist_locked,
             target.xyz,target.quat_xyzw,q0);
-        if(current && !tracker_->line_refused()) {
-          // Start is always the live robot — no start-mismatch refuse/check.
-          // Keep target; progress forward only. Sync QP s0 anchor (line_reference)
-          // to the same live joints so Mode B x=0 stays feasible (r38 s0_step_j1).
+        bool adopt_plan = current && !tracker_->line_refused();
+        if(adopt_plan) {
+          // Snapping the certified start is a new curve. If the live joints
+          // leave the certificate, drop this package and plan again.
           if(plan.on && !plan.samples.empty() && q_meas && q_meas->allFinite()) {
-            plan.samples.front() = *q_meas;
-            tracker_->set_line_reference(*q_meas);
-            const auto start_pose=kin_->fk(*q_meas,plan.frame);
-            std::lock_guard<std::mutex> lock(stream_mu_);
-            reset_interpolator_to(*q_meas);
-            stream_geo_start_=start_pose.col(3).head<3>();stream_geo_target_=plan.target;
-            stream_geo_quat0_=kmpc::rot_to_quat_xyzw(start_pose.block<3,3>(0,0));
-            stream_geo_quat1_=plan.quat;stream_geo_ori_=plan.ori_on;stream_geo_frame_=plan.frame;
-            stream_geo_previous_=0.0;stream_line_fault_.clear();
-            const double pitch=q_meas->head<3>().sum();
-            const double limit=cfg_.params.torso_pitch_max_deg*kmpc::kPi/180;
-            const double excess=std::max(0.0,std::abs(pitch)-limit);
-            stream_pitch_recovery_=limit>0 && excess>1e-6;
-            stream_pitch_direction_=pitch<0?-1.0:1.0;
-            stream_pitch_initial_=stream_pitch_previous_=excess; stream_pitch_ticks_=0;
-            kmpc::Vec18 budget=kmpc::Vec18::Zero();budget[0]=excess;
-            stream_pitch_filter_.reset(budget);
+            if(!tracker_->recertify_line_start(plan, *q_meas)) {
+              adopt_plan = false;
+              ++line_plan_discards_;
+            } else {
+              plan.samples.front() = *q_meas;
+              tracker_->set_line_reference(*q_meas);
+              const auto start_pose=kin_->fk(*q_meas,plan.frame);
+              std::lock_guard<std::mutex> lock(stream_mu_);
+              reset_interpolator_to(*q_meas);
+              stream_geo_start_=start_pose.col(3).head<3>();stream_geo_target_=plan.target;
+              stream_geo_quat0_=kmpc::rot_to_quat_xyzw(start_pose.block<3,3>(0,0));
+              stream_geo_quat1_=plan.quat;stream_geo_ori_=plan.ori_on;stream_geo_frame_=plan.frame;
+              stream_geo_previous_=0.0;stream_line_fault_.clear();
+              const double pitch=q_meas->head<3>().sum();
+              const double limit=cfg_.params.torso_pitch_max_deg*kmpc::kPi/180;
+              const double excess=std::max(0.0,std::abs(pitch)-limit);
+              stream_pitch_recovery_=limit>0 && excess>1e-6;
+              stream_pitch_direction_=pitch<0?-1.0:1.0;
+              stream_pitch_initial_=stream_pitch_previous_=excess; stream_pitch_ticks_=0;
+              kmpc::Vec18 budget=kmpc::Vec18::Zero();budget[0]=excess;
+              stream_pitch_filter_.reset(budget);
+            }
           }
-          if(plan.candidate=="reverse_cache" || plan.candidate=="qa_seed" ||
-             plan.reverse_decision.rfind("rejected_",0)==0) {
-            tracker_->clear_last_line_cache();
+          if(adopt_plan) {
+            if(plan.candidate=="reverse_cache" || plan.candidate=="qa_seed" ||
+               plan.reverse_decision.rfind("rejected_",0)==0) {
+              tracker_->clear_last_line_cache();
+            }
+            tracker_->adopt_line(std::move(plan));
           }
-          tracker_->adopt_line(std::move(plan));
         } else if(!current) {++line_plan_discards_;}
       }
       if(tracker_->line_needs_build(is_left,target.xyz,&target.quat_xyzw)) {
@@ -2447,6 +2454,10 @@ class KmpcNode : public rclcpp::Node {
         " cascade=" + (tracker_->line_cascade_checked()?(tracker_->line_cascade_passed()?"passed":"failed"):"not_provided") +
         " forced_waist=" + std::to_string(tracker_->line_cascade_forced_waist()) +
         " cascade_full_body=" + std::to_string(tracker_->line_cascade_full_body()) +
+        " planner=" +
+        std::string(tracker_->line_candidate()=="unified_multistage"
+                        ? "unified_multistage"
+                        : "none") +
         " line_candidate=" + (tracker_->line_candidate().empty()?"none":tracker_->line_candidate()) +
         " pose_report=" + (tracker_->line_pose_report().empty()?"none":tracker_->line_pose_report()) +
         " line_waist_locked=" + std::string(tracker_->line_waist_locked() ? "True" : "False") +
