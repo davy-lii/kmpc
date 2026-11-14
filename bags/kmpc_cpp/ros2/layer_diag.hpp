@@ -1,6 +1,7 @@
 #pragma once
-// 阶段 A 分层诊断。热路径只往预分配 SPSC 里写固定样本。
+// 分层诊断。热路径只往预分配 SPSC 里写固定样本。
 // JSONL 只给导出线程/测试用，禁止在 250Hz 回调里调用 format。
+// schema 2：跨层 tick_id + s_dot/solve/commit/nominal/pre/proj（P0 可归因）。
 
 #include <atomic>
 #include <chrono>
@@ -23,6 +24,8 @@ enum class LayerDiagLayer : uint8_t {
   FinalSend = 5,
   Feedback = 6,
   SdkStatus = 7,
+  StreamCommit = 8,
+  ShadowCand = 9,
 };
 
 inline const char* layer_diag_name(LayerDiagLayer layer) {
@@ -35,6 +38,8 @@ inline const char* layer_diag_name(LayerDiagLayer layer) {
     case LayerDiagLayer::FinalSend: return "final_send";
     case LayerDiagLayer::Feedback: return "Feedback";
     case LayerDiagLayer::SdkStatus: return "sdk_status";
+    case LayerDiagLayer::StreamCommit: return "stream_commit";
+    case LayerDiagLayer::ShadowCand: return "shadow_cand";
   }
   return "unknown";
 }
@@ -43,12 +48,14 @@ inline LayerDiagLayer layer_diag_next(LayerDiagLayer layer) {
   switch (layer) {
     case LayerDiagLayer::Build: return LayerDiagLayer::FollowQp;
     case LayerDiagLayer::FollowQp: return LayerDiagLayer::FollowCommit;
-    case LayerDiagLayer::FollowCommit: return LayerDiagLayer::StreamRawRef;
+    case LayerDiagLayer::FollowCommit: return LayerDiagLayer::StreamCommit;
+    case LayerDiagLayer::StreamCommit: return LayerDiagLayer::StreamRawRef;
     case LayerDiagLayer::StreamRawRef: return LayerDiagLayer::LineSmoother;
     case LayerDiagLayer::LineSmoother: return LayerDiagLayer::FinalSend;
     case LayerDiagLayer::FinalSend: return LayerDiagLayer::Feedback;
     case LayerDiagLayer::Feedback: return LayerDiagLayer::Feedback;
     case LayerDiagLayer::SdkStatus: return LayerDiagLayer::SdkStatus;
+    case LayerDiagLayer::ShadowCand: return LayerDiagLayer::Build;
   }
   return layer;
 }
@@ -56,6 +63,7 @@ inline LayerDiagLayer layer_diag_next(LayerDiagLayer layer) {
 // mono_ns / recv_mono_ns：steady_clock 自纪元起的纳秒，不是 Unix 时间。
 // source_stamp_ns：消息 header 的 Unix 纳秒；没有传感器时间戳时为 -1。
 // 不能把节点 now() 填进 source_stamp_ns。
+// tick_id：同一 50 Hz 控制拍在规划/QP/commit/250 Hz 出口共用；各层 seq 仍可独立。
 struct LayerDiagSample {
   uint64_t mono_ns = 0;
   int64_t source_stamp_ns = -1;
@@ -63,14 +71,33 @@ struct LayerDiagSample {
   uint64_t run_id = 0;
   uint64_t goal_generation = 0;
   uint64_t seq = 0;
+  uint64_t tick_id = 0;
   uint32_t line_gen = 0;
   uint32_t drops_before = 0;
   LayerDiagLayer layer = LayerDiagLayer::Build;
   LayerDiagLayer next_layer = LayerDiagLayer::FollowQp;
   double prog = 0.0;
+  double s_dot = 0.0;
+  double solve_us = 0.0;
+  double commit_scale = 1.0;
+  double qp_dx_norm = 0.0;
+  double dq_proj_max = 0.0;
+  uint8_t qp_mode = 0;  // 0=A current, 1=B direct+hard, 2=C min-correction
+  uint8_t field_mask = 0;
   double q[kNDof]{};
+  double q_nominal[kNDof]{};
+  double q_pre[kNDof]{};
   char note[48]{};
 };
+
+// field_mask bits
+inline constexpr uint8_t kLayerDiagHasSDot = 1u << 0;
+inline constexpr uint8_t kLayerDiagHasSolve = 1u << 1;
+inline constexpr uint8_t kLayerDiagHasScale = 1u << 2;
+inline constexpr uint8_t kLayerDiagHasNominal = 1u << 3;
+inline constexpr uint8_t kLayerDiagHasPre = 1u << 4;
+inline constexpr uint8_t kLayerDiagHasProj = 1u << 5;
+inline constexpr uint8_t kLayerDiagHasQpMode = 1u << 6;
 
 inline uint64_t layer_diag_mono_ns() {
   return static_cast<uint64_t>(
@@ -91,6 +118,21 @@ inline void layer_diag_copy_q(LayerDiagSample* sample, const Vec18& q) {
   for (int i = 0; i < kNDof; ++i) {
     sample->q[i] = q[i];
   }
+}
+
+inline void layer_diag_copy_nominal(LayerDiagSample* sample, const Vec18& q) {
+  for (int i = 0; i < kNDof; ++i) {
+    sample->q_nominal[i] = q[i];
+  }
+  sample->field_mask =
+      static_cast<uint8_t>(sample->field_mask | kLayerDiagHasNominal);
+}
+
+inline void layer_diag_copy_pre(LayerDiagSample* sample, const Vec18& q) {
+  for (int i = 0; i < kNDof; ++i) {
+    sample->q_pre[i] = q[i];
+  }
+  sample->field_mask = static_cast<uint8_t>(sample->field_mask | kLayerDiagHasPre);
 }
 
 // 单写单读。满了丢新样本并累加 drops，写者不等待读者。
@@ -142,22 +184,55 @@ class LayerDiagQueue {
   std::atomic<uint64_t> drops_{0};
 };
 
+inline void layer_diag_append_q_array(
+    char* buf, size_t cap, int* n, const char* key, const double* q) {
+  int used = std::snprintf(
+      buf + *n, cap - static_cast<size_t>(*n), ",\"%s\":[", key);
+  if (used < 0 || static_cast<size_t>(*n + used) >= cap) {
+    *n = -1;
+    return;
+  }
+  *n += used;
+  for (int i = 0; i < kNDof; ++i) {
+    used = std::snprintf(
+        buf + *n, cap - static_cast<size_t>(*n), "%s%.9g",
+        (i == 0 ? "" : ","), q[i]);
+    if (used < 0 || static_cast<size_t>(*n + used) >= cap) {
+      *n = -1;
+      return;
+    }
+    *n += used;
+  }
+  used = std::snprintf(buf + *n, cap - static_cast<size_t>(*n), "]");
+  if (used < 0 || static_cast<size_t>(*n + used) >= cap) {
+    *n = -1;
+    return;
+  }
+  *n += used;
+}
+
 inline std::string layer_diag_jsonl(const LayerDiagSample& sample) {
-  char buf[2048];
+  char buf[4096];
   int n = std::snprintf(
       buf, sizeof(buf),
-      "{\"schema\":1,\"run_id\":%llu,\"goal_generation\":%llu,\"seq\":%llu,"
-      "\"line_gen\":%u,\"layer\":\"%s\",\"next_layer\":\"%s\","
+      "{\"schema\":2,\"run_id\":%llu,\"goal_generation\":%llu,\"seq\":%llu,"
+      "\"tick_id\":%llu,\"line_gen\":%u,\"layer\":\"%s\",\"next_layer\":\"%s\","
       "\"mono_ns\":%llu,\"source_stamp_ns\":%lld,\"recv_mono_ns\":%llu,"
-      "\"drops_before\":%u,\"prog\":%.9g,\"note\":\"%s\",\"q\":[",
+      "\"drops_before\":%u,\"prog\":%.9g,\"s_dot\":%.9g,\"solve_us\":%.9g,"
+      "\"commit_scale\":%.9g,\"qp_dx_norm\":%.9g,\"dq_proj_max\":%.9g,"
+      "\"qp_mode\":%u,\"field_mask\":%u,\"note\":\"%s\",\"q\":[",
       static_cast<unsigned long long>(sample.run_id),
       static_cast<unsigned long long>(sample.goal_generation),
-      static_cast<unsigned long long>(sample.seq), sample.line_gen,
+      static_cast<unsigned long long>(sample.seq),
+      static_cast<unsigned long long>(sample.tick_id), sample.line_gen,
       layer_diag_name(sample.layer), layer_diag_name(sample.next_layer),
       static_cast<unsigned long long>(sample.mono_ns),
       static_cast<long long>(sample.source_stamp_ns),
       static_cast<unsigned long long>(sample.recv_mono_ns), sample.drops_before,
-      sample.prog, sample.note);
+      sample.prog, sample.s_dot, sample.solve_us, sample.commit_scale,
+      sample.qp_dx_norm, sample.dq_proj_max,
+      static_cast<unsigned>(sample.qp_mode),
+      static_cast<unsigned>(sample.field_mask), sample.note);
   if (n < 0 || static_cast<size_t>(n) >= sizeof(buf)) {
     return {};
   }
@@ -170,8 +245,28 @@ inline std::string layer_diag_jsonl(const LayerDiagSample& sample) {
     }
     n += used;
   }
-  const int tail = std::snprintf(
-      buf + n, sizeof(buf) - static_cast<size_t>(n), "]}");
+  {
+    const int used =
+        std::snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n), "]");
+    if (used < 0 || static_cast<size_t>(n + used) >= sizeof(buf)) {
+      return {};
+    }
+    n += used;
+  }
+  if (sample.field_mask & kLayerDiagHasNominal) {
+    layer_diag_append_q_array(buf, sizeof(buf), &n, "q_nominal", sample.q_nominal);
+    if (n < 0) {
+      return {};
+    }
+  }
+  if (sample.field_mask & kLayerDiagHasPre) {
+    layer_diag_append_q_array(buf, sizeof(buf), &n, "q_pre", sample.q_pre);
+    if (n < 0) {
+      return {};
+    }
+  }
+  const int tail =
+      std::snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n), "}");
   if (tail < 0 || static_cast<size_t>(n + tail) >= sizeof(buf)) {
     return {};
   }
@@ -179,15 +274,16 @@ inline std::string layer_diag_jsonl(const LayerDiagSample& sample) {
 }
 
 inline std::string layer_diag_header_jsonl(uint64_t run_id) {
-  char buf[640];
+  char buf[768];
   std::snprintf(
       buf, sizeof(buf),
-      "{\"schema\":1,\"kind\":\"header\",\"run_id\":%llu,"
+      "{\"schema\":2,\"kind\":\"header\",\"run_id\":%llu,"
       "\"mono_clock\":\"steady_clock_epoch_ns\","
       "\"source_stamp\":\"header_unix_ns_or_-1\","
       "\"recv_clock\":\"steady_clock_epoch_ns\","
+      "\"tick_id\":\"shared_50hz_control_tick\","
       "\"gaps\":[\"imu_not_subscribed\",\"sdk_queue_depth_not_visible\","
-      "\"stream_status_has_no_goal_generation\"]}",
+      "\"stream_status_has_no_goal_generation\",\"dynamic_tipover_unproven\"]}",
       static_cast<unsigned long long>(run_id));
   return std::string(buf);
 }
@@ -196,7 +292,7 @@ inline std::string layer_diag_overflow_jsonl(uint64_t run_id, uint64_t drops) {
   char buf[192];
   std::snprintf(
       buf, sizeof(buf),
-      "{\"schema\":1,\"kind\":\"overflow\",\"run_id\":%llu,\"drops\":%llu}",
+      "{\"schema\":2,\"kind\":\"overflow\",\"run_id\":%llu,\"drops\":%llu}",
       static_cast<unsigned long long>(run_id),
       static_cast<unsigned long long>(drops));
   return std::string(buf);
@@ -219,7 +315,7 @@ inline std::string config_snapshot_json(
   char head[192];
   std::snprintf(
       head, sizeof(head),
-      "{\"schema\":1,\"kind\":\"effective_config\",\"run_id\":%llu,\"git_sha\":\"%s\",\"rows\":[",
+      "{\"schema\":2,\"kind\":\"effective_config\",\"run_id\":%llu,\"git_sha\":\"%s\",\"rows\":[",
       static_cast<unsigned long long>(run_id), git_sha.c_str());
   out += head;
   for (size_t i = 0; i < rows.size(); ++i) {

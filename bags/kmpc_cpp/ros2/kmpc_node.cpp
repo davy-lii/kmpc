@@ -39,6 +39,9 @@
 #include "kmpc/cartesian_tracker.hpp"
 #include "kmpc/config.hpp"
 #include "kmpc/kinematics.hpp"
+#include "kmpc/line_async_handoff.hpp"
+#include "kmpc/line_final_gate.hpp"
+#include "kmpc/qp_fail_dump_worker.hpp"
 #include "kmpc/safety.hpp"
 #include "kmpc/stream_interpolator.hpp"
 #include "kmpc/tracker_math.hpp"
@@ -170,6 +173,11 @@ class KmpcNode : public rclcpp::Node {
     }
     stream_kin_=std::make_unique<kmpc::Kinematics>(line_urdf_source_,
         line_urdf_xml_?kmpc::Kinematics::UrdfInput::Xml:kmpc::Kinematics::UrdfInput::Path);
+    // Dedicated plan-worker model: load URDF once. Re-parsing Pinocchio on every
+    // std::async plan cost ~1s wall on robot03 while line_build_ms only timed the
+    // fit (~100ms). One async line_future_ at a time → no cross-thread use.
+    line_plan_kin_=std::make_unique<kmpc::Kinematics>(line_urdf_source_,
+        line_urdf_xml_?kmpc::Kinematics::UrdfInput::Xml:kmpc::Kinematics::UrdfInput::Path);
     stream_guards_=std::make_unique<kmpc::WholeBodyGuards>(cfg_.params,cfg_.q_pref[kmpc::kIdxYaw]);
     tracker_ = std::make_unique<kmpc::CartesianTracker>(*kin_, cfg_);
     planner_ = std::make_unique<kmpc::UpperPlanner>(
@@ -246,6 +254,36 @@ class KmpcNode : public rclcpp::Node {
           "line_qp_max_iter must be in [1,10000]");
     }
     line_qp_max_iter_ = tracker_->line_qp_max_iter();
+    {
+      const std::string mode_text = str_or("line_qp_follow_mode", "A");
+      kmpc::LineQpFollowMode mode = kmpc::LineQpFollowMode::A;
+      if (!kmpc::parse_line_qp_follow_mode(mode_text, &mode)) {
+        throw kmpc::ConfigError(
+            "line_qp_follow_mode must be A|B|C (current|direct|min_correction)");
+      }
+      line_qp_follow_mode_ = mode;
+      tracker_->set_line_qp_follow_mode(mode);
+    }
+    {
+      // P02: default NewUnified (offline suite covers it); FIR mean deleted.
+      const std::string profile_text =
+          str_or("line_chain_profile", "new_unified");
+      kmpc::CartesianTracker::LineChainProfile profile =
+          kmpc::CartesianTracker::LineChainProfile::Legacy;
+      if (profile_text == "new_unified" || profile_text == "NewUnified") {
+        profile = kmpc::CartesianTracker::LineChainProfile::NewUnified;
+      } else if (profile_text != "legacy" && profile_text != "Legacy") {
+        throw kmpc::ConfigError(
+            "line_chain_profile must be legacy|new_unified");
+      }
+      line_chain_profile_ = profile;
+      tracker_->set_line_chain_profile(profile);
+      if (profile == kmpc::CartesianTracker::LineChainProfile::NewUnified) {
+        line_qp_follow_mode_ = tracker_->line_qp_follow_mode();
+        line_pace_mode_ = tracker_->line_pace_mode();
+      }
+    }
+    final_gate_limits_ = kmpc::make_final_gate_limits(cfg_);
     line_pose_pref_enable_ = bool_param("line_pose_pref_enable", false);
     tracker_->set_line_pose_pref(line_pose_pref_enable_);
     tracker_->set_line_pose_pref_q(cfg_.q_pref);
@@ -262,17 +300,27 @@ class KmpcNode : public rclcpp::Node {
     line_direction_strict_enable_ =
         bool_param("line_direction_strict_enable", true);
     tracker_->set_line_direction_strict_enable(line_direction_strict_enable_);
+    line_shadow_diag_enable_ = bool_param("line_shadow_diag_enable", true);
+    tracker_->set_line_shadow_diag_enable(line_shadow_diag_enable_);
     line_diag_enable_ = bool_param("line_diag_enable", false);
     tracker_->set_line_diag_enable(line_diag_enable_);
+    // Node stream path must confirm/abort explicitly; never auto-confirm.
+    tracker_->set_line_commit_requires_stream(true);
     run_id_ = kmpc::ros2io::layer_diag_mono_ns();
     tracker_->set_line_diag_run_id(run_id_);
     layer_diag_path_ = str_or("layer_diag_path", "");
+    // Must be on a path the kmpc container can write (ljw is not bind-mounted).
     qp_fail_dump_dir_ = str_or(
-        "qp_fail_dump_dir", "/home/nvidia/ljw/issues/kmpc/qp_fail_dumps");
+        "qp_fail_dump_dir",
+        "/home/nvidia/workspaces/kmpc/qp_fail_dumps");
     config_snapshot_path_ = str_or("config_snapshot_path", "");
     t0_ = now().seconds();
     configure_command_io();
     stream_topic_name_ = str_or("stream_topic", "/xoip/robot/multi_joint_servo_cmd");
+    // Timer only schedules; ofstream runs on a detached writer thread.
+    qp_fail_dump_timer_ = create_wall_timer(
+        std::chrono::milliseconds(100),
+        std::bind(&KmpcNode::schedule_qp_fail_dump, this));
 
 #ifdef KMPC_HAVE_XOIP
     servo_pub_ = create_publisher<xoip_ros2::msg::MultiJointServoCommand>(
@@ -503,6 +551,8 @@ class KmpcNode : public rclcpp::Node {
     if (layer_diag_on_) {
       drain_layer_diag();
     }
+    // Join dump worker before destroying this / mutexes.
+    qp_dump_worker_.stop_join();
   }
 
  private:
@@ -534,15 +584,19 @@ class KmpcNode : public rclcpp::Node {
         kmpc::CartesianTracker::line_brake_profile_name(
             kmpc::CartesianTracker::kDefaultLineBrakeProfile));
     declare_parameter("line_qp_max_iter", 200);
+    declare_parameter<std::string>("line_qp_follow_mode", "A");
+    declare_parameter<std::string>("line_chain_profile", "new_unified");
     declare_parameter("line_pose_pref_enable", false);
     declare_parameter("line_pitch_straighten_enable", true);
     declare_parameter("line_qp_pitch_monotonic_enable", true);
     declare_parameter("reverse_last_line_enable", true);
     declare_parameter("line_direction_strict_enable", true);
+    declare_parameter("line_shadow_diag_enable", true);
     declare_parameter("line_diag_enable", false);
     declare_parameter<std::string>("layer_diag_path", "");
     declare_parameter<std::string>(
-        "qp_fail_dump_dir", "/home/nvidia/ljw/issues/kmpc/qp_fail_dumps");
+        "qp_fail_dump_dir",
+        "/home/nvidia/workspaces/kmpc/qp_fail_dumps");
     declare_parameter<std::string>("config_snapshot_path", "");
     declare_parameter("stream_hz", 250.0);
     declare_parameter("interp_catch_s", 0.02);
@@ -635,28 +689,21 @@ class KmpcNode : public rclcpp::Node {
   // stream_mu_ protects this model and its geometry; no Pinocchio data is
   // shared with the 50 Hz controller or the asynchronous geometry worker.
   const char* stream_filtered_fault(const kmpc::Vec18& q, double pitch_extra) {
-    if(!q.allFinite()) return "stream_filtered_nonfinite";
-    if((q.array()<cfg_.limits.q_min.array()+cfg_.params.q_limit_margin-1e-7).any() ||
-       (q.array()>cfg_.limits.q_max.array()-cfg_.params.q_limit_margin+1e-7).any()) return "stream_filtered_joint_limit";
-    const double limit=cfg_.params.torso_pitch_max_deg*kmpc::kPi/180;
-    // Ordinary final gate: hard + recovery extra + round eps only.
-    // Never add kStartPitchAdmitRad here — that admit is for start-outside
-    // recovery / validate residue, not a permanent 250 Hz widen.
-    if(limit>0 &&
-       std::abs(q.head<3>().sum())>
-           limit+pitch_extra+kmpc::kPitchRoundEpsRad) {
-      return "stream_filtered_pitch";
+    kmpc::LineFinalGateGeo geo;
+    geo.start = stream_geo_start_;
+    geo.target = stream_geo_target_;
+    geo.quat0 = stream_geo_quat0_;
+    geo.quat1 = stream_geo_quat1_;
+    geo.frame = stream_geo_frame_;
+    geo.ori_on = stream_geo_ori_;
+    geo.previous_along = stream_geo_previous_;
+    const char* fault = kmpc::line_final_filtered_fault(
+        q, pitch_extra, final_gate_limits_, *stream_kin_, *stream_guards_,
+        &geo);
+    if (fault == nullptr) {
+      stream_geo_previous_ = geo.previous_along;
     }
-    if(!stream_guards_->com_xy_inside(stream_kin_->com(q))) return "stream_filtered_com";
-    const auto pose=stream_kin_->fk(q,stream_geo_frame_);
-    const kmpc::Vec3 ab=stream_geo_target_-stream_geo_start_;
-    const double along=(pose.col(3).head<3>()-stream_geo_start_).dot(ab);
-    const double t=std::clamp(along/std::max(ab.squaredNorm(),1e-12),0.0,1.0);
-    if((pose.col(3).head<3>()-stream_geo_start_-t*ab).norm()>.003) return "stream_filtered_path";
-    if(along<stream_geo_previous_-1e-6*std::max(ab.norm(),1e-6)) return "stream_filtered_progress";
-    if(stream_geo_ori_ && kmpc::ori_error_xyzw(kmpc::quat_slerp_xyzw(stream_geo_quat0_,stream_geo_quat1_,t),
-       kmpc::rot_to_quat_xyzw(pose.block<3,3>(0,0))).norm()>cfg_.params.arrived_ori_rad+1e-6) return "stream_filtered_orientation";
-    stream_geo_previous_=along;return nullptr;
+    return fault;
   }
 
   // Precondition: stream_mu_ held. Copy only; caller publishes unlocked.
@@ -682,6 +729,16 @@ class KmpcNode : public rclcpp::Node {
       *q_out = stream_q_hold_;
     } else if (stream_line_) {
       const double qp_dt = std::max(cfg_.params.dt, 1e-3);
+      // Arm a queued chord only after the active chord reaches its endpoint.
+      // Mid-chord rebase was the source of the exact 5/6 commit_scale stutter.
+      if (stream_chord_pending_ && stream_line_u_ >= 1.0 - 1e-15) {
+        stream_line_from_ = stream_line_to_;
+        stream_line_to_ = stream_chord_pending_to_;
+        stream_line_u_ = 0.0;
+        stream_raw_ref_ = stream_line_from_;
+        stream_chord_pending_ = false;
+        ++stream_chord_queue_arms_;
+      }
       stream_line_u_ += interp_dt_ / qp_dt;
       if (stream_line_u_ > 1.0) {
         stream_line_u_ = 1.0;
@@ -690,7 +747,9 @@ class KmpcNode : public rclcpp::Node {
       stream_raw_ref_=(1.0-u)*stream_line_from_+u*stream_line_to_;
       double extra=0;
       const char* fault=nullptr;
+      bool pitch_recovery_tick=false;
       if(stream_pitch_recovery_) {
+        pitch_recovery_tick=true;
         const double limit=cfg_.params.torso_pitch_max_deg*kmpc::kPi/180;
         const double excess=std::max(0.0,stream_pitch_direction_*stream_raw_ref_.head<3>().sum()-limit);
         if(excess>stream_pitch_previous_+1e-7 || excess>stream_pitch_initial_+1e-7) fault="stream_pitch_recovery_regressed";
@@ -701,8 +760,9 @@ class KmpcNode : public rclcpp::Node {
         if(excess<=1e-9 && extra<=1e-9) stream_pitch_recovery_=false;
       }
       const kmpc::Vec18 filtered=line_smoother_.push(stream_raw_ref_,interp_dt_);
+      const uint32_t line_gen =
+          stream_line_gen_ < 0 ? 0u : static_cast<uint32_t>(stream_line_gen_);
       if (layer_diag_on_) {
-        const uint32_t line_gen = stream_line_gen_ < 0 ? 0u : static_cast<uint32_t>(stream_line_gen_);
         push_stream_diag(kmpc::ros2io::LayerDiagLayer::StreamRawRef, stream_raw_ref_,
                          stream_goal_gen_, line_gen, "raw", 0, false);
         push_stream_diag(kmpc::ros2io::LayerDiagLayer::LineSmoother, filtered,
@@ -711,21 +771,37 @@ class KmpcNode : public rclcpp::Node {
       if(!fault) fault=stream_filtered_fault(filtered,extra);
       // Final-send hard gate: never publish a waist/pitch reversal vs the
       // accepted direction contract, even if raw/QP were monotone.
+      // Exception: active pitch recovery must be allowed to move frozen waist /
+      // pitch toward the hard box (r32 hold: freeze gate canceled QP recovery).
+      // Re-anchor on the clearing tick too — old extrema would false-fail.
       if(!fault && line_direction_strict_enable_ && stream_dir_env_.active) {
-        // Probe without mutating envelope until commit succeeds.
-        kmpc::DirectionEnvelope probe_env=stream_dir_env_;
-        const auto dir=kmpc::direction_envelope_accept(&probe_env,filtered);
-        if(!dir.ok) {
-          fault="final_send_direction_violation";
-          stream_line_fault_=std::string(fault)+";"+dir.reason;
+        if(pitch_recovery_tick) {
+          stream_dir_env_.last_q=filtered;
+          stream_dir_env_.last_pitch=filtered.head<3>().sum();
+          stream_dir_env_.extremum[0]=filtered[0];
+          stream_dir_env_.extremum[1]=filtered[1];
+          stream_dir_env_.extremum[2]=filtered[2];
+          stream_dir_env_.extremum[3]=stream_dir_env_.last_pitch;
         } else {
-          stream_dir_env_=probe_env;
+          // Probe without mutating envelope until commit succeeds.
+          kmpc::DirectionEnvelope probe_env=stream_dir_env_;
+          const auto dir=kmpc::direction_envelope_accept(&probe_env,filtered);
+          if(!dir.ok) {
+            fault="final_send_direction_violation";
+            stream_line_fault_=std::string(fault)+";"+dir.reason;
+          } else {
+            stream_dir_env_=probe_env;
+          }
         }
       }
       if(fault) {
         RCLCPP_ERROR(get_logger(),"line stream fault gen=%llu reason=%s pitch=%.9fdeg limit=%.9fdeg start_excess=%.9frad allowed_extra=%.9frad recovery_ticks=%d",
           static_cast<unsigned long long>(stream_line_gen_),fault,filtered.head<3>().sum()*180/kmpc::kPi,
           cfg_.params.torso_pitch_max_deg,stream_pitch_initial_,extra,stream_pitch_ticks_);
+        if (layer_diag_on_) {
+          push_stream_diag(kmpc::ros2io::LayerDiagLayer::FinalSend, filtered,
+                           stream_goal_gen_, line_gen, fault, 0, false);
+        }
         const kmpc::Vec18 hold=interpolator_.q_ref();
         stream_enter_hold(hold);
         if(stream_line_fault_.empty()) stream_line_fault_=fault;
@@ -777,17 +853,22 @@ class KmpcNode : public rclcpp::Node {
       bool send = false;
       uint64_t gen = 0;
       uint32_t line_gen = 0;
+      uint64_t tick_snap = 0;
       {
         std::lock_guard<std::mutex> lock(stream_mu_);
         send = stream_take_tick(&q);
         gen = stream_goal_gen_;
         line_gen = stream_line_gen_ < 0 ? 0u : static_cast<uint32_t>(stream_line_gen_);
+        // Snapshot tick with the accepted q under the same lock — do not reload
+        // stream_tick_id_ after unlock (50 Hz may have advanced it).
+        tick_snap = stream_segment_tick_;
       }
       if (send) {
         const uint64_t seq = publish_stream(q);
         if (layer_diag_on_) {
           push_stream_diag(kmpc::ros2io::LayerDiagLayer::FinalSend, q, gen, line_gen,
-                           "sent", seq, true);
+                           "sent", seq, true, 0.0, 1.0, 0, false, tick_snap,
+                           /*use_tick=*/true);
         }
         maybe_publish_debug_q(q);
       }
@@ -829,6 +910,7 @@ class KmpcNode : public rclcpp::Node {
     stream_fixed_ = false;
     stream_have_qp_ = false;
     stream_line_ = false;
+    stream_chord_pending_ = false;
     stream_pitch_recovery_ = false;
     kmpc::direction_envelope_reset(&stream_dir_env_);
     interpolator_.clear_q_star();
@@ -841,6 +923,7 @@ class KmpcNode : public rclcpp::Node {
     stream_hold_ = true;
     stream_fixed_ = true;
     stream_line_ = false;
+    stream_chord_pending_ = false;
     stream_q_hold_ = q;
     interpolator_.reset(q);
     stream_raw_ref_=q;line_smoother_.reset(q);
@@ -858,10 +941,17 @@ class KmpcNode : public rclcpp::Node {
       return;
     }
     const bool continuing=stream_line_;
+    // Queue the next chord until the active one finishes. Binding from a
+    // mid-chord sample made |new-mid|≈1.2·cap → exact scale 5/6 stutter.
+    const bool queue_until_end =
+        continuing && stream_line_u_ < 1.0 - 1e-9;
     stream_hold_ = false;
     stream_fixed_ = false;
-    stream_line_from_ = continuing?stream_raw_ref_:interpolator_.q_ref();
+    // Commit geometry is always anchored at the last accepted endpoint.
+    const kmpc::Vec18 commit_from =
+        continuing ? stream_line_to_ : interpolator_.q_ref();
     if(!continuing) {
+      stream_line_from_ = commit_from;
       stream_raw_ref_=stream_line_from_;
       line_smoother_.reset(stream_line_from_);
       if(line_direction_strict_enable_) {
@@ -874,31 +964,48 @@ class KmpcNode : public rclcpp::Node {
     }
     stream_line_gen_ = tracker_->line_gen();
     stream_goal_gen_ = tracker_->goal_generation();
+    // Bind tick to the accepted propose (not the latest control tick). 250 Hz
+    // still sending the previous segment must not inherit a new QP tick id.
+    stream_segment_tick_ = tracker_->line_commit_tick_id();
+    stream_tick_id_.store(stream_segment_tick_, std::memory_order_release);
+    const uint32_t line_gen =
+        stream_line_gen_ < 0 ? 0u : static_cast<uint32_t>(stream_line_gen_);
     const kmpc::Vec18 cap=tracker_->effective_dq_max()*cfg_.params.dt*line_dq_scale_;
+    auto push_commit=[&](const char* note, const kmpc::Vec18& q, double scale) {
+      push_stream_diag(kmpc::ros2io::LayerDiagLayer::StreamCommit, q,
+                       stream_goal_gen_, line_gen, note, 0, false,
+                       tracker_->line_progress(), scale,
+                       kmpc::ros2io::kLayerDiagHasScale,
+                       /*from_control_thread=*/true);
+    };
     // A genuinely invalid solve still fails. A valid solve can be slightly
     // longer than one tick relative to the reference advanced during solving.
     if (((q_path-planning_from).cwiseAbs().array()>cap.array()+1e-6).any()) {
-      for(int j=0;j<kmpc::kNDof;++j) if(std::abs(q_path[j]-stream_line_from_[j])>cap[j]+1e-6) {
+      for(int j=0;j<kmpc::kNDof;++j) if(std::abs(q_path[j]-commit_from[j])>cap[j]+1e-6) {
         RCLCPP_ERROR(get_logger(),"line step limit gen=%llu joint=%d delta=%.10g cap=%.10g planned_delta=%.10g reference_advance=%.10g",
-          static_cast<unsigned long long>(tracker_->goal_generation()),j,q_path[j]-stream_line_from_[j],cap[j],q_path[j]-planning_from[j],stream_line_from_[j]-planning_from[j]);
+          static_cast<unsigned long long>(tracker_->goal_generation()),j,q_path[j]-commit_from[j],cap[j],q_path[j]-planning_from[j],commit_from[j]-planning_from[j]);
       }
+      push_commit("reject_first_step", q_path, 0.0);
+      tracker_->abort_line_stream_commit();
       tracker_->refuse_line("stream_first_step_limit");
       stream_enter_hold(interpolator_.q_ref());
       return;
     }
-    const auto bounded=kmpc::ros2io::bound_line_stream_step(stream_line_from_,q_path,cap);
+    const auto bounded=kmpc::ros2io::bound_line_stream_step(commit_from,q_path,cap);
     if(!bounded) {
+      push_commit("reject_nonfinite", q_path, 0.0);
+      tracker_->abort_line_stream_commit();
       tracker_->refuse_line("stream_nonfinite_or_invalid_cap");
       stream_enter_hold(interpolator_.q_ref()); return;
     }
     line_commit_scale_=bounded->scale;
     line_commit_peak_ratio_=0.0;
     for(int j=0;j<kmpc::kNDof;++j) if(cap[j]>0.0)
-      line_commit_peak_ratio_=std::max(line_commit_peak_ratio_,std::abs(bounded->target[j]-stream_line_from_[j])/cap[j]);
+      line_commit_peak_ratio_=std::max(line_commit_peak_ratio_,std::abs(bounded->target[j]-commit_from[j])/cap[j]);
     if(line_commit_scale_<1.0-1e-9) ++line_limited_steps_;
     // Validate the actual chord after limiting; velocity, line tube and
     // forward progress remain acceptance conditions.
-    const auto check=tracker_->line_stream_segment_check(stream_line_from_,bounded->target);
+    const auto check=tracker_->line_stream_segment_check(commit_from,bounded->target);
     if(!check.ok) {
       const auto vec_csv=[](const kmpc::Vec18& q) {
         std::ostringstream out;
@@ -915,21 +1022,50 @@ class KmpcNode : public rclcpp::Node {
         static_cast<unsigned long long>(tracker_->goal_generation()),check.reason,
         check.sample_index,check.joint_margin_rad,check.com_margin_m,
         check.pitch_margin_rad,check.tube_margin_m,check.progress_margin_m,
-        (stream_line_from_-sent).cwiseAbs().maxCoeff(),
-        vec_csv(stream_line_from_).c_str(),vec_csv(bounded->target).c_str(),
+        (commit_from-sent).cwiseAbs().maxCoeff(),
+        vec_csv(commit_from).c_str(),vec_csv(bounded->target).c_str(),
         vec_csv(sent).c_str());
+      char reject_note[48];
+      std::snprintf(reject_note, sizeof(reject_note), "reject_%s", check.reason);
+      push_commit(reject_note, bounded->target, line_commit_scale_);
       // Preserve the concrete gate (pitch/tube/progress/…) — never collapse to
       // the historical stream_tube_or_progress alias that hid pitch hard-box stops.
+      tracker_->abort_line_stream_commit();
       tracker_->refuse_line(std::string("stream_") + check.reason);
       stream_enter_hold(interpolator_.q_ref());
       return;
     }
-    stream_line_ = true;
-    stream_line_to_ = bounded->target;
-    stream_line_u_ = 0.0;
     interpolator_.clear_q_star();
     interpolator_.clear_segment();
     interpolator_.set_stop_at_goal(false);
+    if (!tracker_->confirm_line_stream_commit(bounded->target,
+                                              line_commit_scale_)) {
+      // Progress mapping unknown — do not guess. Hold without arming stream.
+      const std::string why =
+          std::string("stream_progress_") + tracker_->last_progress_recover().reason;
+      push_commit(why.c_str(), bounded->target, line_commit_scale_);
+      tracker_->refuse_line(why);
+      stream_enter_hold(interpolator_.q_ref());
+      return;
+    }
+    tracker_->set_stream_commit_feedback_scale(line_commit_scale_);
+    if (queue_until_end) {
+      stream_chord_pending_ = true;
+      stream_chord_pending_to_ = bounded->target;
+      ++stream_chord_queue_waits_;
+      push_commit(line_commit_scale_ < 1.0 - 1e-9 ? "scale_queued" : "full_queued",
+                  bounded->target, line_commit_scale_);
+      return;
+    }
+    if (continuing) {
+      stream_line_from_ = stream_line_to_;
+    }
+    stream_line_ = true;
+    stream_line_to_ = bounded->target;
+    stream_line_u_ = 0.0;
+    stream_chord_pending_ = false;
+    push_commit(line_commit_scale_ < 1.0 - 1e-9 ? "scale" : "full",
+                bounded->target, line_commit_scale_);
     // q_ref is the filtered command; raw advancement is maintained separately.
   }
 
@@ -1268,9 +1404,14 @@ class KmpcNode : public rclcpp::Node {
           reset_interpolator_to(*q_meas);
         q0=interpolator_.q_ref();
         if(!stream_line_fault_.empty()) tracker_->refuse_line(stream_line_fault_);
-        // The next QP segment follows the last committed endpoint. Anchoring
-        // it to a moving mid-segment sample creates an alternating speed.
-        line_solve_from=(stream_line_ && !needs_build && !line_future_.valid())?stream_line_to_:q0;
+        // The next QP segment follows the last committed endpoint (including a
+        // queued-but-not-yet-armed chord). Mid-segment samples alternate speed.
+        if (stream_line_ && !needs_build && !line_future_.valid()) {
+          line_solve_from = stream_chord_pending_ ? stream_chord_pending_to_
+                                                  : stream_line_to_;
+        } else {
+          line_solve_from = q0;
+        }
         if(needs_build || line_future_.valid()) stream_enter_hold(q0);
       }
       tracker_->set_line_reference(line_solve_from);
@@ -1281,39 +1422,44 @@ class KmpcNode : public rclcpp::Node {
         kmpc::CartesianTracker::LineRun plan;
         try { plan=line_future_.get(); }
         catch(const std::exception&) { tracker_->refuse_line("line_worker_exception"); }
-        const bool current=line_pending_gen_==target.generation && line_pending_left_==is_left &&
-            (line_pending_xyz_-target.xyz).norm()<0.008 &&
-            kmpc::ori_error_xyzw(line_pending_quat_,target.quat_xyzw).norm()<kmpc::kTargetJumpOriRad &&
-            line_pending_waist_locked_==result.command.waist_locked &&
-            (q0-line_pending_q_).cwiseAbs().maxCoeff()<1e-9;
+        kmpc::LineAsyncPendingSeed pending;
+        pending.generation=line_pending_gen_;
+        pending.left=line_pending_left_;
+        pending.waist_locked=line_pending_waist_locked_;
+        pending.xyz=line_pending_xyz_;
+        pending.quat=line_pending_quat_;
+        pending.q_seed=line_pending_q_;
+        const bool current=kmpc::line_async_plan_matches_live(
+            pending,target.generation,is_left,result.command.waist_locked,
+            target.xyz,target.quat_xyzw,q0);
         if(current && !tracker_->line_refused()) {
-          const double moved=(*q_meas-line_pending_q_).cwiseAbs().maxCoeff();
-          if(moved>0.1*kmpc::kPi/180.0 && stream_mute_)
-            tracker_->refuse_line("line_start_moved_during_plan");
-          else {
-            if(plan.on && !plan.samples.empty()) {
-              const auto start_pose=kin_->fk(plan.samples.front(),plan.frame);
-              std::lock_guard<std::mutex> lock(stream_mu_);
-              stream_geo_start_=start_pose.col(3).head<3>();stream_geo_target_=plan.target;
-              stream_geo_quat0_=kmpc::rot_to_quat_xyzw(start_pose.block<3,3>(0,0));
-              stream_geo_quat1_=plan.quat;stream_geo_ori_=plan.ori_on;stream_geo_frame_=plan.frame;
-              stream_geo_previous_=0.0;stream_line_fault_.clear();
-              const double pitch=plan.samples.front().head<3>().sum();
-              const double limit=cfg_.params.torso_pitch_max_deg*kmpc::kPi/180;
-              const double excess=std::max(0.0,std::abs(pitch)-limit);
-              stream_pitch_recovery_=limit>0 && excess>1e-6;
-              stream_pitch_direction_=pitch<0?-1.0:1.0;
-              stream_pitch_initial_=stream_pitch_previous_=excess; stream_pitch_ticks_=0;
-              kmpc::Vec18 budget=kmpc::Vec18::Zero();budget[0]=excess;
-              stream_pitch_filter_.reset(budget);
-            }
-            // Worker cache mutations stay local; mirror consume/reject on main.
-            if(plan.candidate=="reverse_cache" || plan.candidate=="qa_seed" ||
-               plan.reverse_decision.rfind("rejected_",0)==0) {
-              tracker_->clear_last_line_cache();
-            }
-            tracker_->adopt_line(std::move(plan));
+          // Start is always the live robot — no start-mismatch refuse/check.
+          // Keep target; progress forward only. Sync QP s0 anchor (line_reference)
+          // to the same live joints so Mode B x=0 stays feasible (r38 s0_step_j1).
+          if(plan.on && !plan.samples.empty() && q_meas && q_meas->allFinite()) {
+            plan.samples.front() = *q_meas;
+            tracker_->set_line_reference(*q_meas);
+            const auto start_pose=kin_->fk(*q_meas,plan.frame);
+            std::lock_guard<std::mutex> lock(stream_mu_);
+            reset_interpolator_to(*q_meas);
+            stream_geo_start_=start_pose.col(3).head<3>();stream_geo_target_=plan.target;
+            stream_geo_quat0_=kmpc::rot_to_quat_xyzw(start_pose.block<3,3>(0,0));
+            stream_geo_quat1_=plan.quat;stream_geo_ori_=plan.ori_on;stream_geo_frame_=plan.frame;
+            stream_geo_previous_=0.0;stream_line_fault_.clear();
+            const double pitch=q_meas->head<3>().sum();
+            const double limit=cfg_.params.torso_pitch_max_deg*kmpc::kPi/180;
+            const double excess=std::max(0.0,std::abs(pitch)-limit);
+            stream_pitch_recovery_=limit>0 && excess>1e-6;
+            stream_pitch_direction_=pitch<0?-1.0:1.0;
+            stream_pitch_initial_=stream_pitch_previous_=excess; stream_pitch_ticks_=0;
+            kmpc::Vec18 budget=kmpc::Vec18::Zero();budget[0]=excess;
+            stream_pitch_filter_.reset(budget);
           }
+          if(plan.candidate=="reverse_cache" || plan.candidate=="qa_seed" ||
+             plan.reverse_decision.rfind("rejected_",0)==0) {
+            tracker_->clear_last_line_cache();
+          }
+          tracker_->adopt_line(std::move(plan));
         } else if(!current) {++line_plan_discards_;}
       }
       if(tracker_->line_needs_build(is_left,target.xyz,&target.quat_xyzw)) {
@@ -1321,13 +1467,20 @@ class KmpcNode : public rclcpp::Node {
         // that worker is building. Encoder noise must not invalidate every plan.
         {
           std::lock_guard<std::mutex> lock(stream_mu_);
-          if(stream_mute_ && !tracker_->line_active()) reset_interpolator_to(*q_meas);
+          // Always seed the plan from live joints — start is the robot now,
+          // not a stale hold/q_ref (r32 fake descend; r38 QP s0 mismatch).
+          if(!tracker_->line_active() && q_meas && q_meas->allFinite()) {
+            reset_interpolator_to(*q_meas);
+          } else if(stream_mute_ && !tracker_->line_active() &&
+                    q_meas && q_meas->allFinite()) {
+            reset_interpolator_to(*q_meas);
+          }
           q0=interpolator_.q_ref();stream_enter_hold(q0);
         }
         line_solve_from=q0;tracker_->set_line_reference(q0);++line_plan_builds_;
         line_pending_gen_=target.generation; line_pending_left_=is_left;
         line_pending_xyz_=target.xyz; line_pending_quat_=target.quat_xyzw; line_pending_q_=q0;
-        const auto config=cfg_; const auto source=line_urdf_source_; const bool xml=line_urdf_xml_;
+        const auto config=cfg_;
         const auto upper=result.command;
         line_pending_waist_locked_=upper.waist_locked;
         const bool pose_pref=line_pose_pref_enable_;
@@ -1335,22 +1488,26 @@ class KmpcNode : public rclcpp::Node {
         const bool qp_pitch_mono=line_qp_pitch_monotonic_enable_;
         const bool reverse_last=reverse_last_line_enable_;
         const bool direction_strict=line_direction_strict_enable_;
+        const bool shadow_diag=line_shadow_diag_enable_;
         const bool diag=line_diag_enable_;
         const auto pace_mode=line_pace_mode_;
         const double brake_m=line_brake_distance_m_;
         const double brake_floor=line_brake_floor_;
         const auto brake_profile=line_brake_profile_;
         const int qp_max_iter=line_qp_max_iter_;
+        const auto qp_follow_mode=line_qp_follow_mode_;
+        const auto chain_profile=line_chain_profile_;
         const kmpc::Vec18 q_pref=cfg_.q_pref;
         const auto line_cache=tracker_->last_line_cache();
         const auto successor_plan=tracker_->successor_plan();
         const uint64_t run_id=run_id_;
+        kmpc::Kinematics* plan_kin=line_plan_kin_.get();
         line_future_=std::async(std::launch::async,
-            [config,source,xml,target,q0,is_left,upper,pose_pref,pitch_straighten,
-             qp_pitch_mono,reverse_last,direction_strict,diag,pace_mode,brake_m,brake_floor,
-             brake_profile,qp_max_iter,q_pref,line_cache,successor_plan,run_id]() {
-          kmpc::Kinematics model(source,xml?kmpc::Kinematics::UrdfInput::Xml:kmpc::Kinematics::UrdfInput::Path);
-          kmpc::CartesianTracker worker(model,config);
+            [config,plan_kin,target,q0,is_left,upper,pose_pref,pitch_straighten,
+             qp_pitch_mono,reverse_last,direction_strict,shadow_diag,diag,pace_mode,brake_m,brake_floor,
+             brake_profile,qp_max_iter,qp_follow_mode,chain_profile,q_pref,line_cache,successor_plan,
+             run_id]() {
+          kmpc::CartesianTracker worker(*plan_kin,config);
           worker.set_upper_commands(upper);
           worker.set_line_pose_pref(pose_pref);
           worker.set_line_pose_pref_q(q_pref);
@@ -1358,6 +1515,10 @@ class KmpcNode : public rclcpp::Node {
           worker.set_line_qp_pitch_monotonic_enable(qp_pitch_mono);
           worker.set_reverse_last_line_enable(reverse_last);
           worker.set_line_direction_strict_enable(direction_strict);
+          worker.set_line_shadow_diag_enable(shadow_diag);
+          // Profile first: NewUnified forces pace/QP; Legacy preserves later setters.
+          worker.set_line_chain_profile(chain_profile);
+          worker.set_line_qp_follow_mode(qp_follow_mode);
           worker.set_line_pace_mode(pace_mode);
           if (!worker.set_line_brake_distance_m(brake_m)) {
             throw kmpc::ConfigError("line_brake_distance_m must be finite and > 0");
@@ -1376,7 +1537,7 @@ class KmpcNode : public rclcpp::Node {
           worker.rearm_line(target.generation,target.cascade);
           auto plan = worker.prepare_line(q0,is_left,target.xyz,&target.quat_xyzw);
           plan.diag_events = worker.line_diag_take();
-          // prepare_line already copies successor into plan; keep explicit.
+          // prepare_line already copies successor + smooth/interp into plan.
           plan.successor = worker.successor_plan();
           return plan;
         });
@@ -1387,7 +1548,31 @@ class KmpcNode : public rclcpp::Node {
     kmpc::Vec18 dq = kmpc::Vec18::Zero();
     kmpc::Vec18 q_cmd = kmpc::Vec18::Zero();
     try {
+      bool wait_chord_queue = false;
+      {
+        std::lock_guard<std::mutex> lock(stream_mu_);
+        wait_chord_queue = use_cart && stream_line_ && stream_chord_pending_ &&
+                           stream_line_u_ < 1.0 - 1e-9;
+      }
+      if (wait_chord_queue) {
+        // Depth-1 chord queue is armed but not yet playing. Skip propose so
+        // follow_line cannot abort/replace the confirmed pending endpoint.
+        std::lock_guard<std::mutex> lock(stream_mu_);
+        stream_goal_gen_ = tracker_->goal_generation();
+        q_cmd = stream_chord_pending_to_;
+        dq.setZero();
+        if (interpolator_.ready()) {
+          stream_mute_ = false;
+        }
+        publish_cmd(q_cmd, dq, 0.0, true);
+        return;
+      }
       if (use_cart) {
+        const uint64_t tick_id =
+            control_tick_id_.fetch_add(1, std::memory_order_relaxed) + 1;
+        tracker_->set_control_tick_id(tick_id);
+        // Do not bump stream_tick_id here: 250 Hz may still be emitting the
+        // previous accepted segment. stream_on_line binds tick on confirm.
         const kmpc::TrackerStep step = tracker_->compute(
             q0, q_pref_cart, use_l, use_r, use_ql, use_qr,
             kmpc::kEeFrameLeft, kmpc::kEeFrameRight);
@@ -1457,10 +1642,22 @@ class KmpcNode : public rclcpp::Node {
               stream_enter_hold(interpolator_.ready()?interpolator_.q_ref():q_path);
             }
             q_cmd=interpolator_.q_ref();dq.setZero();
+          } else if (!tracker_->line_commit_pending()) {
+            // Tail-wait / already-confirmed tick has no new chord. Re-confirming
+            // would reuse the previous "full_propose" reason and refuse a line
+            // that has already reached the path end.
+            q_cmd = stream_line_ ? stream_line_to_
+                                 : (interpolator_.ready() ? interpolator_.q_ref()
+                                                          : q_path);
+            dq.setZero();
           } else {
             stream_on_line(q_path,line_solve_from);
-            q_cmd = tracker_->line_refused() ? stream_q_hold_ : stream_line_to_;
+            q_cmd = tracker_->line_refused()
+                        ? stream_q_hold_
+                        : (stream_chord_pending_ ? stream_chord_pending_to_
+                                                 : stream_line_to_);
             if (tracker_->line_refused()) dq.setZero();
+            else if (stream_chord_pending_) dq.setZero();
             else dq=q_cmd-stream_line_from_;
           }
         } else if (use_cart && tracker_->line_refused()) {
@@ -1551,9 +1748,14 @@ class KmpcNode : public rclcpp::Node {
     interpolator_.set_jerk_s(interp_jerk_s_);
   }
 
+  // from_control_thread: 50 Hz commit path → control_diag_q_ (single writer).
+  // else: 250 Hz stream path → stream_diag_q_ (single writer). Never mix.
   void push_stream_diag(
       kmpc::ros2io::LayerDiagLayer layer, const kmpc::Vec18& q, uint64_t gen,
-      uint32_t line_gen, const char* note, uint64_t seq_override, bool use_override) {
+      uint32_t line_gen, const char* note, uint64_t seq_override, bool use_override,
+      double prog = 0.0, double commit_scale = 1.0, uint8_t field_mask = 0,
+      bool from_control_thread = false, uint64_t tick_override = 0,
+      bool use_tick = false) {
     if (!layer_diag_on_) {
       return;
     }
@@ -1563,13 +1765,28 @@ class KmpcNode : public rclcpp::Node {
     sample.source_stamp_ns = -1;
     sample.run_id = run_id_;
     sample.goal_generation = gen;
-    sample.seq = use_override ? seq_override : ++stream_diag_seq_;
+    if (from_control_thread) {
+      sample.seq = use_override ? seq_override : ++control_diag_seq_;
+    } else {
+      sample.seq = use_override ? seq_override : ++stream_diag_seq_;
+    }
+    sample.tick_id = use_tick
+                         ? tick_override
+                         : stream_tick_id_.load(std::memory_order_acquire);
     sample.line_gen = line_gen;
     sample.layer = layer;
     sample.next_layer = kmpc::ros2io::layer_diag_next(layer);
+    sample.prog = prog;
+    sample.commit_scale = commit_scale;
+    sample.field_mask = field_mask;
+    sample.qp_mode = static_cast<uint8_t>(line_qp_follow_mode_);
     kmpc::ros2io::layer_diag_copy_q(&sample, q);
     kmpc::ros2io::layer_diag_note(&sample, note);
-    stream_diag_q_.try_push(sample);
+    if (from_control_thread) {
+      control_diag_q_.try_push(sample);
+    } else {
+      stream_diag_q_.try_push(sample);
+    }
   }
 
   void note_sdk_status(uint64_t sequence, bool last_send_ok, bool active) {
@@ -1591,28 +1808,48 @@ class KmpcNode : public rclcpp::Node {
     sdk_notes_.push_back(sample);
   }
 
-  void drain_qp_fail_dump() {
+  void schedule_qp_fail_dump() {
     if (!tracker_ || qp_fail_dump_dir_.empty()) {
       return;
     }
-    // Dump is ~0.6MB; keep it off the stack.
+    // Take is cheap; ofstream stays off every ROS/control callback thread.
     auto dump = std::make_unique<kmpc::CartesianTracker::LineQpFailDump>();
     if (!tracker_->take_line_qp_fail_dump(dump.get()) || !dump->valid) {
       return;
     }
+    if (!qp_dump_worker_.running()) {
+      const std::string dir = qp_fail_dump_dir_;
+      qp_dump_worker_.start(
+          [this, dir](
+              std::unique_ptr<kmpc::CartesianTracker::LineQpFailDump>&& payload) {
+            write_qp_fail_dump_file(std::move(payload), dir);
+          });
+    }
+    if (!qp_dump_worker_.enqueue(std::move(dump))) {
+      // Bounded queue full — counted, never spawn unbounded detach threads.
+      return;
+    }
+  }
+
+  void write_qp_fail_dump_file(
+      std::unique_ptr<kmpc::CartesianTracker::LineQpFailDump> dump,
+      const std::string& dir) {
+    if (!dump || !dump->valid) {
+      return;
+    }
     namespace fs = std::filesystem;
     std::error_code ec;
-    fs::create_directories(qp_fail_dump_dir_, ec);
+    fs::create_directories(dir, ec);
     if (ec) {
       RCLCPP_ERROR(get_logger(), "qp fail dump mkdir %s failed: %s",
-                   qp_fail_dump_dir_.c_str(), ec.message().c_str());
+                   dir.c_str(), ec.message().c_str());
       return;
     }
     char name[256];
     std::snprintf(name, sizeof(name), "qp_fail_gen%llu_mono%llu.json",
                   static_cast<unsigned long long>(dump->goal_generation),
                   static_cast<unsigned long long>(dump->mono_ns));
-    const fs::path path = fs::path(qp_fail_dump_dir_) / name;
+    const fs::path path = fs::path(dir) / name;
     std::ofstream out(path);
     if (!out) {
       RCLCPP_ERROR(get_logger(), "qp fail dump open failed: %s", path.c_str());
@@ -1732,20 +1969,25 @@ class KmpcNode : public rclcpp::Node {
       return;
     }
     kmpc::ros2io::LayerDiagSample batch[64];
-    for (;;) {
-      const size_t n = stream_diag_q_.try_pop(batch, 64);
-      for (size_t i = 0; i < n; ++i) {
-        layer_diag_out_ << kmpc::ros2io::layer_diag_jsonl(batch[i]) << '\n';
+    auto drain_q = [&](kmpc::ros2io::LayerDiagQueue<8192>& q, uint64_t* exported) {
+      for (;;) {
+        const size_t n = q.try_pop(batch, 64);
+        for (size_t i = 0; i < n; ++i) {
+          layer_diag_out_ << kmpc::ros2io::layer_diag_jsonl(batch[i]) << '\n';
+        }
+        if (n < 64) {
+          break;
+        }
       }
-      if (n < 64) {
-        break;
+      const uint64_t drops = q.drops();
+      if (drops != *exported) {
+        layer_diag_out_ << kmpc::ros2io::layer_diag_overflow_jsonl(run_id_, drops)
+                        << '\n';
+        *exported = drops;
       }
-    }
-    const uint64_t drops = stream_diag_q_.drops();
-    if (drops != exported_stream_drops_) {
-      layer_diag_out_ << kmpc::ros2io::layer_diag_overflow_jsonl(run_id_, drops) << '\n';
-      exported_stream_drops_ = drops;
-    }
+    };
+    drain_q(control_diag_q_, &exported_control_drops_);
+    drain_q(stream_diag_q_, &exported_stream_drops_);
     if (tracker_ && line_diag_enable_) {
       const uint64_t ov = tracker_->line_diag_overflows();
       const auto events = tracker_->line_diag_snapshot();
@@ -1762,6 +2004,7 @@ class KmpcNode : public rclcpp::Node {
         sample.run_id = ev.run_id == 0 ? run_id_ : ev.run_id;
         sample.goal_generation = ev.goal_generation;
         sample.seq = ev.seq;
+        sample.tick_id = ev.tick_id;
         sample.line_gen = ev.line_gen < 0 ? 0u : static_cast<uint32_t>(ev.line_gen);
         using L = kmpc::CartesianTracker::LineDiagLayer;
         sample.layer = ev.layer == L::FollowQp
@@ -1773,7 +2016,26 @@ class KmpcNode : public rclcpp::Node {
                                        : kmpc::ros2io::LayerDiagLayer::Build;
         sample.next_layer = kmpc::ros2io::layer_diag_next(sample.layer);
         sample.prog = ev.prog;
+        sample.s_dot = ev.s_dot;
+        sample.solve_us = ev.solve_us;
+        sample.commit_scale = ev.commit_scale;
+        sample.qp_dx_norm = ev.qp_dx_norm;
+        sample.dq_proj_max = ev.dq_proj_max;
+        sample.qp_mode = ev.qp_mode;
+        sample.field_mask = ev.field_mask;
         kmpc::ros2io::layer_diag_copy_q(&sample, ev.q);
+        if (ev.field_mask & kmpc::ros2io::kLayerDiagHasNominal) {
+          kmpc::ros2io::layer_diag_copy_nominal(&sample, ev.q_nominal);
+        }
+        if (ev.field_mask & kmpc::ros2io::kLayerDiagHasPre) {
+          kmpc::ros2io::layer_diag_copy_pre(&sample, ev.q_pre);
+        }
+        // Prefer q_aux as pre/from when FollowQp and q_pre empty.
+        if (ev.layer == L::FollowQp &&
+            !(sample.field_mask & kmpc::ros2io::kLayerDiagHasPre) &&
+            ev.q_aux.allFinite()) {
+          kmpc::ros2io::layer_diag_copy_pre(&sample, ev.q_aux);
+        }
         kmpc::ros2io::layer_diag_note(
             &sample, ev.decision[0] != '\0' ? ev.decision : ev.candidate);
         layer_diag_out_ << kmpc::ros2io::layer_diag_jsonl(sample) << '\n';
@@ -1888,9 +2150,16 @@ class KmpcNode : public rclcpp::Node {
       num("line_qp_max_iter", static_cast<double>(line_qp_max_iter_), "iters",
           raw == 200 ? "node_default" : "ros_override", "[1,10000]", true);
     }
+    {
+      const std::string raw = str_or("line_qp_follow_mode", "A");
+      add("line_qp_follow_mode",
+          kmpc::line_qp_follow_mode_name(line_qp_follow_mode_), "enum",
+          raw == "A" ? "node_default" : "ros_override", "A|B|C", true);
+    }
     add("line_freeze_distance_m", "0.08", "m", "compile_const", "=0.08", true);
     ros_bool("line_pitch_straighten_enable", true);
     ros_bool("line_qp_pitch_monotonic_enable", true);
+    ros_bool("line_shadow_diag_enable", true);
     ros_bool("reverse_last_line_enable", true);
     ros_bool("line_direction_strict_enable", true);
     ros_num("stream_hz", 250.0, stream_hz_, "Hz", ">0");
@@ -2126,8 +2395,9 @@ class KmpcNode : public rclcpp::Node {
             static_cast<unsigned long long>(tracker_->goal_generation()),
             tracker_->line_reason().c_str());
       }
-      // Off the 50/250 Hz hot path: drain a pre-filled QP input dump to disk.
-      drain_qp_fail_dump();
+      // Drain promptly: empty poses trigger reset()/line_clear within ~10ms,
+      // and the 100ms wall timer alone often loses that race.
+      schedule_qp_fail_dump();
     }
     publish_arrived(arbiter_->enabled() && last_use_cart_ && arrived);
     const kmpc::Vec3 com = last_use_cart_ ? tracker_->last_com()
@@ -2178,6 +2448,7 @@ class KmpcNode : public rclcpp::Node {
         " forced_waist=" + std::to_string(tracker_->line_cascade_forced_waist()) +
         " cascade_full_body=" + std::to_string(tracker_->line_cascade_full_body()) +
         " line_candidate=" + (tracker_->line_candidate().empty()?"none":tracker_->line_candidate()) +
+        " pose_report=" + (tracker_->line_pose_report().empty()?"none":tracker_->line_pose_report()) +
         " line_waist_locked=" + std::string(tracker_->line_waist_locked() ? "True" : "False") +
         " pose_pref=" + (tracker_->line_pose_pref_decision().empty()?"disabled":tracker_->line_pose_pref_decision()) +
         " reverse_line=" + (tracker_->reverse_line_decision().empty()?"disabled":tracker_->reverse_line_decision()) +
@@ -2362,6 +2633,7 @@ class KmpcNode : public rclcpp::Node {
   double stream_pitch_direction_=1.0,stream_pitch_previous_=0,stream_pitch_initial_=0;
   int stream_pitch_ticks_=0;
   std::unique_ptr<kmpc::Kinematics> stream_kin_;
+  std::unique_ptr<kmpc::Kinematics> line_plan_kin_;
   std::unique_ptr<kmpc::WholeBodyGuards> stream_guards_;
   kmpc::Vec18 stream_raw_ref_=kmpc::Vec18::Zero();
   kmpc::Vec3 stream_geo_start_=kmpc::Vec3::Zero(),stream_geo_target_=kmpc::Vec3::Zero();
@@ -2409,18 +2681,28 @@ class KmpcNode : public rclcpp::Node {
   kmpc::CartesianTracker::LineBrakeProfile line_brake_profile_ =
       kmpc::CartesianTracker::kDefaultLineBrakeProfile;
   int line_qp_max_iter_ = 200;
+  kmpc::LineQpFollowMode line_qp_follow_mode_ = kmpc::LineQpFollowMode::A;
+  kmpc::CartesianTracker::LineChainProfile line_chain_profile_ =
+      kmpc::CartesianTracker::LineChainProfile::Legacy;
+  kmpc::LineFinalGateLimits final_gate_limits_{};
   bool line_pose_pref_enable_ = false;
   bool line_pitch_straighten_enable_ = true;
   bool line_qp_pitch_monotonic_enable_ = true;
   bool reverse_last_line_enable_ = true;
   bool line_direction_strict_enable_ = true;
+  bool line_shadow_diag_enable_ = true;
   kmpc::DirectionEnvelope stream_dir_env_{};
   bool line_diag_enable_ = false;
   bool layer_diag_on_ = false;
   uint64_t run_id_ = 0;
+  std::atomic<uint64_t> control_tick_id_{0};
+  std::atomic<uint64_t> stream_tick_id_{0};
+  uint64_t stream_segment_tick_ = 0;  // tick of last accepted segment
   uint64_t stream_goal_gen_ = 0;
   uint64_t stream_diag_seq_ = 0;
+  uint64_t control_diag_seq_ = 0;
   uint64_t exported_stream_drops_ = 0;
+  uint64_t exported_control_drops_ = 0;
   uint64_t exported_tracker_overflows_ = 0;
   size_t exported_ring_n_ = 0;
   uint64_t sdk_note_drops_ = 0;
@@ -2430,7 +2712,12 @@ class KmpcNode : public rclcpp::Node {
   std::string config_snapshot_path_;
   std::ofstream layer_diag_out_;
   std::deque<kmpc::ros2io::LayerDiagSample> sdk_notes_;
+  // Separate SPSC queues: 50 Hz control writer vs 250 Hz stream writer.
+  kmpc::ros2io::LayerDiagQueue<8192> control_diag_q_;
   kmpc::ros2io::LayerDiagQueue<8192> stream_diag_q_;
+  kmpc::QpFailDumpWorker<
+      std::unique_ptr<kmpc::CartesianTracker::LineQpFailDump>>
+      qp_dump_worker_{4};
   bool stream_dedicated_thread_ = true;
   double stream_debug_q_hz_ = 50.0;
   double stream_hz_ = 250.0;
@@ -2451,6 +2738,11 @@ class KmpcNode : public rclcpp::Node {
   double stream_line_u_ = 1.0;
   kmpc::Vec18 stream_line_from_ = kmpc::Vec18::Zero();
   kmpc::Vec18 stream_line_to_ = kmpc::Vec18::Zero();
+  // Depth-1 queue: confirm immediately, arm only when active chord reaches u=1.
+  bool stream_chord_pending_ = false;
+  kmpc::Vec18 stream_chord_pending_to_ = kmpc::Vec18::Zero();
+  uint64_t stream_chord_queue_waits_ = 0;
+  uint64_t stream_chord_queue_arms_ = 0;
   // 无目标钉住：不往伺服口重复发同一包。有球或有关节目标时为 false。
   bool stream_mute_ = false;
   bool alarm_block_ = false;
@@ -2472,6 +2764,7 @@ class KmpcNode : public rclcpp::Node {
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::TimerBase::SharedPtr stream_timer_;
   rclcpp::TimerBase::SharedPtr layer_diag_timer_;
+  rclcpp::TimerBase::SharedPtr qp_fail_dump_timer_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr alarm_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr enable_sub_;

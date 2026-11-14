@@ -69,8 +69,53 @@ TEST(LayerDiag, SourceStampAndGenerationStayOnTheSample) {
   EXPECT_GT(out.mono_ns, 0u);
   EXPECT_EQ(out.recv_mono_ns, out.mono_ns);
   const std::string line = kmpc::ros2io::layer_diag_jsonl(out);
+  EXPECT_NE(line.find("\"schema\":2"), std::string::npos);
   EXPECT_NE(line.find("\"source_stamp_ns\":1700000000123456789"), std::string::npos);
   EXPECT_NE(line.find("\"seq\":7"), std::string::npos);
+  EXPECT_NE(line.find("\"tick_id\":"), std::string::npos);
+}
+
+TEST(LayerDiag, Schema2RecordsTickScaleAndNominal) {
+  kmpc::ros2io::LayerDiagSample sample = sample_at(9, -1);
+  sample.tick_id = 55;
+  sample.s_dot = 0.4;
+  sample.solve_us = 1234.5;
+  sample.commit_scale = 0.833326;
+  sample.qp_mode = 2;
+  sample.field_mask = static_cast<uint8_t>(
+      kmpc::ros2io::kLayerDiagHasSDot | kmpc::ros2io::kLayerDiagHasSolve |
+      kmpc::ros2io::kLayerDiagHasScale | kmpc::ros2io::kLayerDiagHasQpMode |
+      kmpc::ros2io::kLayerDiagHasNominal);
+  sample.q_nominal[0] = 0.2;
+  const std::string line = kmpc::ros2io::layer_diag_jsonl(sample);
+  EXPECT_NE(line.find("\"tick_id\":55"), std::string::npos);
+  EXPECT_NE(line.find("\"commit_scale\":0.833326"), std::string::npos);
+  EXPECT_NE(line.find("\"qp_mode\":2"), std::string::npos);
+  EXPECT_NE(line.find("\"q_nominal\":["), std::string::npos);
+  EXPECT_NE(line.find("\"solve_us\":1234.5"), std::string::npos);
+}
+
+TEST(LayerDiag, SeparateQueuesKeepSingleWriterContract) {
+  // Mimic node: 50 Hz control queue vs 250 Hz stream queue — each SPSC.
+  kmpc::ros2io::LayerDiagQueue<8> control;
+  kmpc::ros2io::LayerDiagQueue<8> stream;
+  auto ctrl = sample_at(1, -1);
+  ctrl.tick_id = 10;
+  ctrl.layer = kmpc::ros2io::LayerDiagLayer::StreamCommit;
+  auto raw = sample_at(2, -1);
+  raw.tick_id = 10;
+  raw.layer = kmpc::ros2io::LayerDiagLayer::StreamRawRef;
+  EXPECT_TRUE(control.try_push(ctrl));
+  EXPECT_TRUE(stream.try_push(raw));
+  kmpc::ros2io::LayerDiagSample out_c, out_s;
+  ASSERT_EQ(control.try_pop(&out_c, 1), 1u);
+  ASSERT_EQ(stream.try_pop(&out_s, 1), 1u);
+  EXPECT_EQ(out_c.tick_id, 10u);
+  EXPECT_EQ(out_s.tick_id, 10u);
+  EXPECT_EQ(out_c.layer, kmpc::ros2io::LayerDiagLayer::StreamCommit);
+  EXPECT_EQ(out_s.layer, kmpc::ros2io::LayerDiagLayer::StreamRawRef);
+  EXPECT_EQ(control.drops(), 0u);
+  EXPECT_EQ(stream.drops(), 0u);
 }
 
 TEST(LayerDiag, DisabledPathSkipsTheQueue) {

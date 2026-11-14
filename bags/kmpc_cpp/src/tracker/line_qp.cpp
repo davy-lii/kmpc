@@ -39,6 +39,24 @@ const char* proxqp_status_name(proxsuite::proxqp::QPSolverOutput status) {
   }
 }
 
+// Soft-line build (line_path kLineTubeHardM / kLineOriHardRad): mid knots may
+// leave the chord; endpoint stays tight. QP used to keep a hard 3 mm / arrival
+// ori tube everywhere, so Mode B DIRECT rejected fold_15 soft bows
+// (qp_primal_residual / s*_tube_* / s*_ori_*).
+constexpr double kQpTubeEndM = 0.003;
+constexpr double kQpTubeMidM = 0.20;
+constexpr double kQpOriMidRad = 0.40;
+// Only the very last chord fraction uses the arrival tube. Soft-path joint
+// lerps near the end still leave the start→target chord by more than 3 mm
+// (LoggedPrep fold_15 hit qp_nonlinear_tube_or_com around along≈0.92–0.99).
+constexpr double kQpTubeEndFrac = 0.999;
+inline double qp_cross_tube_m(double along01) {
+  return (along01 >= kQpTubeEndFrac) ? kQpTubeEndM : kQpTubeMidM;
+}
+inline double qp_ori_tol_rad(double along01, double arrived_ori_rad) {
+  return (along01 >= kQpTubeEndFrac) ? arrived_ori_rad : kQpOriMidRad;
+}
+
 }  // namespace
 
 bool CartesianTracker::take_line_qp_fail_dump(LineQpFailDump* out) {
@@ -78,6 +96,11 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
   last_line_qp_fail_.pitch_deg = rad_to_deg(from.head<3>().sum());
   last_line_qp_fail_.ee_err_m =
       (line_.target - kin_.fk_pos(from, line_.frame)).norm();
+  last_line_qp_solve_us_ = 0.0;
+  last_line_qp_dx_norm_ = 0.0;
+  last_line_qp_proj_max_ = 0.0;
+  last_line_qp_nominal_ = Vec18::Zero();
+  last_line_qp_pre_ = Vec18::Zero();
 
   constexpr int d=kNWaist+kNArm;
   const int n=std::clamp(n_horizon_,1,LineQpFailDump::kMaxStages), nx=n*d;
@@ -202,6 +225,15 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
   };
   const double pitch0=line_.samples.front().head<3>().sum();
   const double pitchN=line_.samples.back().head<3>().sum();
+  // Live stream excess: NewUnified Mode B is x=0 and cannot pull pitch back.
+  // While recovering, force ProxQP so waist nullspace can meet the shrinking box.
+  const double from_pitch_ex =
+      (torso_pitch_max_ > 0.0)
+          ? std::max(0.0, std::abs(from.head<3>().sum()) - torso_pitch_max_)
+          : 0.0;
+  const bool pitch_recovering_from = from_pitch_ex > 1e-9;
+  double pitch_recover_step = 0.0;
+  for (int j = 0; j < 3; ++j) pitch_recover_step += std::abs(cap[j]);
   Vec18 prev=from;
   double s=next_prog;
   for(int k=0;k<n;++k) {
@@ -215,11 +247,20 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
     const Vec3 ep=(1-t)*p_start+t*line_.target-pose.col(3).head<3>();
     const Vec3 eo=line_.ori_on?ori_error_xyzw(quat_slerp_xyzw(ori_start,line_.quat,t),
         rot_to_quat_xyzw(pose.block<3,3>(0,0))):Vec3::Zero();
-    Eigen::Matrix<double,d,d> H=400.0*J.topRows<3>().transpose()*J.topRows<3>();
-    Eigen::Matrix<double,d,1> grad=-400.0*J.topRows<3>().transpose()*ep;
-    if(line_.ori_on) {
-      H+=20.0*J.bottomRows<3>().transpose()*J.bottomRows<3>();
-      grad-=20.0*J.bottomRows<3>().transpose()*eo;
+    // Mode A: Cartesian reshape (legacy). Mode C: min deviation from nominal.
+    // Mode B skips the ProxQP solve but still builds the same hard rows below.
+    Eigen::Matrix<double,d,d> H=Eigen::Matrix<double,d,d>::Zero();
+    Eigen::Matrix<double,d,1> grad=Eigen::Matrix<double,d,1>::Zero();
+    if(line_qp_follow_mode_==LineQpFollowMode::C) {
+      H.setIdentity();
+      // Prefer staying on the planned joint path; no large Cartesian re-pose.
+    } else {
+      H=400.0*J.topRows<3>().transpose()*J.topRows<3>();
+      grad=-400.0*J.topRows<3>().transpose()*ep;
+      if(line_.ori_on) {
+        H+=20.0*J.bottomRows<3>().transpose()*J.bottomRows<3>();
+        grad-=20.0*J.bottomRows<3>().transpose()*eo;
+      }
     }
     // Fixed nominal path regularizer; original line pitch/yaw/arm/wrist ratios.
     Eigen::Matrix<double,d,1> w;
@@ -244,22 +285,24 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
     for(int j=0;j<18;++j) {
       if(T.row(j).squaredNorm()==0) continue;
       char tag[LineQpFailDump::kTagLen];
+      // Hard joint box only. Soft margin is a planner preference / growth gate
+      // (line_validate), not a follow stop: r39 rise failed s0_qlim_j0 when
+      // J1 sat ~0.003° past soft while moving *away* from the hard wall.
       std::snprintf(tag, sizeof(tag), "s%d_qlim_j%d", k, j);
-      row(k,T.row(j),limits_.q_min[j]+q_limit_margin_-q[j],
-          limits_.q_max[j]-q_limit_margin_-q[j],tag);
+      row(k,T.row(j),limits_.q_min[j]-q[j],limits_.q_max[j]-q[j],tag);
       std::snprintf(tag, sizeof(tag), "s%d_step_j%d", k, j);
       row(k,T.row(j),-cap[j]-(q[j]-prev[j]),cap[j]-(q[j]-prev[j]),tag,k>0);
     }
-    // Box inscribed in the 3 mm Euclidean tube; nonlinear validation follows.
-    constexpr double tube=0.0029/1.7320508075688772;
+    // Box inscribed in the progress-dependent Euclidean tube (soft mid / 3 mm end).
+    const double tube=qp_cross_tube_m(t)/1.7320508075688772;
     for(int j=0;j<3;++j) {
       char tag[LineQpFailDump::kTagLen];
       std::snprintf(tag, sizeof(tag), "s%d_tube_%c", k, "xyz"[j]);
       row(k,J.row(j),ep[j]-tube,ep[j]+tube,tag);
       if(line_.ori_on) {
+        const double ori_box=qp_ori_tol_rad(t,arrived_ori_rad_)/1.7321;
         std::snprintf(tag, sizeof(tag), "s%d_ori_%c", k, "xyz"[j]);
-        row(k,J.row(3+j),eo[j]-arrived_ori_rad_/1.7321,
-            eo[j]+arrived_ori_rad_/1.7321,tag);
+        row(k,J.row(3+j),eo[j]-ori_box,eo[j]+ori_box,tag);
       }
     }
     const Vec3 com=kin_.com(q);
@@ -273,9 +316,10 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
     }
     Eigen::Matrix<double,1,d> pitch=Eigen::Matrix<double,1,d>::Zero(); pitch.head<3>().setOnes();
     // Unified with line_build / 250 Hz stream_pitch_recovery (kStartPitchAdmitRad):
-    // existing tiny excess may persist (no worsen vs stream `from`), shrink toward
-    // the hard box by the waist rate budget, then stay inside. Never permanently
-    // widen the box; never treat MAX_ITER as success.
+    // Active recovery (from_ex>0): shrink ceiling by waist rate; no nom_ex floor
+    // (that froze r32). Non-recovery Mode B: keep nom_ex so x=0 stays feasible
+    // when the seed sample sits slightly outside while live `from` is inside
+    // (r33 run1 s0_pitch_box viol≈2e-5). Never exceed admit; never widen hard.
     const double limit=torso_pitch_max_;
     bool pitch_recovering=false;
     if(limit>0) {
@@ -295,8 +339,11 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
           std::max(0.0,from_ex-static_cast<double>(k)*recover_step);
       const double first_floor=
           (k==0)?std::max(0.0,from_ex-recover_step):0.0;
+      // nom_ex only when NOT recovering — Mode B x=0 needs the sample's own
+      // crumb; recovering ProxQP must still drive toward the hard box.
+      const double nom_ex=pitch_recovering?0.0:excess(q.head<3>().sum());
       const double allowed_ex=
-          std::min(admit_excess,std::max(staged,first_floor));
+          std::min(admit_excess,std::max({staged,first_floor,nom_ex}));
       const double soft=limit+allowed_ex;
       char tag[LineQpFailDump::kTagLen];
       std::snprintf(tag, sizeof(tag), "s%d_pitch_box", k);
@@ -455,46 +502,69 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
     finish_dump();
     return reject("qp_bounds");
   }
-  Eigen::VectorXd x;
-  try {
-    proxsuite::proxqp::sparse::QP<double,int> qp(nx,0,nc);
-    qp.settings.eps_abs=1e-7; qp.settings.eps_rel=0.0;
-    qp.settings.max_iter=line_qp_max_iter_;
-    qp.settings.verbose=false;
-    qp.init(H,g,proxsuite::nullopt,proxsuite::nullopt,C,lo,hi);
+  Eigen::VectorXd x=Eigen::VectorXd::Zero(nx);
+  if(line_qp_follow_mode_==LineQpFollowMode::B && !pitch_recovering_from) {
+    // Direct nominal path: skip Cartesian reshape, still enforce C*x∈[lo,hi].
+    // Recovery must not take this shortcut — x=0 cannot shrink pitch excess.
     ++line_qp_solves_;
-    const auto t0 = std::chrono::steady_clock::now();
-    qp.solve();
-    const auto t1 = std::chrono::steady_clock::now();
-    last_line_qp_fail_.solve_ms =
-        std::chrono::duration<double, std::milli>(t1 - t0).count();
-    last_line_qp_fail_.status = static_cast<int>(qp.results.info.status);
+    last_line_qp_fail_.solve_ms = 0.0;
+    last_line_qp_solve_us_ = 0.0;
+    last_line_qp_fail_.status = 0;
     std::snprintf(last_line_qp_fail_.status_name,
-                  sizeof(last_line_qp_fail_.status_name), "%s",
-                  proxqp_status_name(qp.results.info.status));
-    last_line_qp_fail_.iter = static_cast<int>(qp.results.info.iter);
-    last_line_qp_fail_.pri_res = static_cast<double>(qp.results.info.pri_res);
-    last_line_qp_fail_.dua_res = static_cast<double>(qp.results.info.dua_res);
-    fill_worst(qp.results.x);
-    if(qp.results.info.status!=proxsuite::proxqp::QPSolverOutput::PROXQP_SOLVED) {
+                  sizeof(last_line_qp_fail_.status_name), "DIRECT");
+  } else {
+    try {
+      proxsuite::proxqp::sparse::QP<double,int> qp(nx,0,nc);
+      qp.settings.eps_abs=1e-7; qp.settings.eps_rel=0.0;
+      // ProxSuite 0.7.x can prematurely certify an infeasible primal problem
+      // with its default certificate tolerance (r29 feasible constraint dump).
+      // Reduce certificate stationarity error; keep hard rows/primal checks.
+      qp.settings.eps_primal_inf=1e-9;
+      qp.settings.max_iter=line_qp_max_iter_;
+      qp.settings.verbose=false;
+      qp.init(H,g,proxsuite::nullopt,proxsuite::nullopt,C,lo,hi);
+      ++line_qp_solves_;
+      const auto t0 = std::chrono::steady_clock::now();
+      qp.solve();
+      const auto t1 = std::chrono::steady_clock::now();
+      last_line_qp_fail_.solve_ms =
+          std::chrono::duration<double, std::milli>(t1 - t0).count();
+      last_line_qp_solve_us_ = last_line_qp_fail_.solve_ms * 1000.0;
+      last_line_qp_fail_.status = static_cast<int>(qp.results.info.status);
+      std::snprintf(last_line_qp_fail_.status_name,
+                    sizeof(last_line_qp_fail_.status_name), "%s",
+                    proxqp_status_name(qp.results.info.status));
+      last_line_qp_fail_.iter = static_cast<int>(qp.results.info.iter);
+      last_line_qp_fail_.pri_res = static_cast<double>(qp.results.info.pri_res);
+      last_line_qp_fail_.dua_res = static_cast<double>(qp.results.info.dua_res);
+      fill_worst(qp.results.x);
+      if(qp.results.info.status!=proxsuite::proxqp::QPSolverOutput::PROXQP_SOLVED) {
+        finish_dump();
+        return reject("qp_status_"+std::to_string(static_cast<int>(qp.results.info.status)));
+      }
+      x=qp.results.x;
+    } catch(...) {
       finish_dump();
-      return reject("qp_status_"+std::to_string(static_cast<int>(qp.results.info.status)));
+      return reject("qp_exception");
     }
-    x=qp.results.x;
-  } catch(...) {
-    finish_dump();
-    return reject("qp_exception");
+    if(!x.allFinite()) {
+      finish_dump();
+      return reject("qp_nonfinite");
+    }
   }
-  if(!x.allFinite()) {
-    finish_dump();
-    return reject("qp_nonfinite");
-  }
+  // Hard constraint matrix check for A/B/C — B must not skip this.
   if(line_.waist_locked) for(int k=0;k<n;++k) x.segment(k*d,kNWaist).setZero();
-  const Eigen::VectorXd cx=C*x;
-  if((cx.array()<lo.array()-2e-7).any() || (cx.array()>hi.array()+2e-7).any()) {
-    fill_worst(x);
-    finish_dump();
-    return reject("qp_primal_residual");
+  {
+    const Eigen::VectorXd cx=C*x;
+    if((cx.array()<lo.array()-2e-7).any() || (cx.array()>hi.array()+2e-7).any()) {
+      fill_worst(x);
+      finish_dump();
+      return reject("qp_primal_residual");
+    }
+  }
+  last_line_qp_dx_norm_ = x.norm();
+  if(!nominal.empty()) {
+    last_line_qp_nominal_ = nominal.front();
   }
   prev=from;
   // The first interval starts at the actual stream reference, not the old endpoint.
@@ -514,18 +584,20 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
       const auto pose=kin_.fk(mid,line_.frame);
       const Vec3 ab=line_.target-p_start;
       const double along=std::clamp((pose.col(3).head<3>()-p_start).dot(ab)/std::max(ab.squaredNorm(),1e-12),0.0,1.0);
-      if((pose.col(3).head<3>()-(p_start+along*ab)).norm()>0.003 ||
+      if((pose.col(3).head<3>()-(p_start+along*ab)).norm()>qp_cross_tube_m(along) ||
           !guards_.com_xy_inside(kin_.com(mid))) {
         finish_dump();
         return reject("qp_nonlinear_tube_or_com");
       }
       if(line_.ori_on && ori_error_xyzw(quat_slerp_xyzw(ori_start,line_.quat,(1-a)*previous_t+a*t),
-          rot_to_quat_xyzw(pose.block<3,3>(0,0))).norm()>arrived_ori_rad_+1e-6) {
+          rot_to_quat_xyzw(pose.block<3,3>(0,0))).norm()>
+              qp_ori_tol_rad(along,arrived_ori_rad_)+1e-6) {
         finish_dump();
         return reject("qp_nonlinear_orientation");
       }
     }
     if (k == 0) {
+      last_line_qp_pre_ = q;
       to = q;
       // Final emit projection: QP half-spaces stop intentional reverse, but
       // float crumbs and pitch-sum coupling can still wiggle. Enforce the live
@@ -568,7 +640,26 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
           }
         }
       };
-      if (line_direction_strict_enable_ && line_.direction_check.ok) {
+      // Recovery may need to move pitch against the path contract sign (hold
+      // wall-hug: path wants more fold, recovery wants back into ±hard).
+      auto apply_pitch_need_recover = [&](double need) {
+        for (int ax : {1, 0, 2}) {
+          if (std::abs(need) <= 1e-15) break;
+          const double lo = limits_.q_min[ax] + q_limit_margin_;
+          const double hi = limits_.q_max[ax] - q_limit_margin_;
+          const double room = need > 0.0 ? (hi - to[ax]) : (lo - to[ax]);
+          const double capped =
+              need > 0.0 ? std::min(need, std::min(room, from[ax] + cap[ax] - to[ax]))
+                         : std::max(need, std::max(room, from[ax] - cap[ax] - to[ax]));
+          to[ax] += capped;
+          need -= capped;
+        }
+      };
+      // Direction freeze must not cancel pitch recovery: wall-hug hold paths
+      // often have psgn==0, and pinning to `from` made stream_pitch_recovery
+      // timeout deterministic (r32). While recovering, only shrink |pitch|.
+      if (line_direction_strict_enable_ && line_.direction_check.ok &&
+          !pitch_recovering_from) {
         reclamp_axes();
         double p_to = to[0] + to[1] + to[2];
         if (psgn == 0) {
@@ -588,18 +679,30 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
         }
       }
       // Joint pitch-box projection after direction repair. Ordinary segments
-      // target the hard box; recovery keeps the start/from envelope (no growth).
-      // Re-validate tube/CoM/velocity/direction; refuse rather than emit illegal.
+      // target the hard box. Recovery shrinks by one waist-rate step toward
+      // the hard box (never grow; never keep the old no-pull envelope forever).
       if (torso_pitch_max_ > 0.0) {
         const double start_abs = std::abs(pitch0);
         const double from_abs = std::abs(p_from);
-        const double bound = pitch_abs_bound(
-            torso_pitch_max_, std::max(start_abs, from_abs), /*for_gate=*/true);
+        const double bound =
+            pitch_recovering_from
+                ? (torso_pitch_max_ +
+                   std::max(0.0, from_pitch_ex - pitch_recover_step) +
+                   kPitchRoundEpsRad)
+                : pitch_abs_bound(torso_pitch_max_,
+                                  std::max(start_abs, from_abs),
+                                  /*for_gate=*/true);
         double p_to = to[0] + to[1] + to[2];
         if (std::abs(p_to) > bound) {
-          const double target_p = std::copysign(bound, p_to == 0.0 ? p_from : p_to);
-          apply_pitch_need(target_p - p_to);
-          if (line_direction_strict_enable_ && line_.direction_check.ok) {
+          const double target_p =
+              std::copysign(bound, p_to == 0.0 ? p_from : p_to);
+          if (pitch_recovering_from) {
+            apply_pitch_need_recover(target_p - p_to);
+          } else {
+            apply_pitch_need(target_p - p_to);
+          }
+          if (line_direction_strict_enable_ && line_.direction_check.ok &&
+              !pitch_recovering_from) {
             reclamp_axes();
             p_to = to[0] + to[1] + to[2];
             if (psgn == 0) {
@@ -630,7 +733,8 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
         }
         if (scale < 1.0 - 1e-12) {
           to = from + scale * dq;
-          if (line_direction_strict_enable_ && line_.direction_check.ok) {
+          if (line_direction_strict_enable_ && line_.direction_check.ok &&
+              !pitch_recovering_from) {
             reclamp_axes();
             double p_scaled = to[0] + to[1] + to[2];
             if (psgn == 0) {
@@ -645,9 +749,14 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
           if (torso_pitch_max_ > 0.0) {
             const double start_abs = std::abs(pitch0);
             const double from_abs = std::abs(p_from);
-            const double bound = pitch_abs_bound(
-                torso_pitch_max_, std::max(start_abs, from_abs),
-                /*for_gate=*/true);
+            const double bound =
+                pitch_recovering_from
+                    ? (torso_pitch_max_ +
+                       std::max(0.0, from_pitch_ex - pitch_recover_step) +
+                       kPitchRoundEpsRad)
+                    : pitch_abs_bound(torso_pitch_max_,
+                                      std::max(start_abs, from_abs),
+                                      /*for_gate=*/true);
             const double p_scaled = to[0] + to[1] + to[2];
             if (std::abs(p_scaled) > bound + kPitchRoundEpsRad) {
               finish_dump();
@@ -661,8 +770,8 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
         }
       }
       for (int j = 0; j < 18; ++j) {
-        if (to[j] < limits_.q_min[j] + q_limit_margin_ - 1e-7 ||
-            to[j] > limits_.q_max[j] - q_limit_margin_ + 1e-7) {
+        if (to[j] < limits_.q_min[j] - 1e-7 ||
+            to[j] > limits_.q_max[j] + 1e-7) {
           finish_dump();
           return reject("qp_projection_joint_limit");
         }
@@ -674,13 +783,17 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
             (pose.col(3).head<3>() - p_start).dot(ab) /
                 std::max(ab.squaredNorm(), 1e-12),
             0.0, 1.0);
-        if ((pose.col(3).head<3>() - (p_start + along * ab)).norm() > 0.003 ||
+        if ((pose.col(3).head<3>() - (p_start + along * ab)).norm() >
+                qp_cross_tube_m(along) ||
             !guards_.com_xy_inside(kin_.com(to))) {
           finish_dump();
           return reject("qp_projection_tube_or_com");
         }
       }
-      if (line_direction_strict_enable_ && line_.direction_check.ok) {
+      // Recovery may move frozen waist axes / pitch toward the hard box; the
+      // QP already skipped direction rows while pitch_recovering.
+      if (line_direction_strict_enable_ && line_.direction_check.ok &&
+          !pitch_recovering_from) {
         for (int a = 0; a < 3; ++a) {
           const int sgn = line_.direction_contract.sign[a];
           const double dq = to[a] - from[a];
@@ -713,9 +826,241 @@ bool CartesianTracker::line_path_qp(const Vec18& from, double next_prog,
           return reject("qp_projection_direction");
         }
       }
+      // Full first-stage chord after projection (not endpoint-only).
+      for (int j = 1; j <= 5; ++j) {
+        const double a = j / 5.0;
+        const Vec18 mid = (1 - a) * from + a * to;
+        const auto pose = kin_.fk(mid, line_.frame);
+        const Vec3 ab = line_.target - p_start;
+        const double along = std::clamp(
+            (pose.col(3).head<3>() - p_start).dot(ab) /
+                std::max(ab.squaredNorm(), 1e-12),
+            0.0, 1.0);
+        if ((pose.col(3).head<3>() - (p_start + along * ab)).norm() >
+                qp_cross_tube_m(along) ||
+            !guards_.com_xy_inside(kin_.com(mid))) {
+          finish_dump();
+          return reject("qp_projection_chord_tube_or_com");
+        }
+        if (line_.ori_on &&
+            ori_error_xyzw(quat_slerp_xyzw(ori_start, line_.quat,
+                                           (1 - a) * previous_t + a * t),
+                           rot_to_quat_xyzw(pose.block<3, 3>(0, 0)))
+                    .norm() > qp_ori_tol_rad(along, arrived_ori_rad_) + 1e-6) {
+          finish_dump();
+          return reject("qp_projection_chord_orientation");
+        }
+      }
     }
-    prev=q; previous_t=t;
+    // Subsequent prediction must continue from the actual first-stage result
+    // (projected), not the pre-projection QP state.
+    if (k == 0) {
+      prev = to;
+      previous_t = t;
+      if ((to - q).cwiseAbs().maxCoeff() > 1e-6) {
+        // Rebuild remaining horizon from the projected first stage along the
+        // nominal path (not the stale ProxQP x for k>0). Re-anchor onto the
+        // path from the accepted `to` — comparing against progress[0] (the
+        // pre-projection nominal) falsely rejects feasible projected steps.
+        auto at = [this](double p) { return line_at(p); };
+        auto chord_ok = [&](const Vec18& a, const Vec18& b, double ta,
+                            double tb, const char* tube_reason,
+                            const char* ori_reason) -> bool {
+          for (int j = 1; j <= 5; ++j) {
+            const double alpha = j / 5.0;
+            const Vec18 mid = (1.0 - alpha) * a + alpha * b;
+            const auto pose = kin_.fk(mid, line_.frame);
+            const Vec3 ab = line_.target - p_start;
+            const double along = std::clamp(
+                (pose.col(3).head<3>() - p_start).dot(ab) /
+                    std::max(ab.squaredNorm(), 1e-12),
+                0.0, 1.0);
+            if ((pose.col(3).head<3>() - (p_start + along * ab)).norm() >
+                    qp_cross_tube_m(along) ||
+                !guards_.com_xy_inside(kin_.com(mid))) {
+              finish_dump();
+              reject(tube_reason);
+              return false;
+            }
+            if (line_.ori_on &&
+                ori_error_xyzw(
+                    quat_slerp_xyzw(ori_start, line_.quat,
+                                    (1.0 - alpha) * ta + alpha * tb),
+                    rot_to_quat_xyzw(pose.block<3, 3>(0, 0)))
+                        .norm() >
+                    qp_ori_tol_rad(along, arrived_ori_rad_) + 1e-6) {
+              finish_dump();
+              reject(ori_reason);
+              return false;
+            }
+          }
+          return true;
+        };
+        auto fill_postproj_diag = [&](int kk, const Vec18& pred,
+                                      const Vec18& qk, double pred_s) {
+          int worst_j = 0;
+          double worst_ratio = -1.0;
+          for (int j = 0; j < 18; ++j) {
+            const double dq = std::abs(qk[j] - pred[j]);
+            const double c = std::max(cap[j], 1e-12);
+            const double ratio = dq / c;
+            if (ratio > worst_ratio) {
+              worst_ratio = ratio;
+              worst_j = j;
+            }
+          }
+          last_line_qp_fail_.worst_c = worst_j;
+          last_line_qp_fail_.worst_violation =
+              std::abs(qk[worst_j] - pred[worst_j]) - cap[worst_j];
+          std::snprintf(last_line_qp_fail_.worst_tag,
+                        sizeof(last_line_qp_fail_.worst_tag),
+                        "kk%d_j%d", kk, worst_j);
+          last_line_qp_fail_.prog = pred_s;
+        };
+
+        Vec18 pred = to;
+        const double search_lo = std::max(0.0, progress[0] - 3.0);
+        const double search_hi =
+            std::min(end, progress[0] + static_cast<double>(std::max(n, 1)));
+        // recover still reports the nearest sample even when residual>tol;
+        // residual/ambiguous/cross_knot must bridge, not hard-stop (r27 field).
+        const auto recovered =
+            recover_path_progress(search_lo, search_hi, to, at);
+        const bool nearest_usable =
+            recovered.ok ||
+            std::strncmp(recovered.reason, "residual_", 9) == 0 ||
+            std::strncmp(recovered.reason, "zero_span_residual", 18) == 0 ||
+            std::strcmp(recovered.reason, "ambiguous_minima") == 0 ||
+            std::strcmp(recovered.reason, "cross_knot_uncertain") == 0;
+        if (!nearest_usable) {
+          std::snprintf(last_line_qp_fail_.worst_tag,
+                        sizeof(last_line_qp_fail_.worst_tag), "%.27s",
+                        recovered.reason);
+          finish_dump();
+          return reject("qp_postproj_horizon_anchor");
+        }
+        double pred_s = recovered.prog;
+        // Prefer a path sample already inside the velocity box from `to`.
+        bool horizon_done = false;
+        if (const auto on_path =
+                find_progress_within_cap(search_lo, search_hi, to, cap, at)) {
+          pred_s = *on_path;
+        } else {
+          // Off-path after projection: bridge toward nearest nominal sample
+          // even when recover residual exceeded the 15 mrad map tolerance.
+          const double goal_s = recovered.prog;
+          const Vec18 q_goal = at(goal_s);
+          const int bridge = count_cap_substeps(pred, q_goal, cap);
+          if (bridge < 0 || bridge > n - 1) {
+            fill_postproj_diag(1, pred, q_goal, goal_s);
+            finish_dump();
+            return reject(bridge < 0 ? "qp_postproj_horizon_bridge"
+                                     : "qp_postproj_horizon_velocity");
+          }
+          if (bridge > 0) {
+            Vec18 cursor = pred;
+            const double bridge_t = goal_s / std::max(end, 1.0);
+            double cursor_t = bridge_t;
+            for (int s = 1; s <= bridge; ++s) {
+              const double alpha =
+                  static_cast<double>(s) / static_cast<double>(bridge);
+              const Vec18 step = pred + alpha * (q_goal - pred);
+              if (!within_velocity_cap(cursor, step, cap)) {
+                fill_postproj_diag(s, cursor, step, goal_s);
+                finish_dump();
+                return reject("qp_postproj_horizon_velocity");
+              }
+              if (!chord_ok(cursor, step, cursor_t, bridge_t,
+                            "qp_postproj_horizon_tube_or_com",
+                            "qp_postproj_horizon_orientation")) {
+                return false;
+              }
+              for (int j = 0; j < 18; ++j) {
+                if (step[j] < limits_.q_min[j] - 1e-7 ||
+                    step[j] > limits_.q_max[j] + 1e-7) {
+                  fill_postproj_diag(s, cursor, step, goal_s);
+                  finish_dump();
+                  return reject("qp_postproj_horizon_bridge");
+                }
+              }
+              cursor = step;
+              cursor_t = bridge_t;
+            }
+            pred = q_goal;
+            pred_s = goal_s;
+            const int stages_left = n - 1 - bridge;
+            if (stages_left <= 0) {
+              horizon_done = true;
+            } else {
+              double pred_t = pred_s / std::max(end, 1.0);
+              for (int kk = 0; kk < stages_left; ++kk) {
+                pred_s = bounded_path_progress(pred_s, end, pred, cap, at);
+                const Vec18 qk = at(pred_s);
+                if (!within_velocity_cap(pred, qk, cap)) {
+                  fill_postproj_diag(bridge + 1 + kk, pred, qk, pred_s);
+                  finish_dump();
+                  return reject("qp_postproj_horizon_velocity");
+                }
+                const double tk = pred_s / std::max(end, 1.0);
+                if (!chord_ok(pred, qk, pred_t, tk,
+                              "qp_postproj_horizon_tube_or_com",
+                              "qp_postproj_horizon_orientation")) {
+                  return false;
+                }
+                pred = qk;
+                pred_t = tk;
+              }
+              horizon_done = true;
+            }
+          } else {
+            pred_s = goal_s;
+          }
+        }
+        if (horizon_done) {
+          break;
+        }
+        double pred_t = pred_s / std::max(end, 1.0);
+        for (int kk = 1; kk < n; ++kk) {
+          pred_s = bounded_path_progress(pred_s, end, pred, cap, at);
+          const Vec18 qk = at(pred_s);
+          if (!within_velocity_cap(pred, qk, cap)) {
+            // One more catch attempt: advance to a reachable path sample.
+            const auto catch_s = find_progress_within_cap(
+                pred_s, std::min(end, pred_s + static_cast<double>(n - kk)),
+                pred, cap, at);
+            if (!catch_s) {
+              fill_postproj_diag(kk, pred, qk, pred_s);
+              finish_dump();
+              return reject("qp_postproj_horizon_velocity");
+            }
+            const Vec18 q_catch = at(*catch_s);
+            const double tk = *catch_s / std::max(end, 1.0);
+            if (!chord_ok(pred, q_catch, pred_t, tk,
+                          "qp_postproj_horizon_tube_or_com",
+                          "qp_postproj_horizon_orientation")) {
+              return false;
+            }
+            pred = q_catch;
+            pred_s = *catch_s;
+            pred_t = tk;
+            continue;
+          }
+          const double tk = pred_s / std::max(end, 1.0);
+          if (!chord_ok(pred, qk, pred_t, tk, "qp_postproj_horizon_tube_or_com",
+                        "qp_postproj_horizon_orientation")) {
+            return false;
+          }
+          pred = qk;
+          pred_t = tk;
+        }
+        break;  // horizon rebuilt and checked; skip stale ProxQP stages
+      }
+    } else {
+      prev = q;
+      previous_t = t;
+    }
   }
+  last_line_qp_proj_max_ = (to - last_line_qp_pre_).cwiseAbs().maxCoeff();
   // Success clears the fail latch so notes only show the last real refusal.
   last_line_qp_fail_ = LineQpFailSnapshot{};
   last_line_qp_fail_dump_.pending_write = false;

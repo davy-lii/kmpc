@@ -27,6 +27,17 @@ inline constexpr double kPitchWallEpsDeg = 0.5;
 inline constexpr double kStartPitchAdmitRad = 0.005;
 // Rounding / float judgment only (gates). Not a planning target budget.
 inline constexpr double kPitchRoundEpsRad = 1e-6;
+// Pitch-recovery first chord may retreat EE by waist nullspace pull (r33 field:
+// ~8e-6 m). Allow a bounded reverse along the path only while |pitch|>hard;
+// meters, not the dimensionless progress_margin reported in rejects.
+inline constexpr double kStreamRecoverProgressSlackM = 1e-3;
+// Final-send progress gate. along is a dot product, so this coefficient is the
+// allowed retreat in meters. 1 cm: a waist pull may nudge the hand backward
+// without counting as a real reverse. Normal large reversals still fail.
+inline constexpr double kStreamFilteredProgressSlackM = 0.01;
+// Planning: recovering / near-wall end pose must keep at least this pitch
+// margin inside ±hard (Z-squat preference). ~1.5°.
+inline constexpr double kPitchSquatEndMarginRad = 1.5 * kPi / 180.0;
 
 // Absolute pitch bound for one sample.
 // Ordinary (start inside hard): planning uses hard; gates add only round eps.

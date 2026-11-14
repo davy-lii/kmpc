@@ -3,7 +3,9 @@
 // compute 只编排：FK/J → 装配 P,g,A,b → ProxQP → ARRIVED。Safety / Planner 不进这里。
 // 腰锁只覆盖 dq_max。z_home / λ / q4_pref 钉构造期 HOME，不随运行 q_calib 热改。
 
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -16,6 +18,9 @@
 #include "kmpc/constraints.hpp"
 #include "kmpc/kinematics.hpp"
 #include "kmpc/line_contract.hpp"
+#include "kmpc/path_layer_metrics.hpp"
+#include "kmpc/path_progress.hpp"
+#include "kmpc/path_smooth_verify.hpp"
 #include "kmpc/qp_solver.hpp"
 #include "kmpc/types.hpp"
 #include "kmpc/upper_command.hpp"
@@ -34,6 +39,34 @@ struct LineTarget {
   Vec4 quat_xyzw = Vec4(0, 0, 0, 1);
   bool ori_on = false;
   std::string frame = std::string(kBaseFrame);
+};
+
+// 只读对照用的路径几何。不参与正式选路。
+struct LinePoseKnot {
+  double s = 0.0;
+  double hand_err_m = 0.0;
+  double pitch_rad = 0.0;
+  double body_z_m = 0.0;
+  double body_x_m = 0.0;
+  double fold_x_m = 0.0;
+  double waist_motion_rad = 0.0;
+  double arm_motion_rad = 0.0;
+};
+
+// 同一起点、手目标和可选后继下，当前整段拟合与有限折叠初值的硬约束对照。
+// 正式建路仍走原来的接受顺序；本结果不得直接当指令。
+struct LineFoldContrast {
+  bool baseline_hard_ok = false;
+  bool fold_hard_ok = false;
+  bool early_waist_arm_overlap = false;
+  std::string baseline_reason;
+  std::string fold_reason;
+  double baseline_body_drop_m = 0.0;
+  double fold_body_drop_m = 0.0;
+  double baseline_end_pitch_rad = 0.0;
+  double fold_end_pitch_rad = 0.0;
+  std::vector<LinePoseKnot> baseline_knots;
+  std::vector<LinePoseKnot> fold_knots;
 };
 
 class CartesianTracker {
@@ -96,13 +129,20 @@ class CartesianTracker {
   int line_gen() const { return line_gen_; }
   // Path-rate update only. Does not change planning, freeze, or safety.
   // Experiment default is r10b first-order; r11 S-curve remains the same-build baseline.
+  // UnifiedTimeLaw: single s(t) from path tangent + end/corner brake + feedback.
   enum class LinePaceMode : uint8_t {
     R11Scurve = 0,
     R10bFirstOrder = 1,
+    UnifiedTimeLaw = 2,
   };
   static constexpr LinePaceMode kDefaultLinePaceMode = LinePaceMode::R10bFirstOrder;
   static const char* line_pace_mode_name(LinePaceMode mode) {
-    return mode == LinePaceMode::R10bFirstOrder ? "r10b_first_order" : "r11_scurve";
+    switch (mode) {
+      case LinePaceMode::R10bFirstOrder: return "r10b_first_order";
+      case LinePaceMode::UnifiedTimeLaw: return "unified_time_law";
+      case LinePaceMode::R11Scurve: return "r11_scurve";
+    }
+    return "r11_scurve";
   }
   static bool parse_line_pace_mode(std::string_view text, LinePaceMode* out) {
     if (!out) {
@@ -116,7 +156,43 @@ class CartesianTracker {
       *out = LinePaceMode::R10bFirstOrder;
       return true;
     }
+    if (text == "unified_time_law" || text == "unified") {
+      *out = LinePaceMode::UnifiedTimeLaw;
+      return true;
+    }
     return false;
+  }
+
+  // Live path interpolant. VerifiedHermite only after full revalidation.
+  enum class LinePathInterp : uint8_t {
+    Linear = 0,
+    VerifiedHermite = 1,
+  };
+  static const char* line_path_interp_name(LinePathInterp mode) {
+    return mode == LinePathInterp::VerifiedHermite ? "verified_hermite" : "linear";
+  }
+
+  // Offline/new-chain profile. Default Legacy keeps production A-chain.
+  // NewUnified: try verified smooth + UnifiedTimeLaw + QP-B follow (still offline
+  // gated; does not change the formal default until explicitly switched).
+  enum class LineChainProfile : uint8_t {
+    Legacy = 0,
+    NewUnified = 1,
+  };
+  static const char* line_chain_profile_name(LineChainProfile p) {
+    return p == LineChainProfile::NewUnified ? "new_unified" : "legacy";
+  }
+  void set_line_chain_profile(LineChainProfile profile);
+  LineChainProfile line_chain_profile() const { return line_chain_profile_; }
+  LinePathInterp line_path_interp() const { return line_path_interp_; }
+  const PathSmoothReport& last_path_smooth_report() const {
+    return last_path_smooth_report_;
+  }
+  void set_stream_commit_feedback_scale(double scale) {
+    stream_commit_feedback_scale_ = std::clamp(scale, 0.0, 1.0);
+  }
+  double stream_commit_feedback_scale() const {
+    return stream_commit_feedback_scale_;
   }
 
   // speed_scale 是直线自己的比例，0..1，不跟 QP 的 dq_scale。accel_s<=0 表示这一拍直接用满，不爬坡。
@@ -159,6 +235,13 @@ class CartesianTracker {
   // Sparse line ProxQP iteration budget. Non-SOLVED still refuses the segment.
   bool set_line_qp_max_iter(int max_iter);
   int line_qp_max_iter() const { return line_qp_max_iter_; }
+
+  // P3 ablation: A=current reshape QP (default), B=direct nominal+hard checks,
+  // C=min-correction objective. Hard constraints stay in all modes.
+  void set_line_qp_follow_mode(LineQpFollowMode mode) {
+    line_qp_follow_mode_ = mode;
+  }
+  LineQpFollowMode line_qp_follow_mode() const { return line_qp_follow_mode_; }
   double line_rate() const { return line_rate_; }
   // S-curve acceleration state. First-order mode keeps this at 0 (not applicable).
   double line_rate_acc() const { return line_rate_acc_; }
@@ -277,6 +360,11 @@ class CartesianTracker {
   // Category only — never replaces root reason (e.g. pitch_recovery_infeasible).
   const std::string& line_failure_category() const { return line_.failure_category; }
   const std::string& line_candidate() const { return line_.candidate; }
+  const std::string& line_pose_report() const { return line_.pose_report; }
+  // 不改 line_、不改候选胜出。折叠初值只用来证明有没有共同硬门下的对照解。
+  LineFoldContrast probe_fold_contrast(
+      const Vec18& q0, bool left, const Vec3& target, const Vec4* quat,
+      const LineTarget* successor = nullptr) const;
   const std::string& line_pose_pref_decision() const { return line_.pose_pref_decision; }
   const DirectionContract& line_direction_contract() const {
     return line_.direction_contract;
@@ -284,6 +372,13 @@ class CartesianTracker {
   const DirectionCheckResult& line_direction_check() const {
     return line_.direction_check;
   }
+  // Shared by offline runner / final gate (same objects as the live tracker).
+  const WholeBodyGuards& guards() const { return guards_; }
+  const Vec3& line_target_xyz() const { return line_.target; }
+  const Vec4& line_target_quat() const { return line_.quat; }
+  const std::string& line_ee_frame() const { return line_.frame; }
+  bool line_ori_on() const { return line_.ori_on; }
+  bool line_is_left() const { return line_.left; }
   double line_max_arm_fold() const { return line_.max_arm_fold; }
   double line_build_ms() const { return line_.build_ms; }
   double line_progress() const { return line_.prog; }
@@ -323,6 +418,55 @@ class CartesianTracker {
   bool line_direction_strict_enabled() const {
     return line_direction_strict_enable_;
   }
+
+  // Read-only shadow candidate / corner metrics (P1). Never changes selection.
+  void set_line_shadow_diag_enable(bool enable) {
+    line_shadow_diag_enable_ = enable;
+  }
+  bool line_shadow_diag_enabled() const { return line_shadow_diag_enable_; }
+  const PathCornerMetrics& last_path_corner_metrics() const {
+    return last_path_corner_metrics_;
+  }
+
+  // Shared 50 Hz control tick for cross-layer attribution (P0).
+  void set_control_tick_id(uint64_t tick_id) {
+    control_tick_id_.store(tick_id, std::memory_order_release);
+  }
+  uint64_t control_tick_id() const {
+    return control_tick_id_.load(std::memory_order_acquire);
+  }
+
+  // When true (node/stream path), follow_line leaves a pending propose until
+  // confirm/abort. Stale pending is aborted — never auto-confirmed.
+  // Default false: offline compute consumers treat the returned dq as accepted.
+  void set_line_commit_requires_stream(bool enable) {
+    line_commit_requires_stream_ = enable;
+  }
+  bool line_commit_requires_stream() const {
+    return line_commit_requires_stream_;
+  }
+
+  // P2 commit transaction: propose in follow_line, confirm/abort after stream.
+  bool line_commit_pending() const { return line_commit_pending_; }
+  uint64_t line_commit_tick_id() const { return line_commit_tick_id_; }
+  const ProgressRecoverResult& last_progress_recover() const {
+    return last_progress_recover_;
+  }
+  // Recover path progress from the accepted joint (not chord scale alone).
+  // scale is retained for diagnostics / feedback into the unified time law.
+  bool confirm_line_stream_commit(const Vec18& accepted, double scale);
+  void abort_line_stream_commit();
+  // Drop pending without restoring (line is being cleared/replaced).
+  void discard_line_stream_commit();
+  double last_line_qp_solve_us() const { return last_line_qp_solve_us_; }
+  double last_line_qp_dx_norm() const { return last_line_qp_dx_norm_; }
+  double last_line_qp_proj_max() const { return last_line_qp_proj_max_; }
+  const Vec18& last_line_qp_nominal() const { return last_line_qp_nominal_; }
+  const Vec18& last_line_qp_pre() const { return last_line_qp_pre_; }
+  const Vec18& line_commit_from() const { return line_commit_from_; }
+  const Vec18& line_commit_proposed() const { return line_commit_proposed_; }
+  double line_commit_old_prog() const { return line_commit_old_prog_; }
+  double line_commit_new_prog() const { return line_commit_new_prog_; }
 
   // Restored off switch. Default ON preserves r12 retreat behavior while forward
   // isolation turns straighten off first.
@@ -392,13 +536,23 @@ class CartesianTracker {
     LineDiagLayer layer = LineDiagLayer::Build;
     uint64_t goal_generation = 0;
     int line_gen = 0;
+    uint64_t tick_id = 0;
     double t_steady_s = 0.0;
     double prog = 0.0;
+    double s_dot = 0.0;
     double build_ms = 0.0;
+    double solve_us = 0.0;
+    double commit_scale = 1.0;
+    double qp_dx_norm = 0.0;
+    double dq_proj_max = 0.0;
+    uint8_t qp_mode = 0;
+    uint8_t field_mask = 0;
     char candidate[32]{};
     char decision[48]{};
     Vec18 q = Vec18::Zero();
     Vec18 q_aux = Vec18::Zero();  // QP from / feedback, depending on layer
+    Vec18 q_nominal = Vec18::Zero();
+    Vec18 q_pre = Vec18::Zero();
     // steady_clock 纪元纳秒。source_stamp_ns 只在有消息头时填写，否则 -1。
     uint64_t mono_ns = 0;
     int64_t source_stamp_ns = -1;
@@ -522,9 +676,11 @@ class CartesianTracker {
     bool cascade_passed = false;
     bool cascade_forced_waist = false;
     bool cascade_full_body = false;
-    // arm_only | free_fit | tip_seed | cascade_full_body | pose_pref |
-    // reverse_cache | qa_seed | none
+    // arm_only | free_fit | fold_15 | pose_pref | reverse_cache | qa_seed | none
+    // (tip_seed / cascade_full_body / seed_monotone removed: empty pool refuses)
     std::string candidate = "none";
+    // 胜出路径的姿态账：肩架升降、前后移、折叠枢轴、俯仰、质量分。
+    std::string pose_report;
     // skipped | accepted | rejected_<reason> | disabled
     std::string pose_pref_decision = "disabled";
     // skipped | accepted | rejected_<reason>
@@ -537,6 +693,13 @@ class CartesianTracker {
     DirectionCheckResult direction_check{};
     // Worker→main handoff of the paired tip commitment (cascade_full_body).
     SuccessorPlan successor{};
+    // Async build must hand back the verified interpolant + smooth report so
+    // the main tracker executes the same curve the worker validated.
+    LinePathInterp path_interp = LinePathInterp::Linear;
+    PathSmoothReport path_smooth{};
+    PathCornerMetrics corners{};
+    bool geometry_c1 = false;
+    LineChainProfile chain_profile = LineChainProfile::Legacy;
     // 异步建线线程的诊断副本。adopt 后拆走，不参与跟踪计算。
     std::vector<LineDiagEvent> diag_events;
     double build_ms = 0.0;
@@ -555,9 +718,15 @@ class CartesianTracker {
     // Always export the current successor commitment with the LineRun so an
     // async worker's cascade tip plan survives into the main tracker.
     line_.successor = successor_plan_;
+    line_.path_interp = line_path_interp_;
+    line_.path_smooth = last_path_smooth_report_;
+    line_.corners = last_path_corner_metrics_;
+    line_.geometry_c1 = last_line_geometry_c1_;
+    line_.chain_profile = line_chain_profile_;
     return line_;
   }
   void adopt_line(LineRun plan) {
+    discard_line_stream_commit();
     if (!plan.diag_events.empty()) {
       line_diag_splice(plan.diag_events);
       plan.diag_events.clear();
@@ -565,6 +734,13 @@ class CartesianTracker {
     reverse_decision_ = plan.reverse_decision.empty() ? reverse_decision_ : plan.reverse_decision;
     successor_plan_ = std::move(plan.successor);
     plan.successor = SuccessorPlan{};
+    // Restore verified path representation before moving samples into line_.
+    line_path_interp_ = plan.path_interp;
+    last_path_smooth_report_ = plan.path_smooth;
+    last_path_corner_metrics_ = plan.corners;
+    last_line_geometry_c1_ = plan.geometry_c1;
+    // Profile is sticky on the main tracker; adopt does not switch it.
+    // Worker must have built under the same profile the node requested.
     line_ = std::move(plan);
     if (!line_.samples.empty()) line_q_=line_.samples.front();
     line_rate_=0; line_rate_acc_=0; ++line_gen_; last_arrived_=false;
@@ -588,7 +764,7 @@ class CartesianTracker {
       bool ori_on, bool lock_waist, const std::string& frame,
       std::vector<Vec18, Eigen::aligned_allocator<Vec18>>& samples,
       bool& waist_locked, bool allow_relock = true, const Vec18* goal_seed = nullptr,
-      const Vec18* pose_pref = nullptr) const;
+      const Vec18* pose_pref = nullptr, double sample_step_m = -1.0) const;
   bool line_validate(const std::vector<Vec18, Eigen::aligned_allocator<Vec18>>& samples,
       const Vec3& target, const Vec4* quat, bool ori_on, const std::string& frame) const;
   bool line_path_qp(const Vec18& from, double next_prog, const Vec18& cap, Vec18& to);
@@ -644,6 +820,28 @@ class CartesianTracker {
   uint64_t line_qp_pitch_monotonic_hits_ = 0;
   bool reverse_last_line_enable_ = true;
   bool line_direction_strict_enable_ = true;
+  bool line_shadow_diag_enable_ = true;
+  LineQpFollowMode line_qp_follow_mode_ = LineQpFollowMode::A;
+  LineChainProfile line_chain_profile_ = LineChainProfile::Legacy;
+  LinePathInterp line_path_interp_ = LinePathInterp::Linear;
+  PathSmoothReport last_path_smooth_report_{};
+  double stream_commit_feedback_scale_ = 1.0;
+  std::atomic<uint64_t> control_tick_id_{0};
+  PathCornerMetrics last_path_corner_metrics_{};
+  bool line_commit_requires_stream_ = false;
+  bool line_commit_pending_ = false;
+  uint64_t line_commit_tick_id_ = 0;
+  double line_commit_old_prog_ = 0.0;
+  double line_commit_new_prog_ = 0.0;
+  Vec18 line_commit_from_ = Vec18::Zero();
+  Vec18 line_commit_proposed_ = Vec18::Zero();
+  ProgressRecoverResult last_progress_recover_{};
+  double last_line_qp_solve_us_ = 0.0;
+  double last_line_qp_dx_norm_ = 0.0;
+  double last_line_qp_proj_max_ = 0.0;
+  Vec18 last_line_qp_nominal_ = Vec18::Zero();
+  Vec18 last_line_qp_pre_ = Vec18::Zero();
+  bool last_line_geometry_c1_ = false;
 
   std::string reverse_decision_ = "skipped";
   LastLineCache last_line_cache_{};
