@@ -557,3 +557,139 @@ TEST(ExecChain50250, SendSequenceStatsReport250Hz) {
       "E_250Hz_stats max_dq=%.6f max_ddq=%.6f max_jerk=%.6f folds=%d pauses=%d\n",
       max_dq, max_ddq, max_jerk, fold_events, pause_ticks);
 }
+
+TEST(GateA50250Matrix, DelayFirstTickReversalSwitchAndFeedbackLag) {
+  // A: scheduling delay / first tick / reversal / task switch / feedback lag.
+  const auto config = kmpc::Config::load(
+      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+  kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
+                       "/Light-duty wheeled robot.urdf");
+  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
+  auto policy = kmpc::policy_from_config(config);
+  kmpc::Vec18 q0 = home_q(config);
+  kmpc::Vec18 q1 = q0;
+  q1[4] += 0.03;
+  kmpc::Vec18 q2 = q0;
+  q2[5] += 0.03;
+
+  auto make_pkg = [&](uint64_t gen, const kmpc::Vec18& q_end) {
+    kmpc::TrajectoryPackage pkg = make_hold_package(q0, gen);
+    pkg.path_id = static_cast<uint32_t>(gen);
+    pkg.task_digest = 1000 + gen;
+    pkg.samples = {q0, q_end};
+    pkg.time_law.s = {0.0, 1.0};
+    pkg.time_law.t_s = {0.0, 0.2};
+    pkg.time_law.duration_s = 0.2;
+    return pkg;
+  };
+
+  // --- First tick: after adopt, exec_t starts at 0 and first sample is start.
+  {
+    kmpc::TrajectoryFollower f(kin, &guards, policy);
+    f.set_enable_qp_correction(false);
+    ASSERT_TRUE(f.adopt(make_pkg(1, q1), q0, kmpc::Vec18::Zero(), false));
+    EXPECT_DOUBLE_EQ(f.exec_t(), 0.0);
+    const auto tick = f.step(q0, 0.02);
+    EXPECT_NEAR(tick.exec_t_s, 0.02, 1e-12);
+    EXPECT_LT((tick.q_plan - q0).cwiseAbs().maxCoeff(), 0.02);
+    EXPECT_NE(tick.action, kmpc::FollowerAction::Arrived);
+  }
+
+  // --- Scheduling delay: 50 Hz advances exec_t; 250 Hz fill-in uses wall delta
+  // from the published anchor without jumping past package duration.
+  {
+    kmpc::TrajectoryFollower f(kin, &guards, policy);
+    f.set_enable_qp_correction(false);
+    ASSERT_TRUE(f.adopt(make_pkg(2, q1), q0, kmpc::Vec18::Zero(), false));
+    const auto tick50 = f.step(q0, 0.02);
+    const double anchor = tick50.exec_t_s;
+    // Simulate 4× 250 Hz ticks using wall fill-in from the same anchor.
+    for (int i = 1; i <= 4; ++i) {
+      const double t_fill = anchor + 0.004 * i;
+      kmpc::TrajectoryTimeSample samp;
+      ASSERT_TRUE(kmpc::sample_trajectory_at(f.package(), t_fill, &samp));
+      EXPECT_TRUE(samp.ok);
+      EXPECT_LE(samp.t_s, f.package().time_law.duration_s + 1e-12);
+    }
+  }
+
+  // --- Reversal: 250 Hz Supervisor accepts smooth sign change (shared with B/E).
+  {
+    kmpc::SafetySupervisor sup(kin, &guards, policy);
+    sup.seed(q0);
+    kmpc::Vec18 q = q0;
+    const int j = 5;
+    const double dt = 0.004;
+    const double step = std::min(0.5 * policy.dq_max[j] * dt,
+                                 2.0 * policy.ddq_max[j] * dt * dt);
+    double t = 10.0;
+    auto send = [&](double dq) {
+      kmpc::SafetySupervisorInput in;
+      in.q_cmd = q;
+      in.q_cmd[j] = q[j] + dq;
+      in.q_meas = q;
+      in.has_meas = true;
+      in.meas_timestamp_s = t;
+      in.now_s = t;
+      in.dt = dt;
+      in.q_follow = in.q_cmd;
+      in.has_follow = true;
+      const auto dec = sup.check(in);
+      ASSERT_TRUE(dec.accept) << dec.reason;
+      q = dec.q_send;
+      t += dt;
+    };
+    for (int k = 0; k < 8; ++k) {
+      send(+step);
+    }
+    for (int k = 0; k < 16; ++k) {
+      send(-step);
+    }
+  }
+
+  // --- Task switch: new generation adopt replaces package; old gen cannot ACK.
+  {
+    kmpc::TrajectoryFollower f(kin, &guards, policy);
+    f.set_enable_qp_correction(false);
+    ASSERT_TRUE(f.adopt(make_pkg(10, q1), q0, kmpc::Vec18::Zero(), false));
+    EXPECT_EQ(f.package().generation, 10u);
+    ASSERT_TRUE(f.adopt(make_pkg(11, q2), q0, kmpc::Vec18::Zero(), false));
+    EXPECT_EQ(f.package().generation, 11u);
+    EXPECT_EQ(f.package().path_id, 11u);
+    // Stale ACK for old generation while not waiting is rejected.
+    EXPECT_FALSE(f.on_stage_ack(10, 1, true, q0));
+  }
+
+  // --- Feedback lag: stale measurement timestamp rejected by Supervisor.
+  {
+    kmpc::SafetySupervisor sup(kin, &guards, policy);
+    sup.seed(q0);
+    kmpc::SafetySupervisorInput in;
+    in.q_cmd = q0;
+    in.q_meas = q0;
+    in.has_meas = true;
+    in.dt = 0.004;
+    in.now_s = 100.0;
+    in.meas_timestamp_s = 90.0;  // 10 s lag
+    in.cmd_timestamp_s = 100.0;
+    const auto dec = sup.check(in);
+    EXPECT_FALSE(dec.accept);
+    EXPECT_STREQ(dec.reason, "safety_stale_meas");
+  }
+
+  // --- Feedback lag (no real meas): also rejected.
+  {
+    kmpc::SafetySupervisor sup(kin, &guards, policy);
+    sup.seed(q0);
+    kmpc::SafetySupervisorInput in;
+    in.q_cmd = q0;
+    in.q_meas = q0;
+    in.has_meas = false;
+    in.dt = 0.004;
+    in.now_s = 1.0;
+    in.meas_timestamp_s = 1.0;
+    const auto dec = sup.check(in);
+    EXPECT_FALSE(dec.accept);
+    EXPECT_STREQ(dec.reason, "safety_no_real_meas");
+  }
+}
