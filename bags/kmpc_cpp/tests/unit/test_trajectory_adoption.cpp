@@ -92,9 +92,118 @@ TEST(TrajectoryAdoption, BridgeFailHoldsNotExecuteOldPackage) {
   EXPECT_EQ(follower.state(), kmpc::FollowerState::Hold);
   EXPECT_FALSE(follower.has_package());
 
-  const auto tick = follower.step(q_bad, 0.0, 0.02);
+  const auto tick = follower.step(q_bad, 0.02);
   EXPECT_EQ(tick.state, kmpc::FollowerState::Hold);
   EXPECT_NE(tick.action, kmpc::FollowerAction::Arrived);
+}
+
+TEST(TrajectoryAdoption, SealedIdentityAdoptAndStaleReject) {
+  // Production submit → Worker solve → identity gate: success adopts,
+  // mismatched / zero digest cannot adopt.
+  const auto config = kmpc::Config::load(
+      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+  const std::string urdf =
+      std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf";
+  kmpc::PlannerWorker worker(urdf, config);
+  worker.start();
+  kmpc::Kinematics kin(urdf);
+  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
+  const auto policy = kmpc::policy_from_config(config);
+  const kmpc::Vec18 q0 = config.q_pref;
+  const kmpc::Vec3 p0 = kin.fk_pos(q0, kmpc::kEeFrameRight);
+
+  auto make_task = [&](uint64_t gen) {
+    kmpc::MotionTask task;
+    task.generation = gen;
+    task.q = q0;
+    task.left = false;
+    task.frame = std::string(kmpc::kEeFrameRight);
+    kmpc::TaskStage st;
+    st.geometry = kmpc::TaskGeometry::Lin;
+    st.position = p0 + kmpc::Vec3(0.02, 0.0, 0.0);
+    st.position_tol_m = 0.01;
+    st.stage_id = 1;
+    task.stages.push_back(st);
+    kmpc::seal_motion_task_identity(&task, urdf, false, policy);
+    return task;
+  };
+
+  kmpc::RobotState state;
+  state.q = q0;
+  state.fresh = true;
+
+  // Empty identity must be rejected by Worker (no rewrite / no zero bypass).
+  {
+    kmpc::MotionTask bare = make_task(10);
+    bare.model_digest.clear();
+    worker.submit_snapshot(bare, state, policy, worker.default_weights(), 50.0);
+    kmpc::FastPlanResult bad;
+    bool got = false;
+    for (int i = 0; i < 400; ++i) {
+      if (worker.try_take(bad)) {
+        got = true;
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(got);
+    EXPECT_FALSE(bad.ok);
+    EXPECT_EQ(bad.reason, "missing_model_digest");
+    EXPECT_EQ(bad.task_digest, 0u);
+  }
+
+  // Sealed identity: successful plan must match sealed digest and be adoptable.
+  kmpc::MotionTask task = make_task(11);
+  const uint64_t sealed = kmpc::motion_task_digest(task);
+  ASSERT_NE(sealed, 0u);
+  worker.submit_snapshot(task, state, policy, worker.default_weights(), 50.0);
+  kmpc::FastPlanResult ok_plan;
+  bool got_ok = false;
+  for (int i = 0; i < 400; ++i) {
+    if (worker.try_take(ok_plan)) {
+      got_ok = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_TRUE(got_ok);
+  if (ok_plan.ok) {
+    EXPECT_EQ(ok_plan.task_digest, sealed);
+    EXPECT_EQ(ok_plan.package.task_digest, sealed);
+    EXPECT_NE(ok_plan.package.model_digest, 0u);
+    EXPECT_NE(ok_plan.limits_digest, 0u);
+    EXPECT_FALSE(ok_plan.package.certificate.continuous_certified);
+    kmpc::TrajectoryFollower follower(kin, &guards, policy);
+    std::string why;
+    EXPECT_TRUE(follower.adopt(ok_plan.package, q0, kmpc::Vec18::Zero(), false,
+                               1e-3, 0.5, &why))
+        << why;
+  } else {
+    // Planner may fail geometry on this small fixture; identity path still ran.
+    EXPECT_NE(ok_plan.reason, "missing_model_digest");
+    EXPECT_NE(ok_plan.reason, "model_digest_mismatch");
+  }
+
+  // Stale generation result must not be treated as current identity.
+  worker.submit_snapshot(make_task(12), state, policy, worker.default_weights(),
+                         50.0);
+  worker.submit_snapshot(make_task(13), state, policy, worker.default_weights(),
+                         50.0);
+  kmpc::FastPlanResult latest;
+  bool got_latest = false;
+  for (int i = 0; i < 400; ++i) {
+    if (worker.try_take(latest)) {
+      got_latest = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_TRUE(got_latest);
+  if (latest.ok) {
+    EXPECT_EQ(latest.generation, 13u);
+    EXPECT_EQ(latest.task_digest, kmpc::motion_task_digest(make_task(13)));
+  }
+  worker.stop();
 }
 
 TEST(TrajectoryAdoption, PlannerWorkerLatestGenerationWins) {

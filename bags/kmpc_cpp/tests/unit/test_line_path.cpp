@@ -1397,7 +1397,7 @@ TEST(LinePath, PitchRecoveryOutsideFirstQpDoesNotRefuse) {
     kmpc::TrajectoryFollower follower(kin, &guards, policy);
     ASSERT_TRUE(follower.begin_pitch_recovery(q)) << "excess=" << excess;
     EXPECT_EQ(follower.state(), kmpc::FollowerState::Recovering);
-    const auto first = follower.step(q, 0.0, 0.02);
+    const auto first = follower.step(q, 0.02);
     ASSERT_NE(first.action, kmpc::FollowerAction::ProtectStop)
         << "first tick must not refuse; excess=" << excess << " "
         << first.reason;
@@ -1407,7 +1407,7 @@ TEST(LinePath, PitchRecoveryOutsideFirstQpDoesNotRefuse) {
     // Multi-tick recovery into the hard box (never widen caps).
     for (int i = 0; i < 200; ++i) {
       if (std::abs(q[0] + q[1] + q[2]) <= limit + 1e-6) break;
-      const auto tick = follower.step(q, 0.0, 0.02);
+      const auto tick = follower.step(q, 0.02);
       ASSERT_NE(tick.action, kmpc::FollowerAction::ProtectStop)
           << "excess=" << excess << " i=" << i << " " << tick.reason;
       EXPECT_LE(tick.q_follow[0], policy.q_max[0] + 1e-9);
@@ -1450,7 +1450,7 @@ TEST(LinePath, PitchRecoveryOutsideFirstQpDoesNotRefuse) {
     for (int i = 0; i < static_cast<int>(dur / 0.02) + 100; ++i) {
       const double t =
           std::min(static_cast<double>(i) * 0.02, dur);
-      const auto tick = follower.step(q, t, 0.02);
+      const auto tick = follower.step(q, 0.02);
       ASSERT_NE(tick.action, kmpc::FollowerAction::ProtectStop)
           << "excess=" << excess << " i=" << i << " " << tick.reason;
       q = tick.q_follow;
@@ -1496,7 +1496,7 @@ TEST(LinePath, NewUnifiedModeBPitchRecoveryPullsIntoHardBox) {
   EXPECT_EQ(follower.state(), kmpc::FollowerState::Recovering);
   bool inside = false;
   for (int i = 0; i < 80; ++i) {
-    const auto tick = follower.step(q, 0.0, 0.02);
+    const auto tick = follower.step(q, 0.02);
     ASSERT_NE(tick.action, kmpc::FollowerAction::ProtectStop)
         << "i=" << i << " reason=" << tick.reason;
     EXPECT_LE(tick.q_follow[0], policy.q_max[0] + 1e-9);

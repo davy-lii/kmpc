@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "kmpc/constraint_policy.hpp"
+#include "kmpc/motion_task.hpp"
 #include "kmpc/types.hpp"
 
 namespace kmpc {
@@ -85,13 +86,28 @@ uint64_t package_digest(const TrajectoryPackage& package);
 
 uint64_t limits_digest_of(const MotionConstraintPolicy& policy);
 
+// Immutable model identity from actual URDF bytes + limits digest.
+// Format: "urdf:<content_fnv>:limits:<limits_digest_hex>"
+std::string model_identity_string(const std::string& urdf, bool is_xml,
+                                  uint64_t limits_digest);
+
+// Seal task.model_digest before PlannerWorker submit. Returns motion_task_digest.
+// Worker must only verify this string; it must not rewrite identity fields.
+uint64_t seal_motion_task_identity(MotionTask* task, const std::string& urdf,
+                                   bool is_xml,
+                                   const MotionConstraintPolicy& policy);
+
+// Wall time along the certified time law at a densified sample index.
+double time_at_sample_index(const TrajectoryPackage& package,
+                            std::size_t sample_index);
+
 // Rejects a measured start that disagrees with the certified start.
 // Does not write package.samples.front(). A bridge segment is not built here.
 AdmitDecision admit_package_start(
     const TrajectoryPackage& package, const Vec18& q, const Vec18& dq,
     bool dq_known, double q_tol_rad, double dq_tol);
 
-// Sample the *executed* continuous trajectory at wall time t_s (clamped to
+// Sample the *executed* continuous trajectory at execution time t_s (clamped to
 // [0, duration]). Uses Hermite on samples with s(t) from the time law.
 // This is the single source of truth for 50 Hz monitor and 250 Hz send.
 bool sample_trajectory_at(const TrajectoryPackage& package, double t_s,

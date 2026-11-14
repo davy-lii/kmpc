@@ -2,6 +2,8 @@
 
 #include <string>
 
+#include "kmpc/trajectory_package.hpp"
+
 namespace kmpc {
 
 PlannerWorker::PlannerWorker(std::string urdf, Config config, bool urdf_is_xml)
@@ -130,23 +132,46 @@ void PlannerWorker::loop() {
     FastPlanResult result;
     if (optimizer_ != nullptr) {
       MotionTask task = job.task;
+      // q/dq come from the measured snapshot; they are not part of task identity.
       task.q = job.state.q;
       task.dq = job.state.dq;
       task.dq_known = job.state.dq_known;
-      if (task.model_digest.empty() && kin_ != nullptr) {
-        // Real model identity from URDF path/xml fingerprint length+hash seed.
-        task.model_digest = urdf_is_xml_ ? "urdf_xml:" + urdf_path_.substr(0, 64)
-                                         : "urdf_path:" + urdf_path_;
-      }
-      result = optimizer_->plan(task, job.state, job.policy, job.weights,
-                                job.deadline_ms);
-      result.submit_seq = job.seq;
-      result.generation = task.generation;
-      result.task_digest = motion_task_digest(task);
-      result.model_digest = result.package.model_digest;
-      result.limits_digest = result.package.limits_digest;
-      if (result.package.task_digest == 0) {
-        result.package.task_digest = result.task_digest;
+      // Identity is sealed by the submitter. Worker only verifies — never rewrites.
+      const uint64_t lim = limits_digest_of(job.policy);
+      const std::string expected =
+          model_identity_string(urdf_path_, urdf_is_xml_, lim);
+      if (task.model_digest.empty()) {
+        result.ok = false;
+        result.reason = "missing_model_digest";
+        result.submit_seq = job.seq;
+        result.generation = task.generation;
+        result.task_digest = 0;
+      } else if (task.model_digest != expected) {
+        result.ok = false;
+        result.reason = "model_digest_mismatch";
+        result.submit_seq = job.seq;
+        result.generation = task.generation;
+        result.task_digest = motion_task_digest(task);
+      } else {
+        result = optimizer_->plan(task, job.state, job.policy, job.weights,
+                                  job.deadline_ms);
+        result.submit_seq = job.seq;
+        result.generation = task.generation;
+        // Recompute from the sealed task fields only (Worker did not mutate them).
+        result.task_digest = motion_task_digest(task);
+        result.model_digest = result.package.model_digest;
+        result.limits_digest = result.package.limits_digest;
+        if (result.package.task_digest != 0 &&
+            result.package.task_digest != result.task_digest) {
+          result.ok = false;
+          result.reason = "package_task_digest_mismatch";
+        } else {
+          result.package.task_digest = result.task_digest;
+        }
+        if (result.task_digest == 0) {
+          result.ok = false;
+          result.reason = "zero_task_digest";
+        }
       }
     } else {
       result.ok = false;

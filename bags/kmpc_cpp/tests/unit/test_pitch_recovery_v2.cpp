@@ -70,7 +70,7 @@ TEST(PitchRecoveryV2, ExcessNonIncreasingAndEntersHardBox) {
     bool inside = false;
     const double dt = 0.02;
     for (int i = 0; i < 200; ++i) {
-      const auto tick = follower.step(q, 0.0, dt);
+      const auto tick = follower.step(q, dt);
       ASSERT_NE(tick.action, kmpc::FollowerAction::ProtectStop)
           << "excess=" << excess << " i=" << i << " " << tick.reason;
       // §7.4: excess(t+dt) <= excess(t) + eps
@@ -115,7 +115,7 @@ TEST(PitchRecoveryV2, NearJ1WallStillRecoversWithoutWideningCap) {
   double prev_ex = follower.pitch_excess_of(q);
   bool inside = false;
   for (int i = 0; i < 300; ++i) {
-    const auto tick = follower.step(q, 0.0, dt);
+    const auto tick = follower.step(q, dt);
     if (tick.action == kmpc::FollowerAction::ProtectStop) {
       EXPECT_LE(tick.q_follow[0], policy.q_max[0] + 1e-9);
       break;

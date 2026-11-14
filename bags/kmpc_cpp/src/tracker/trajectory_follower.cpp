@@ -41,9 +41,13 @@ void TrajectoryFollower::reset() {
   recovery_ticks_ = 0;
   brake_ticks_ = 0;
   wait_stage_id_ = 0;
-  wait_ack_t0_ = -1.0;
+  wait_ack_elapsed_s_ = 0.0;
   stage_cursor_ = 0;
   brake_requested_ = false;
+  exec_t_ = 0.0;
+  timeline_frozen_ = false;
+  freeze_exec_t_ = 0.0;
+  freeze_q_.setZero();
   last_ = FollowerTick{};
 }
 
@@ -128,8 +132,12 @@ bool TrajectoryFollower::adopt(const TrajectoryPackage& package,
   recovery_excess0_ = ex;
   stage_cursor_ = 0;
   wait_stage_id_ = 0;
-  wait_ack_t0_ = -1.0;
+  wait_ack_elapsed_s_ = 0.0;
   brake_requested_ = false;
+  exec_t_ = 0.0;
+  timeline_frozen_ = false;
+  freeze_exec_t_ = 0.0;
+  freeze_q_ = q_meas;
   if (ex > kExcessEps) {
     state_ = FollowerState::Recovering;
   } else {
@@ -191,9 +199,12 @@ bool TrajectoryFollower::on_stage_ack(uint64_t generation, uint32_t stage_id,
     last_.action = FollowerAction::NeedReplan;
     return false;
   }
-  wait_ack_t0_ = -1.0;
+  wait_ack_elapsed_s_ = 0.0;
   wait_stage_id_ = 0;
   ++stage_cursor_;
+  // Resume from the frozen stage time — never jump to wall-clock future.
+  exec_t_ = freeze_exec_t_;
+  timeline_frozen_ = false;
   state_ = FollowerState::Active;
   if (why) *why = "ok";
   return true;
@@ -577,8 +588,8 @@ FollowerTick TrajectoryFollower::brake_tick(const Vec18& q_meas, double dt) {
   return tick;
 }
 
-FollowerTick TrajectoryFollower::step(const Vec18& q_meas, double t_s,
-                                      double dt) {
+FollowerTick TrajectoryFollower::step(const Vec18& q_meas, double dt) {
+  const double dtp = std::max(dt, 1e-4);
   if (!q_meas.allFinite()) {
     state_ = FollowerState::Hold;
     last_ = make_hold(has_cmd_ ? q_cmd_ : Vec18::Zero(), "meas_nonfinite");
@@ -605,48 +616,76 @@ FollowerTick TrajectoryFollower::step(const Vec18& q_meas, double t_s,
   }
 
   if (state_ == FollowerState::Recovering) {
-    last_ = recover_tick(q_meas, dt);
+    last_ = recover_tick(q_meas, dtp);
+    last_.t_s = exec_t_;
+    last_.exec_t_s = exec_t_;
+    last_.timeline_frozen = timeline_frozen_;
+    last_.freeze_q = freeze_q_;
     return last_;
   }
   if (state_ == FollowerState::Braking) {
-    last_ = brake_tick(q_meas, dt);
+    last_ = brake_tick(q_meas, dtp);
+    last_.t_s = exec_t_;
+    last_.exec_t_s = exec_t_;
+    last_.timeline_frozen = timeline_frozen_;
+    last_.freeze_q = freeze_q_;
     return last_;
   }
   if (state_ == FollowerState::WaitAck) {
-    FollowerTick tick = make_hold(q_cmd_, "wait_external_ack");
+    // Execution clock stays frozen; only wall-elapsed ACK timeout advances.
+    timeline_frozen_ = true;
+    wait_ack_elapsed_s_ += dtp;
+    FollowerTick tick = make_hold(freeze_q_.allFinite() ? freeze_q_ : q_cmd_,
+                                  "wait_external_ack");
     tick.state = FollowerState::WaitAck;
     tick.action = FollowerAction::WaitExternalAck;
     tick.wait_stage_id = wait_stage_id_;
     tick.generation = package_.generation;
     tick.path_id = package_.path_id;
-    tick.t_s = t_s;
-    if (wait_ack_t0_ < 0.0) {
-      wait_ack_t0_ = t_s;
-    }
-    if (ack_timeout_s_ > 0.0 && (t_s - wait_ack_t0_) > ack_timeout_s_) {
+    tick.t_s = exec_t_;
+    tick.exec_t_s = exec_t_;
+    tick.timeline_frozen = true;
+    tick.freeze_q = freeze_q_;
+    tick.q_plan = freeze_q_;
+    tick.q_ref = freeze_q_;
+    tick.q_follow = freeze_q_;
+    if (ack_timeout_s_ > 0.0 && wait_ack_elapsed_s_ > ack_timeout_s_) {
       state_ = FollowerState::Hold;
       has_package_ = false;
+      timeline_frozen_ = false;
       tick.state = FollowerState::Hold;
       tick.action = FollowerAction::NeedReplan;
       tick.reason = "ack_timeout";
+      tick.timeline_frozen = false;
     }
     last_ = tick;
     return last_;
   }
   if (state_ == FollowerState::Hold || !has_package_) {
     last_ = make_hold(q_cmd_, "hold");
+    last_.t_s = exec_t_;
+    last_.exec_t_s = exec_t_;
+    last_.timeline_frozen = timeline_frozen_;
     return last_;
+  }
+
+  // Advance execution time only while the timeline is not frozen at a barrier.
+  if (!timeline_frozen_) {
+    exec_t_ += dtp;
   }
 
   FollowerTick tick;
   tick.state = FollowerState::Active;
   tick.generation = package_.generation;
   tick.path_id = package_.path_id;
-  tick.t_s = t_s;
+  tick.t_s = exec_t_;
+  tick.exec_t_s = exec_t_;
+  tick.timeline_frozen = timeline_frozen_;
+  tick.freeze_q = freeze_q_;
   tick.pitch_excess = pitch_excess_of(q_meas);
 
   TrajectoryTimeSample samp;
-  if (!sample_trajectory_at(package_, t_s, &samp) || !samp.ok) {
+  if (!sample_trajectory_at(package_, exec_t_, &samp) || !samp.ok) {
     state_ = FollowerState::Braking;
     brake_ticks_ = 0;
     tick.state = FollowerState::Braking;
@@ -661,20 +700,30 @@ FollowerTick TrajectoryFollower::step(const Vec18& q_meas, double t_s,
   tick.q_plan = q_plan;
   tick.s = samp.s;
 
-  // Stage stop / external ACK gates — never auto-advance past wait_ack.
+  // Stage stop / external ACK gates — freeze exec timeline at the barrier.
   if (const StageBoundary* b = stage_at_progress(samp.s)) {
-    const bool at_stop =
-        b->stop_required || b->wait_for_external_ack;
+    const bool at_stop = b->stop_required || b->wait_for_external_ack;
     if (at_stop && b->sample_index < package_.samples.size()) {
       const Vec18& q_stage = package_.samples[b->sample_index];
+      const double barrier_t = time_at_sample_index(package_, b->sample_index);
+      if (exec_t_ > barrier_t) {
+        exec_t_ = barrier_t;
+      }
+      timeline_frozen_ = true;
+      freeze_exec_t_ = barrier_t;
+      freeze_q_ = q_stage;
+      tick.t_s = exec_t_;
+      tick.exec_t_s = exec_t_;
+      tick.timeline_frozen = true;
+      tick.freeze_q = q_stage;
       const bool stopped =
-          samp.dq.cwiseAbs().maxCoeff() < 0.05 &&
-          (q_meas - q_stage).cwiseAbs().maxCoeff() < 0.03;
+          (q_meas - q_stage).cwiseAbs().maxCoeff() < 0.03 &&
+          (q_cmd_ - q_stage).cwiseAbs().maxCoeff() < 0.03;
       if (b->wait_for_external_ack) {
         if (!stopped) {
-          // Hold progress by freezing command toward stage end.
           tick.q_ref = q_stage;
           tick.q_follow = q_stage;
+          tick.q_plan = q_stage;
           tick.action = FollowerAction::Continue;
           tick.reason = "decel_to_stage_stop";
           q_prev_cmd_ = q_cmd_;
@@ -684,12 +733,13 @@ FollowerTick TrajectoryFollower::step(const Vec18& q_meas, double t_s,
         }
         state_ = FollowerState::WaitAck;
         wait_stage_id_ = b->stage_id;
-        wait_ack_t0_ = t_s;
+        wait_ack_elapsed_s_ = 0.0;
         tick.state = FollowerState::WaitAck;
         tick.action = FollowerAction::WaitExternalAck;
         tick.wait_stage_id = b->stage_id;
         tick.q_ref = q_stage;
         tick.q_follow = q_stage;
+        tick.q_plan = q_stage;
         tick.reason = "wait_external_ack";
         q_cmd_ = q_stage;
         last_ = tick;
@@ -698,6 +748,7 @@ FollowerTick TrajectoryFollower::step(const Vec18& q_meas, double t_s,
       if (b->stop_required && !stopped) {
         tick.q_ref = q_stage;
         tick.q_follow = q_stage;
+        tick.q_plan = q_stage;
         tick.action = FollowerAction::Continue;
         tick.reason = "stop_required_decel";
         q_cmd_ = q_stage;
@@ -705,21 +756,28 @@ FollowerTick TrajectoryFollower::step(const Vec18& q_meas, double t_s,
         return last_;
       }
       if (b->stop_required && stopped) {
+        // Actually stopped: release the barrier and continue the next stage.
         ++stage_cursor_;
+        timeline_frozen_ = false;
+        tick.timeline_frozen = false;
       }
     }
   }
 
   const double dur = package_.time_law.duration_s;
-  const bool time_done = dur > 0.0 && t_s >= dur - 1e-9;
+  const bool time_done = dur > 0.0 && exec_t_ >= dur - 1e-9;
   tick.time_done = time_done;
   if (time_done) {
-    // Local time done — Arrived only after 250 Hz safety + measured confirm.
     tick.q_ref = package_.samples.back();
     tick.q_follow = tick.q_ref;
     tick.q_offset.setZero();
     tick.action = FollowerAction::Arrived;
     tick.reason = "time_done_claim";
+    timeline_frozen_ = true;
+    freeze_exec_t_ = exec_t_;
+    freeze_q_ = tick.q_ref;
+    tick.timeline_frozen = true;
+    tick.freeze_q = tick.q_ref;
     q_prev_cmd_ = q_cmd_;
     q_cmd_ = tick.q_ref;
     last_ = tick;
@@ -735,7 +793,7 @@ FollowerTick TrajectoryFollower::step(const Vec18& q_meas, double t_s,
     const double err = (p_meas - p_plan).norm();
     if (err > 1e-4 && err <= track_err_m_) {
       Vec18 q_corr;
-      if (try_qp_correction(q_plan, q_cmd_, q_meas, dt, &q_corr, &fail)) {
+      if (try_qp_correction(q_plan, q_cmd_, q_meas, dtp, &q_corr, &fail)) {
         q_ref = q_corr;
         qp_used = true;
       } else {
@@ -752,7 +810,7 @@ FollowerTick TrajectoryFollower::step(const Vec18& q_meas, double t_s,
     }
   }
 
-  if (!command_feasible(q_ref, q_cmd_, dt, 0.0, &fail)) {
+  if (!command_feasible(q_ref, q_cmd_, dtp, 0.0, &fail)) {
     state_ = FollowerState::Braking;
     brake_ticks_ = 0;
     tick.state = FollowerState::Braking;

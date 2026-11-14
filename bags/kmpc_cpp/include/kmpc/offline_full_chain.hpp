@@ -397,7 +397,7 @@ inline ChainRunResult run_offline_full_chain_v2(
     q_meas = q_feedback;
 
     const FollowerTick ft =
-        follower.step(q_meas, follow_t, opt.control_dt);
+        follower.step(q_meas, opt.control_dt);
     follow_t += opt.control_dt;
     rec.plan_ran = true;
     rec.qp_ran = true;  // follower layer (optional δq); not line_path_qp

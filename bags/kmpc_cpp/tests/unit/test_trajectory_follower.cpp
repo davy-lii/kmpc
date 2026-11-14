@@ -80,8 +80,7 @@ TEST(TrajectoryFollower, FollowsCertifiedNominalAndRecordsLayers) {
   const double dt = 0.02;
   const double dur = std::max(package.time_law.duration_s, 1.0);
   for (int i = 0; i < static_cast<int>(dur / dt) + 50; ++i) {
-    const double t = std::min(static_cast<double>(i) * dt, dur);
-    const auto tick = follower.step(q, t, dt);
+    const auto tick = follower.step(q, dt);
     EXPECT_TRUE(tick.q_plan.allFinite());
     EXPECT_TRUE(tick.q_ref.allFinite());
     EXPECT_TRUE(tick.q_follow.allFinite());

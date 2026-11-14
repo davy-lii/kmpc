@@ -253,70 +253,145 @@ TrajectoryCertificate validate_actual_q_of_t(
     note(&fault, "time_law_duration");
   }
 
-  // Sample the *actual* executable Hermite q(t) (not knot polyline alone).
+  // Sample the *actual* executable Hermite q(t) at the 250 Hz send period.
+  // Offline sampling + online supervisor guard ≠ continuous certification.
   bool exec_ok = true;
+  constexpr double kSendDt = 0.004;
   if (law_ok && package.samples.size() >= 2 && law.duration_s > 0.0) {
-    const int n_check = std::max(
-        8, static_cast<int>(std::ceil(law.duration_s / 0.01)) + 1);
-    TrajectoryTimeSample prev;
-    bool have_prev = false;
-    for (int k = 0; k <= n_check; ++k) {
-      const double t =
-          law.duration_s * static_cast<double>(k) / static_cast<double>(n_check);
+    // Sample Hermite q(t) on the real 250 Hz send grid. Derivatives come from
+    // that send sequence (finite differences), not from the h=1e-3 probe inside
+    // sample_trajectory_at — that probe is too noisy for hard accel/jerk gates.
+    const int n_check =
+        std::max(1, static_cast<int>(std::ceil(law.duration_s / kSendDt)));
+    std::vector<Vec18, Eigen::aligned_allocator<Vec18>> qs;
+    std::vector<double> ts;
+    qs.reserve(static_cast<std::size_t>(n_check) + 2);
+    ts.reserve(static_cast<std::size_t>(n_check) + 2);
+    auto push_sample = [&](double t) -> bool {
+      if (!ts.empty() && t <= ts.back() + 1e-12) {
+        return true;  // skip duplicate endpoint / stalled clock
+      }
       TrajectoryTimeSample samp;
       if (!sample_trajectory_at(package, t, &samp) || !samp.ok) {
-        exec_ok = false;
         note(&fault, "exec_sample_fail");
-        break;
+        return false;
       }
       if (joint_violates_hard_box(samp.q, policy.q_min, policy.q_max)) {
-        exec_ok = false;
         note(&fault, "exec_hard_box");
-        break;
+        return false;
       }
       if (policy.torso_pitch_max_rad > 0.0) {
         const double pitch = samp.q[0] + samp.q[1] + samp.q[2];
         if (std::abs(pitch) > policy.torso_pitch_max_rad + kPitchRoundEpsRad) {
-          exec_ok = false;
           note(&fault, "exec_pitch");
-          break;
+          return false;
         }
       }
       if (guards != nullptr && !guards->com_xy_inside(kin.com(samp.q))) {
-        exec_ok = false;
         note(&fault, "exec_com");
+        return false;
+      }
+      qs.push_back(samp.q);
+      ts.push_back(samp.t_s);
+      return true;
+    };
+    for (int k = 0; k < n_check; ++k) {
+      const double t = kSendDt * static_cast<double>(k);
+      if (t >= law.duration_s - 1e-12) {
         break;
       }
-      // Adjacent Hermite samples must respect a send step budget. Time law
-      // was sized on chords; Hermite mid-segment can be slightly faster, so
-      // software_limited packages use a 2× design margin (not a hard-box
-      // relaxation). Calibrated velocity stays at 1×.
-      if (have_prev) {
-        const double dt = std::max(samp.t_s - prev.t_s, 1e-4);
-        const double step_scale = law.software_limited ? 2.0 : 1.0;
+      if (!push_sample(t)) {
+        exec_ok = false;
+        break;
+      }
+    }
+    if (exec_ok && !push_sample(law.duration_s)) {
+      exec_ok = false;
+    }
+    // Match SafetySupervisor 250 Hz boxes exactly (incl. software_limited
+    // effective accel/jerk). Never use a looser offline margin than online.
+    if (exec_ok) {
+      for (std::size_t i = 1; i < qs.size(); ++i) {
+        const double dt = std::max(ts[i] - ts[i - 1], 1e-4);
         for (int j = 0; j < kNDof; ++j) {
-          if (std::abs(samp.q[j] - prev.q[j]) >
-              step_scale * policy.dq_max[j] * dt + 1e-4) {
+          const double dq_max = std::max(policy.dq_max[j], 1e-6);
+          const double step = qs[i][j] - qs[i - 1][j];
+          if (std::abs(step) > dq_max * dt + 1e-4) {
             exec_ok = false;
             note(&fault, "exec_step");
             break;
           }
         }
+        if (!exec_ok) {
+          break;
+        }
       }
-      if (!exec_ok) {
-        break;
-      }
-      prev = samp;
-      have_prev = true;
     }
+    if (exec_ok) {
+      for (std::size_t i = 2; i < qs.size(); ++i) {
+        const double dt1 = std::max(ts[i] - ts[i - 1], 1e-4);
+        const double dt0 = std::max(ts[i - 1] - ts[i - 2], 1e-4);
+        for (int j = 0; j < kNDof; ++j) {
+          const double dq_max = std::max(policy.dq_max[j], 1e-6);
+          const double ddq_pol = std::max(policy.ddq_max[j], 1e-6);
+          const double ddq_soft =
+              policy.a_max_calibrated ? ddq_pol
+                                      : std::max(ddq_pol, dq_max / 0.02);
+          const double v1 = (qs[i][j] - qs[i - 1][j]) / dt1;
+          const double v0 = (qs[i - 1][j] - qs[i - 2][j]) / dt0;
+          // Same gate as SafetySupervisor: |dv| <= 4 * ddq_soft * dt.
+          if (std::abs(v1 - v0) > 4.0 * ddq_soft * dt1 + 1e-6) {
+            exec_ok = false;
+            note(&fault, "exec_ddq");
+            break;
+          }
+        }
+        if (!exec_ok) {
+          break;
+        }
+      }
+    }
+    if (exec_ok) {
+      for (std::size_t i = 3; i < qs.size(); ++i) {
+        const double dt2 = std::max(ts[i] - ts[i - 1], 1e-4);
+        const double dt1 = std::max(ts[i - 1] - ts[i - 2], 1e-4);
+        const double dt0 = std::max(ts[i - 2] - ts[i - 3], 1e-4);
+        for (int j = 0; j < kNDof; ++j) {
+          const double dq_max = std::max(policy.dq_max[j], 1e-6);
+          const double ddq_pol = std::max(policy.ddq_max[j], 1e-6);
+          const double ddq_soft =
+              policy.a_max_calibrated ? ddq_pol
+                                      : std::max(ddq_pol, dq_max / 0.02);
+          const double j_pol = std::max(policy.dddq_max[j], 1e-6);
+          const double j_soft =
+              policy.j_max_calibrated ? j_pol
+                                      : std::max(j_pol, ddq_soft / 0.02);
+          const double v2 = (qs[i][j] - qs[i - 1][j]) / dt2;
+          const double v1 = (qs[i - 1][j] - qs[i - 2][j]) / dt1;
+          const double v0 = (qs[i - 2][j] - qs[i - 3][j]) / dt0;
+          const double a1 = (v2 - v1) / dt2;
+          const double a0 = (v1 - v0) / dt1;
+          // Same gate as SafetySupervisor: |da| <= 16 * j_soft * dt.
+          if (std::abs(a1 - a0) > 16.0 * j_soft * dt2 + 1e-3) {
+            exec_ok = false;
+            note(&fault, "exec_jerk");
+            break;
+          }
+        }
+        if (!exec_ok) {
+          break;
+        }
+      }
+    }
+    // Sampling proves discrete send feasibility under online guard only.
     out.coverage = PathCoverage::AdaptiveSampledWithOnlineGuard;
-    out.coverage_note = law.software_limited
-                            ? "hermite_q_of_t_software_limited_jerk"
-                            : "hermite_q_of_t";
-    out.continuous_certified = exec_ok;
+    out.coverage_note = "sampled+online_guard;hermite_q_of_t_at_250hz";
+    out.continuous_certified = false;
     if (!policy.j_max_calibrated) {
-      // Explicit: jerk bound is a software design value.
       out.coverage_note += ";jerk_source=" + law.jerk_source;
+    }
+    if (law.software_limited) {
+      out.coverage_note += ";software_limited";
     }
   }
 

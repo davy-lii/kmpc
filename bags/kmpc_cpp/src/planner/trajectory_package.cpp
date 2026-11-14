@@ -3,7 +3,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
 
+#include "kmpc/motion_task.hpp"
 #include "kmpc/tracker_math.hpp"
 
 namespace kmpc {
@@ -99,6 +103,88 @@ uint64_t limits_digest_of(const MotionConstraintPolicy& policy) {
   hash = mix(hash, policy.a_max_calibrated ? 1u : 0u);
   hash = mix(hash, policy.j_max_calibrated ? 1u : 0u);
   return hash;
+}
+
+namespace {
+
+uint64_t fnv1a_bytes(const std::string& bytes) {
+  uint64_t hash = kFnvOffset;
+  for (unsigned char c : bytes) {
+    hash = mix(hash, static_cast<uint64_t>(c));
+  }
+  return hash;
+}
+
+std::string load_urdf_bytes(const std::string& urdf, bool is_xml) {
+  if (is_xml) {
+    return urdf;
+  }
+  std::ifstream in(urdf, std::ios::binary);
+  if (!in) {
+    return {};
+  }
+  std::ostringstream ss;
+  ss << in.rdbuf();
+  return ss.str();
+}
+
+std::string hex_u64(uint64_t v) {
+  std::ostringstream ss;
+  ss << std::hex << std::setfill('0') << std::setw(16) << v;
+  return ss.str();
+}
+
+}  // namespace
+
+std::string model_identity_string(const std::string& urdf, bool is_xml,
+                                  uint64_t limits_digest) {
+  const std::string bytes = load_urdf_bytes(urdf, is_xml);
+  const uint64_t content = fnv1a_bytes(bytes);
+  return "urdf:" + hex_u64(content) + ":limits:" + hex_u64(limits_digest);
+}
+
+uint64_t seal_motion_task_identity(MotionTask* task, const std::string& urdf,
+                                   bool is_xml,
+                                   const MotionConstraintPolicy& policy) {
+  if (task == nullptr) {
+    return 0;
+  }
+  const uint64_t lim = limits_digest_of(policy);
+  task->model_digest = model_identity_string(urdf, is_xml, lim);
+  return motion_task_digest(*task);
+}
+
+double time_at_sample_index(const TrajectoryPackage& package,
+                            std::size_t sample_index) {
+  const auto& law = package.time_law;
+  if (law.t_s.empty()) {
+    return 0.0;
+  }
+  if (law.t_s.size() == package.samples.size() &&
+      sample_index < law.t_s.size()) {
+    return law.t_s[sample_index];
+  }
+  if (package.samples.size() < 2 || law.s.size() != law.t_s.size()) {
+    return std::min(law.duration_s, law.t_s.back());
+  }
+  const double s_tgt = std::clamp(
+      static_cast<double>(sample_index) /
+          static_cast<double>(package.samples.size() - 1),
+      0.0, 1.0);
+  for (std::size_t i = 1; i < law.s.size(); ++i) {
+    if (law.s[i] + 1e-12 >= s_tgt) {
+      const double s0 = law.s[i - 1];
+      const double s1 = law.s[i];
+      const double t0 = law.t_s[i - 1];
+      const double t1 = law.t_s[i];
+      if (s1 - s0 <= 1e-12) {
+        return t1;
+      }
+      const double a = (s_tgt - s0) / (s1 - s0);
+      return t0 + a * (t1 - t0);
+    }
+  }
+  return law.t_s.back();
 }
 
 AdmitDecision admit_package_start(

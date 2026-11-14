@@ -37,15 +37,18 @@ enum class FollowerAction {
 
 struct FollowerTick {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-  Vec18 q_plan = Vec18::Zero();   // certified nominal at t
+  Vec18 q_plan = Vec18::Zero();   // certified nominal at exec_t
   Vec18 q_ref = Vec18::Zero();    // after optional δq (or recovery cmd)
   Vec18 q_follow = Vec18::Zero(); // monitor hint / offset target for 250 Hz
   Vec18 q_offset = Vec18::Zero(); // bounded correction about q_plan
+  Vec18 freeze_q = Vec18::Zero(); // hold pose while timeline is frozen
   FollowerState state = FollowerState::Hold;
   FollowerAction action = FollowerAction::Continue;
   const char* reason = "hold";
   double s = 0.0;
-  double t_s = 0.0;
+  double t_s = 0.0;          // effective execution time (not wall clock)
+  double exec_t_s = 0.0;     // alias of t_s for slot publishers
+  bool timeline_frozen = false;
   double pitch_excess = 0.0;
   double pitch_excess_ceiling = 0.0;
   bool qp_used = false;
@@ -77,7 +80,10 @@ class TrajectoryFollower {
   bool on_stage_ack(uint64_t generation, uint32_t stage_id, bool success,
                     const Vec18& q_meas, std::string* why = nullptr);
 
-  FollowerTick step(const Vec18& q_meas, double t_s, double dt);
+  // Advance the *execution* timeline by dt (not wall-clock absolute time).
+  // Stage stop / WaitAck freeze exec_t so 250 Hz cannot sample into the next
+  // stage. ACK success resumes from the frozen stage time.
+  FollowerTick step(const Vec18& q_meas, double dt);
 
   FollowerState state() const { return state_; }
   bool has_package() const { return has_package_; }
@@ -86,6 +92,8 @@ class TrajectoryFollower {
   double pitch_excess_of(const Vec18& q) const;
   uint32_t waiting_stage_id() const { return wait_stage_id_; }
   bool waiting_ack() const { return state_ == FollowerState::WaitAck; }
+  double exec_t() const { return exec_t_; }
+  bool timeline_frozen() const { return timeline_frozen_; }
 
   void set_tcp_tube_m(double m) { tcp_tube_m_ = std::max(m, 1e-4); }
   void set_track_err_m(double m) { track_err_m_ = std::max(m, 1e-4); }
@@ -121,10 +129,14 @@ class TrajectoryFollower {
   double track_err_m_ = 0.03;
   bool enable_qp_ = true;
   uint32_t wait_stage_id_ = 0;
-  double wait_ack_t0_ = -1.0;
+  double wait_ack_elapsed_s_ = 0.0;
   double ack_timeout_s_ = 5.0;
   std::size_t stage_cursor_ = 0;
   bool brake_requested_ = false;
+  double exec_t_ = 0.0;
+  bool timeline_frozen_ = false;
+  double freeze_exec_t_ = 0.0;
+  Vec18 freeze_q_ = Vec18::Zero();
   FollowerTick last_;
 };
 

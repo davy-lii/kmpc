@@ -927,59 +927,74 @@ class KmpcNode : public rclcpp::Node {
                               "kmpc v2 safety reject reason=safety_no_real_meas");
       } else {
         const double now_s = now().seconds();
-        const double t_s = std::max(0.0, now_s - slot.t0_s);
-        kmpc::TrajectoryTimeSample samp;
-        if (!kmpc::sample_trajectory_at(slot.package, t_s, &samp) || !samp.ok) {
-          stream_enter_hold(safety_supervisor_->last_safe());
+        kmpc::Vec18 q_cmd;
+        kmpc::Vec18 q_plan;
+        if (slot.timeline_frozen) {
+          // Stage barrier / WaitAck: do not advance into the next stage.
+          q_plan = slot.freeze_q.allFinite() ? slot.freeze_q : slot.q_follow_hint;
+          q_cmd = q_plan + slot.q_offset;
+        } else {
+          const double t_s = std::max(
+              0.0, slot.exec_t_s + (now_s - slot.exec_t_wall_s));
+          kmpc::TrajectoryTimeSample samp;
+          if (!kmpc::sample_trajectory_at(slot.package, t_s, &samp) ||
+              !samp.ok) {
+            stream_enter_hold(safety_supervisor_->last_safe());
+            stream_v2_ = false;
+            publish_v2_slot_inactive();
+            *q_out = stream_q_hold_;
+            return true;
+          }
+          q_plan = samp.q;
+          q_cmd = samp.q + slot.q_offset;
+        }
+        if (slot.recovering) {
+          q_cmd = slot.q_recovery_cmd.allFinite() ? slot.q_recovery_cmd : q_cmd;
+        }
+        kmpc::SafetySupervisorInput in;
+        in.q_cmd = q_cmd;
+        in.q_prev = q_cmd;  // ignored when supervisor has q_last_send
+        in.q_meas = v2_meas_q_;
+        in.has_meas = true;
+        in.q_follow = slot.q_follow_hint;
+        in.has_follow = slot.q_follow_hint.allFinite();
+        in.q_plan = q_plan;
+        in.dt = interp_dt_;
+        in.cmd_timestamp_s = now_s;
+        in.meas_timestamp_s = v2_meas_stamp_s_;
+        in.now_s = now_s;
+        in.expected_generation = slot.generation;
+        in.expected_path_id = slot.path_id;
+        in.expected_task_digest = slot.task_digest;
+        in.claim_arrived = slot.claim_time_done;
+        in.mode = slot.recovering ? kmpc::SafetyExecMode::Recovering
+                                  : kmpc::SafetyExecMode::Normal;
+        in.pitch_excess_ceiling = slot.pitch_excess_ceiling;
+        in.package = &slot.package;
+        const kmpc::SafetyDecision dec = safety_supervisor_->check(in);
+        if (!dec.accept) {
+          RCLCPP_ERROR_THROTTLE(
+              get_logger(), *get_clock(), 1000,
+              "kmpc v2 safety reject reason=%s gen=%llu path_id=%u",
+              dec.reason,
+              static_cast<unsigned long long>(slot.generation),
+              slot.path_id);
+          stream_enter_hold(dec.q_send.allFinite() ? dec.q_send
+                                                   : interpolator_.q_ref());
           stream_v2_ = false;
           publish_v2_slot_inactive();
           *q_out = stream_q_hold_;
         } else {
-          kmpc::Vec18 q_cmd = samp.q + slot.q_offset;
-          if (slot.recovering) {
-            q_cmd = slot.q_recovery_cmd.allFinite() ? slot.q_recovery_cmd : q_cmd;
+          *q_out = dec.q_send;
+          if (interpolator_.ready()) {
+            interpolator_.set_q_ref(*q_out);
           }
-          kmpc::SafetySupervisorInput in;
-          in.q_cmd = q_cmd;
-          in.q_prev = q_cmd;  // ignored when supervisor has q_last_send
-          in.q_meas = v2_meas_q_;
-          in.has_meas = true;
-          in.q_follow = slot.q_follow_hint;
-          in.has_follow = slot.q_follow_hint.allFinite();
-          in.q_plan = samp.q;
-          in.dt = interp_dt_;
-          in.cmd_timestamp_s = now_s;
-          in.meas_timestamp_s = v2_meas_stamp_s_;
-          in.now_s = now_s;
-          in.expected_generation = slot.generation;
-          in.expected_path_id = slot.path_id;
-          in.expected_task_digest = slot.task_digest;
-          in.claim_arrived = slot.claim_time_done;
-          in.mode = slot.recovering ? kmpc::SafetyExecMode::Recovering
-                                    : kmpc::SafetyExecMode::Normal;
-          in.pitch_excess_ceiling = slot.pitch_excess_ceiling;
-          in.package = &slot.package;
-          const kmpc::SafetyDecision dec = safety_supervisor_->check(in);
-          if (!dec.accept) {
-            RCLCPP_ERROR_THROTTLE(
-                get_logger(), *get_clock(), 1000,
-                "kmpc v2 safety reject reason=%s gen=%llu path_id=%u",
-                dec.reason,
-                static_cast<unsigned long long>(slot.generation),
-                slot.path_id);
-            stream_enter_hold(dec.q_send.allFinite() ? dec.q_send
-                                                     : interpolator_.q_ref());
-            stream_v2_ = false;
-            publish_v2_slot_inactive();
-            *q_out = stream_q_hold_;
-          } else {
-            *q_out = dec.q_send;
-            if (interpolator_.ready()) {
-              interpolator_.set_q_ref(*q_out);
-            }
-            if (dec.arrived) {
-              v2_safety_arrived_ = true;
-            }
+          if (dec.arrived) {
+            v2_safety_arrived_.generation.store(slot.generation,
+                                                std::memory_order_relaxed);
+            v2_safety_arrived_.path_id.store(slot.path_id,
+                                             std::memory_order_relaxed);
+            v2_safety_arrived_.flag.store(true, std::memory_order_release);
           }
         }
       }
@@ -1701,7 +1716,10 @@ class KmpcNode : public rclcpp::Node {
       mt.frame = is_left ? std::string(kmpc::kEeFrameLeft)
                          : std::string(kmpc::kEeFrameRight);
       mt.q = q0;
-      const uint64_t digest = kmpc::motion_task_digest(mt);
+      // Seal immutable identity from real URDF bytes + limits before digest.
+      const auto v2_policy = kmpc::policy_from_config(cfg_);
+      const uint64_t digest = kmpc::seal_motion_task_identity(
+          &mt, line_urdf_source_, line_urdf_xml_, v2_policy);
       const bool gen_changed = (mt.generation != v2_active_generation_);
       if (v2_request_plan_ || gen_changed ||
           (!follower_->has_package() && !v2_plan_pending_)) {
@@ -1714,7 +1732,9 @@ class KmpcNode : public rclcpp::Node {
           follower_->request_brake();
           planner_worker_->clear_pending_and_result();
         }
-        planner_worker_->submit_snapshot(mt, st);
+        planner_worker_->submit_snapshot(mt, st, v2_policy,
+                                         planner_worker_->default_weights(),
+                                         10.0);
         v2_request_plan_ = false;
         v2_plan_pending_ = true;
         v2_submitted_generation_ = mt.generation;
@@ -1742,14 +1762,18 @@ class KmpcNode : public rclcpp::Node {
         const bool seq_ok =
             plan.submit_seq != 0 &&
             plan.submit_seq == v2_submitted_seq_;
-        const uint64_t plan_digest =
-            plan.task_digest ? plan.task_digest : plan.package.task_digest;
+        const uint64_t plan_digest = plan.task_digest;
+        // Zero digest must never bypass identity matching.
         const bool identity_ok =
+            digest != 0 && plan_digest != 0 &&
             plan.generation == mt.generation &&
             plan.generation == v2_submitted_generation_ &&
-            (plan_digest == 0 || plan_digest == digest) &&
-            (plan_digest == 0 || plan_digest == v2_submitted_digest_) &&
-            plan.package.generation == mt.generation;
+            plan_digest == digest &&
+            plan_digest == v2_submitted_digest_ &&
+            plan.package.task_digest == plan_digest &&
+            plan.package.generation == mt.generation &&
+            plan.package.model_digest != 0 &&
+            plan.limits_digest != 0;
         if (!plan.ok || plan.package.samples.size() < 2 || !seq_ok ||
             !identity_ok) {
           RCLCPP_ERROR(
@@ -1794,10 +1818,12 @@ class KmpcNode : public rclcpp::Node {
         }
         v2_active_generation_ = plan.package.generation;
         v2_active_path_id_ = plan.package.path_id;
-        v2_active_digest_ = plan_digest ? plan_digest : digest;
+        v2_active_digest_ = plan_digest;
         v2_active_submit_seq_ = plan.submit_seq;
         v2_follow_t0_ = now().seconds();
-        v2_safety_arrived_ = false;
+        v2_safety_arrived_.flag.store(false, std::memory_order_release);
+        v2_safety_arrived_.generation.store(0, std::memory_order_relaxed);
+        v2_safety_arrived_.path_id.store(0, std::memory_order_relaxed);
         {
           std::lock_guard<std::mutex> lock(stream_mu_);
           reset_interpolator_to(q_meas_adopt);
@@ -1814,6 +1840,10 @@ class KmpcNode : public rclcpp::Node {
           slot.active = true;
           slot.package = plan.package;
           slot.t0_s = v2_follow_t0_;
+          slot.exec_t_s = 0.0;
+          slot.exec_t_wall_s = v2_follow_t0_;
+          slot.timeline_frozen = false;
+          slot.freeze_q = q_meas_adopt;
           slot.generation = plan.package.generation;
           slot.path_id = plan.package.path_id;
           slot.task_digest = v2_active_digest_;
@@ -1838,12 +1868,10 @@ class KmpcNode : public rclcpp::Node {
         publish_cmd(q0, kmpc::Vec18::Zero(), 0.0, true);
         return;
       }
-      const double t_s = std::max(0.0, now().seconds() - v2_follow_t0_);
       const double dt = std::max(cfg_.params.dt, 1e-3);
       const kmpc::Vec18 q_meas_step =
           (q_meas && q_meas->allFinite()) ? *q_meas : q0;
-      const kmpc::FollowerTick tick =
-          follower_->step(q_meas_step, t_s, dt);
+      const kmpc::FollowerTick tick = follower_->step(q_meas_step, dt);
       kmpc::Vec18 q_cmd = tick.q_follow;
       kmpc::Vec18 dq = tick.q_follow - q0;
       if (tick.action == kmpc::FollowerAction::ProtectStop) {
@@ -1897,6 +1925,11 @@ class KmpcNode : public rclcpp::Node {
         slot.active = true;
         slot.package = follower_->package();
         slot.t0_s = v2_follow_t0_;
+        slot.exec_t_s = tick.exec_t_s;
+        slot.exec_t_wall_s = now().seconds();
+        slot.timeline_frozen = tick.timeline_frozen;
+        slot.freeze_q =
+            tick.freeze_q.allFinite() ? tick.freeze_q : tick.q_follow;
         slot.generation = tick.generation;
         slot.path_id = tick.path_id;
         slot.task_digest = v2_active_digest_;
@@ -1909,15 +1942,22 @@ class KmpcNode : public rclcpp::Node {
         slot.q_recovery_cmd = tick.q_follow;
         publish_v2_slot(slot);
       }
-      // Arrived only after 250 Hz safety accepted the claim + measured pose.
-      if (v2_safety_arrived_) {
-        publish_arrived(true);
-        dq.setZero();
-        v2_safety_arrived_ = false;
-        {
-          std::lock_guard<std::mutex> lock(stream_mu_);
-          publish_v2_slot_inactive();
-          stream_v2_ = false;
+      // Arrived only after 250 Hz safety accepted the claim for this gen/path.
+      if (v2_safety_arrived_.flag.load(std::memory_order_acquire)) {
+        const uint64_t arrived_gen =
+            v2_safety_arrived_.generation.load(std::memory_order_relaxed);
+        const uint32_t arrived_path =
+            v2_safety_arrived_.path_id.load(std::memory_order_relaxed);
+        v2_safety_arrived_.flag.store(false, std::memory_order_release);
+        if (arrived_gen == v2_active_generation_ &&
+            arrived_path == v2_active_path_id_) {
+          publish_arrived(true);
+          dq.setZero();
+          {
+            std::lock_guard<std::mutex> lock(stream_mu_);
+            publish_v2_slot_inactive();
+            stream_v2_ = false;
+          }
         }
       } else if (tick.action == kmpc::FollowerAction::Arrived) {
         publish_arrived(false);
@@ -3167,15 +3207,27 @@ class KmpcNode : public rclcpp::Node {
     bool protect_stop = false;
     bool recovering = false;
     bool claim_time_done = false;
+    bool timeline_frozen = false;
     kmpc::TrajectoryPackage package{};
     double t0_s = 0.0;
+    // Effective execution time at publish, plus wall stamp for 250 Hz fill-in
+    // between 50 Hz ticks. When frozen, 250 Hz must hold freeze_q.
+    double exec_t_s = 0.0;
+    double exec_t_wall_s = 0.0;
     uint64_t generation = 0;
     uint32_t path_id = 0;
     uint64_t task_digest = 0;
     kmpc::Vec18 q_offset = kmpc::Vec18::Zero();
     kmpc::Vec18 q_follow_hint = kmpc::Vec18::Zero();
     kmpc::Vec18 q_recovery_cmd = kmpc::Vec18::Zero();
+    kmpc::Vec18 freeze_q = kmpc::Vec18::Zero();
     double pitch_excess_ceiling = 0.0;
+  };
+
+  struct V2SafetyArrived {
+    std::atomic<bool> flag{false};
+    std::atomic<uint64_t> generation{0};
+    std::atomic<uint32_t> path_id{0};
   };
 
   // Precondition: stream_mu_ held. Swap a complete slot (no half-update).
@@ -3263,7 +3315,7 @@ class KmpcNode : public rclcpp::Node {
   double v2_follow_t0_ = 0.0;
   bool stream_v2_ = false;
   bool stream_v2_claim_arrived_ = false;
-  bool v2_safety_arrived_ = false;
+  V2SafetyArrived v2_safety_arrived_{};
   kmpc::TrajectoryPackage stream_v2_package_{};
   kmpc::Vec18 stream_v2_q_follow_ = kmpc::Vec18::Zero();
   kmpc::Vec18 stream_v2_q_plan_ = kmpc::Vec18::Zero();

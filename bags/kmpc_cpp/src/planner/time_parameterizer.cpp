@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <vector>
+
+#include "kmpc/tracker_math.hpp"
 
 namespace kmpc {
 namespace {
@@ -12,6 +15,97 @@ namespace {
 //   j_max = min_j dddq_max_j / |dq_j|  (jerk smooths the accel profile).
 constexpr double kNominalDt = 0.02;
 constexpr double kRateFloor = 1e-6;
+constexpr double kSendDt = 0.004;
+
+// Chord-based rate planning underestimates Hermite mid-segment accel/jerk.
+// Scale wall time until the *executed* 250 Hz Hermite send sequence fits 1×.
+bool hermite_send_sequence_ok(const JointCurve& samples,
+                              const TimeLawTable& law,
+                              const MotionConstraintPolicy& policy) {
+  if (samples.size() < 2 || law.t_s.size() < 2 || !(law.duration_s > 0.0)) {
+    return true;
+  }
+  TrajectoryPackage pkg;
+  pkg.samples = samples;
+  pkg.time_law = law;
+  const int n =
+      std::max(1, static_cast<int>(std::ceil(law.duration_s / kSendDt)));
+  std::vector<Vec18, Eigen::aligned_allocator<Vec18>> qs;
+  std::vector<double> ts;
+  qs.reserve(static_cast<std::size_t>(n) + 2);
+  ts.reserve(static_cast<std::size_t>(n) + 2);
+  auto push = [&](double t) -> bool {
+    if (!ts.empty() && t <= ts.back() + 1e-12) {
+      return true;
+    }
+    TrajectoryTimeSample samp;
+    if (!sample_trajectory_at(pkg, t, &samp) || !samp.ok) {
+      return false;
+    }
+    qs.push_back(samp.q);
+    ts.push_back(samp.t_s);
+    return true;
+  };
+  for (int k = 0; k < n; ++k) {
+    const double t = kSendDt * static_cast<double>(k);
+    if (t >= law.duration_s - 1e-12) {
+      break;
+    }
+    if (!push(t)) {
+      return false;
+    }
+  }
+  if (!push(law.duration_s)) {
+    return false;
+  }
+  for (std::size_t i = 1; i < qs.size(); ++i) {
+    const double dt = std::max(ts[i] - ts[i - 1], 1e-4);
+    for (int j = 0; j < kNDof; ++j) {
+      const double dq_max = std::max(policy.dq_max[j], 1e-6);
+      if (std::abs(qs[i][j] - qs[i - 1][j]) > dq_max * dt + 1e-4) {
+        return false;
+      }
+    }
+  }
+  for (std::size_t i = 2; i < qs.size(); ++i) {
+    const double dt1 = std::max(ts[i] - ts[i - 1], 1e-4);
+    const double dt0 = std::max(ts[i - 1] - ts[i - 2], 1e-4);
+    for (int j = 0; j < kNDof; ++j) {
+      const double dq_max = std::max(policy.dq_max[j], 1e-6);
+      const double ddq_pol = std::max(policy.ddq_max[j], 1e-6);
+      const double ddq_soft =
+          policy.a_max_calibrated ? ddq_pol : std::max(ddq_pol, dq_max / 0.02);
+      const double v1 = (qs[i][j] - qs[i - 1][j]) / dt1;
+      const double v0 = (qs[i - 1][j] - qs[i - 2][j]) / dt0;
+      if (std::abs(v1 - v0) > 4.0 * ddq_soft * dt1 + 1e-6) {
+        return false;
+      }
+    }
+  }
+  for (std::size_t i = 3; i < qs.size(); ++i) {
+    const double dt2 = std::max(ts[i] - ts[i - 1], 1e-4);
+    const double dt1 = std::max(ts[i - 1] - ts[i - 2], 1e-4);
+    const double dt0 = std::max(ts[i - 2] - ts[i - 3], 1e-4);
+    for (int j = 0; j < kNDof; ++j) {
+      const double dq_max = std::max(policy.dq_max[j], 1e-6);
+      const double ddq_pol = std::max(policy.ddq_max[j], 1e-6);
+      const double ddq_soft =
+          policy.a_max_calibrated ? ddq_pol : std::max(ddq_pol, dq_max / 0.02);
+      const double j_pol = std::max(policy.dddq_max[j], 1e-6);
+      const double j_soft =
+          policy.j_max_calibrated ? j_pol : std::max(j_pol, ddq_soft / 0.02);
+      const double v2 = (qs[i][j] - qs[i - 1][j]) / dt2;
+      const double v1 = (qs[i - 1][j] - qs[i - 2][j]) / dt1;
+      const double v0 = (qs[i - 2][j] - qs[i - 3][j]) / dt0;
+      const double a1 = (v2 - v1) / dt2;
+      const double a0 = (v1 - v0) / dt1;
+      if (std::abs(a1 - a0) > 16.0 * j_soft * dt2 + 1e-3) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
 
 }  // namespace
 
@@ -162,6 +256,22 @@ TimeLawTable TimeParameterizer::compute(
     out.ds_dt[i + 1] = v[i + 1] * s_scale;
   }
   out.duration_s = out.t_s.back();
+
+  // Stretch time (keep s knots) until Hermite@250Hz send sequence meets 1×
+  // dq/ddq/jerk. Never widen policy caps — only slow the motion.
+  for (int attempt = 0; attempt < 12; ++attempt) {
+    if (hermite_send_sequence_ok(samples, out, policy)) {
+      break;
+    }
+    constexpr double kStretch = 1.25;
+    for (double& t : out.t_s) {
+      t *= kStretch;
+    }
+    out.duration_s *= kStretch;
+    for (double& r : out.ds_dt) {
+      r /= kStretch;
+    }
+  }
   return out;
 }
 

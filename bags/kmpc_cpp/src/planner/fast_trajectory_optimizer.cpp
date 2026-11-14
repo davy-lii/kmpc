@@ -208,9 +208,13 @@ class V2Solver {
     out.certificate = cert;
     out.package = pkg;
     out.package.certificate.passed = cert.passed;
-    out.package.certificate.continuous_certified = cert.continuous_certified;
+    // Adaptive Hermite sampling never claims continuous certification.
+    out.package.certificate.continuous_certified = false;
     out.package.certificate.sampled_only = true;
-    out.package.certificate.coverage = "sampled_only";
+    out.package.certificate.coverage =
+        cert.coverage == PathCoverage::AdaptiveSampledWithOnlineGuard
+            ? "sampled+online_guard"
+            : "sampled_only";
     out.package.certificate.min_joint_margin_rad = cert.min_joint_margin_rad;
     out.package.certificate.min_pitch_margin_rad = cert.min_pitch_margin_rad;
     out.package.certificate.worst_tcp_cross_track_m =
