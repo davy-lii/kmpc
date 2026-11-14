@@ -113,4 +113,22 @@ AdmitDecision admit_package_start(
 bool sample_trajectory_at(const TrajectoryPackage& package, double t_s,
                           TrajectoryTimeSample* out);
 
+// 250 Hz may extrapolate exec time between 50 Hz publishes. Clamp so it cannot
+// cross an unreleased TIP/STOP StageBoundary before Follower freezes / ACK.
+inline double clamp_exec_t_to_unreleased_barrier(double t_s,
+                                                 bool barrier_pending,
+                                                 bool barrier_released,
+                                                 double barrier_t_s) {
+  if (!(t_s >= 0.0)) {
+    return 0.0;
+  }
+  if (barrier_pending && !barrier_released) {
+    if (!(barrier_t_s >= 0.0)) {
+      return t_s;
+    }
+    return t_s < barrier_t_s ? t_s : barrier_t_s;
+  }
+  return t_s;
+}
+
 }  // namespace kmpc

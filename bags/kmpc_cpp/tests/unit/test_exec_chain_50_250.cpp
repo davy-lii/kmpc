@@ -51,6 +51,11 @@ kmpc::TrajectoryPackage make_hold_package(const kmpc::Vec18& q0,
 
 kmpc::Vec18 home_q(const kmpc::Config& config) { return config.q_pref; }
 
+double tip_time_s(const kmpc::TrajectoryPackage& pkg) {
+  return kmpc::time_at_sample_index(pkg,
+                                    pkg.stage_boundaries.front().sample_index);
+}
+
 }  // namespace
 
 TEST(ExecChain50250, SampleAtProvidesFiniteDerivatives) {
@@ -691,5 +696,212 @@ TEST(GateA50250Matrix, DelayFirstTickReversalSwitchAndFeedbackLag) {
     const auto dec = sup.check(in);
     EXPECT_FALSE(dec.accept);
     EXPECT_STREQ(dec.reason, "safety_no_real_meas");
+  }
+}
+
+TEST(P0Barrier250Hz, TipBetween50HzCyclesNeverEmitsLift) {
+  // TIP barrier sits between two 50 Hz ticks; 250 Hz runs many samples in the
+  // gap. Without independent clamp, wall extrapolation would enter LIFT.
+  const auto config = kmpc::Config::load(
+      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+  kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
+                       "/Light-duty wheeled robot.urdf");
+  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
+  auto policy = kmpc::policy_from_config(config);
+  kmpc::Vec18 q0 = home_q(config);
+  kmpc::Vec18 q_tip = q0;
+  q_tip[4] += 0.02;
+  kmpc::Vec18 q_lift = q_tip;
+  q_lift[5] += 0.08;
+
+  kmpc::TrajectoryPackage pkg = make_hold_package(q0, 77);
+  pkg.samples = {q0, q_tip, q_lift};
+  // TIP at t=0.028 — between 50 Hz ticks at 0.02 and 0.04.
+  pkg.time_law.s = {0.0, 0.5, 1.0};
+  pkg.time_law.t_s = {0.0, 0.028, 0.12};
+  pkg.time_law.duration_s = 0.12;
+  kmpc::StageBoundary tip;
+  tip.sample_index = 1;
+  tip.stage_id = 1;
+  tip.stop_required = true;
+  tip.wait_for_external_ack = true;
+  pkg.stage_boundaries.push_back(tip);
+
+  kmpc::TrajectoryFollower follower(kin, &guards, policy);
+  follower.set_enable_qp_correction(false);
+  ASSERT_TRUE(follower.adopt(pkg, q0, kmpc::Vec18::Zero(), false));
+
+  // One 50 Hz tick at t≈0.02 — still before TIP; barrier must already be
+  // advertised so 250 Hz can clamp independently.
+  auto tick = follower.step(q0, 0.02);
+  ASSERT_TRUE(tick.barrier_pending);
+  EXPECT_FALSE(tick.barrier_released);
+  EXPECT_NEAR(tick.barrier_t_s, 0.028, 1e-9);
+  EXPECT_FALSE(tick.timeline_frozen);
+  EXPECT_LT(tick.exec_t_s, tip_time_s(pkg));
+  const double tip_j5 = q_tip[5];
+  const double barrier_t = tick.barrier_t_s;
+  const double exec_anchor = tick.exec_t_s;
+  const double wall0 = 1.0;
+
+  // ~4.5× 50 Hz gap covered by 250 Hz ticks (0.004). No ACK → no LIFT stage.
+  // Mirror stream_take_tick: clamp time, and at the barrier hold barrier_q.
+  const double tip_s = 0.5;
+  int past_tip = 0;
+  int lift_hold_violations = 0;
+  for (int i = 1; i <= 12; ++i) {
+    const double wall = wall0 + 0.004 * i;
+    const double t_raw = exec_anchor + (wall - wall0);
+    const double t_eff = kmpc::clamp_exec_t_to_unreleased_barrier(
+        t_raw, tick.barrier_pending, tick.barrier_released, barrier_t);
+    EXPECT_LE(t_eff, barrier_t + 1e-12) << "i=" << i << " t_raw=" << t_raw;
+    kmpc::TrajectoryTimeSample samp;
+    ASSERT_TRUE(kmpc::sample_trajectory_at(pkg, t_eff, &samp));
+    EXPECT_LE(samp.s, tip_s + 1e-9) << "progress past TIP stage at i=" << i;
+    if (samp.s > tip_s + 1e-9) {
+      ++past_tip;
+    }
+    kmpc::Vec18 q_cmd = samp.q;
+    if (t_eff + 1e-12 >= barrier_t) {
+      q_cmd = q_tip;  // node holds barrier_q once clamped at TIP
+      EXPECT_NEAR(q_cmd[5], tip_j5, 1e-12);
+      if (std::abs(q_cmd[5] - tip_j5) > 1e-12) {
+        ++lift_hold_violations;
+      }
+    }
+  }
+  EXPECT_EQ(past_tip, 0);
+  EXPECT_EQ(lift_hold_violations, 0);
+
+  // Unclamped raw time past TIP would already enter the LIFT segment.
+  {
+    const double t_raw_past = 0.04;
+    kmpc::TrajectoryTimeSample past;
+    ASSERT_TRUE(kmpc::sample_trajectory_at(pkg, t_raw_past, &past));
+    EXPECT_GT(past.s, tip_s + 1e-6);
+    EXPECT_GT(std::abs(past.q[5] - tip_j5), 1e-4);
+  }
+}
+
+TEST(P0StageSettle, EarlyAckWhileMovingAndTipDriftReject) {
+  const auto config = kmpc::Config::load(
+      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+  kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
+                       "/Light-duty wheeled robot.urdf");
+  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
+  auto policy = kmpc::policy_from_config(config);
+  kmpc::Vec18 q0 = home_q(config);
+  kmpc::Vec18 q_tip = q0;
+  q_tip[4] += 0.02;
+  kmpc::Vec18 q_lift = q_tip;
+  q_lift[5] += 0.05;
+
+  auto make_pkg = [&](uint64_t gen) {
+    kmpc::TrajectoryPackage pkg = make_hold_package(q0, gen);
+    pkg.samples = {q0, q_tip, q_lift};
+    pkg.time_law.s = {0.0, 0.5, 1.0};
+    pkg.time_law.t_s = {0.0, 0.06, 0.16};
+    pkg.time_law.duration_s = 0.16;
+    kmpc::StageBoundary b;
+    b.sample_index = 1;
+    b.stage_id = 3;
+    b.stop_required = true;
+    b.wait_for_external_ack = true;
+    pkg.stage_boundaries.push_back(b);
+    return pkg;
+  };
+
+  // Early success ACK before WaitAck (still approaching) must not release.
+  {
+    kmpc::TrajectoryFollower f(kin, &guards, policy);
+    f.set_enable_qp_correction(false);
+    ASSERT_TRUE(f.adopt(make_pkg(1), q0, kmpc::Vec18::Zero(), false));
+    auto tick = f.step(q0, 0.02);
+    EXPECT_NE(tick.action, kmpc::FollowerAction::WaitExternalAck);
+    std::string why;
+    EXPECT_FALSE(f.on_stage_ack(1, 3, true, q0, &why));
+    EXPECT_EQ(why, "not_waiting_ack");
+    EXPECT_FALSE(f.waiting_ack());
+  }
+
+  // Reach WaitAck with settled tip, then ACK while feedback still moving.
+  {
+    kmpc::TrajectoryFollower f(kin, &guards, policy);
+    f.set_enable_qp_correction(false);
+    ASSERT_TRUE(f.adopt(make_pkg(2), q0, kmpc::Vec18::Zero(), false));
+    kmpc::FollowerTick tick;
+    double t = 1.0;
+    for (int i = 0; i < 60; ++i) {
+      tick = f.step(q_tip, 0.02, t, t);
+      t += 0.02;
+      if (tick.action == kmpc::FollowerAction::WaitExternalAck) {
+        break;
+      }
+    }
+    ASSERT_EQ(tick.action, kmpc::FollowerAction::WaitExternalAck) << tick.reason;
+    // Hold tip with real stamps so dq≈0, then ACK with a short-dt jump.
+    for (int i = 0; i < 3; ++i) {
+      tick = f.step(q_tip, 0.02, t, t);
+      t += 0.02;
+    }
+    kmpc::Vec18 moving = q_tip;
+    moving[4] += 0.012;  // dts=0.02 → dq=0.6 ≫ 0.05 settle
+    std::string why;
+    EXPECT_FALSE(f.on_stage_ack(2, 3, true, moving, &why, t, t));
+    EXPECT_EQ(why, "ack_feedback_moving") << why;
+    EXPECT_EQ(f.state(), kmpc::FollowerState::Hold);
+    EXPECT_FALSE(f.has_package());
+  }
+
+  // Small TIP drift after WaitAck → replan (tighter than legacy 0.05 rad).
+  {
+    kmpc::TrajectoryFollower f(kin, &guards, policy);
+    f.set_enable_qp_correction(false);
+    ASSERT_TRUE(f.adopt(make_pkg(3), q0, kmpc::Vec18::Zero(), false));
+    kmpc::FollowerTick tick;
+    for (int i = 0; i < 60; ++i) {
+      tick = f.step(q_tip, 0.02);
+      if (tick.action == kmpc::FollowerAction::WaitExternalAck) {
+        break;
+      }
+    }
+    ASSERT_EQ(tick.action, kmpc::FollowerAction::WaitExternalAck);
+    // Hold settled a few ticks so dq→0, then drift slightly over q tol.
+    for (int i = 0; i < 5; ++i) {
+      tick = f.step(q_tip, 0.02);
+    }
+    kmpc::Vec18 drifted = q_tip;
+    drifted[4] += 0.025;  // > 0.02 rad settle tol, < old 0.05
+    std::string why;
+    EXPECT_FALSE(f.on_stage_ack(3, 3, true, drifted, &why));
+    EXPECT_EQ(why, "ack_pose_drift");
+    EXPECT_EQ(f.state(), kmpc::FollowerState::Hold);
+  }
+
+  // Multi-tick settle: one-shot position near tip is not enough.
+  {
+    kmpc::TrajectoryFollower f(kin, &guards, policy);
+    f.set_enable_qp_correction(false);
+    kmpc::StageSettleTol tol = f.settle_tol();
+    tol.stable_ticks = 5;
+    f.set_settle_tol(tol);
+    ASSERT_TRUE(f.adopt(make_pkg(4), q0, kmpc::Vec18::Zero(), false));
+    int first_near = -1;
+    int wait_at = -1;
+    for (int i = 0; i < 80; ++i) {
+      auto tick = f.step(q_tip, 0.02);
+      if (first_near < 0 &&
+          (q_tip - tick.q_follow).cwiseAbs().maxCoeff() < 1e-9 &&
+          tick.timeline_frozen) {
+        first_near = i;
+      }
+      if (tick.action == kmpc::FollowerAction::WaitExternalAck) {
+        wait_at = i;
+        break;
+      }
+    }
+    ASSERT_GE(first_near, 0);
+    ASSERT_GE(wait_at, 0);
+    EXPECT_GE(wait_at - first_near, 4);
   }
 }

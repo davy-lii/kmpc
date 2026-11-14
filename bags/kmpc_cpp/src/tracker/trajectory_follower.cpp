@@ -1,6 +1,7 @@
 #include "kmpc/trajectory_follower.hpp"
 
 #include <cmath>
+#include <limits>
 #include <string_view>
 #include <vector>
 
@@ -48,6 +49,14 @@ void TrajectoryFollower::reset() {
   timeline_frozen_ = false;
   freeze_exec_t_ = 0.0;
   freeze_q_.setZero();
+  settle_stable_ticks_ = 0;
+  q_meas_prev_.setZero();
+  q_meas_prev_stamp_s_ = std::numeric_limits<double>::quiet_NaN();
+  have_meas_prev_ = false;
+  dq_meas_est_.setZero();
+  dq_meas_valid_ = false;
+  last_meas_stamp_s_ = std::numeric_limits<double>::quiet_NaN();
+  synthetic_stamp_s_ = 0.0;
   last_ = FollowerTick{};
 }
 
@@ -138,6 +147,14 @@ bool TrajectoryFollower::adopt(const TrajectoryPackage& package,
   timeline_frozen_ = false;
   freeze_exec_t_ = 0.0;
   freeze_q_ = q_meas;
+  settle_stable_ticks_ = 0;
+  q_meas_prev_ = q_meas;
+  q_meas_prev_stamp_s_ = std::numeric_limits<double>::quiet_NaN();
+  have_meas_prev_ = true;
+  dq_meas_est_ = dq_known ? dq_meas : Vec18::Zero();
+  dq_meas_valid_ = dq_known && dq_meas.allFinite();
+  last_meas_stamp_s_ = std::numeric_limits<double>::quiet_NaN();
+  synthetic_stamp_s_ = 0.0;
   if (ex > kExcessEps) {
     state_ = FollowerState::Recovering;
   } else {
@@ -159,7 +176,8 @@ bool TrajectoryFollower::adopt(const TrajectoryPackage& package,
 
 bool TrajectoryFollower::on_stage_ack(uint64_t generation, uint32_t stage_id,
                                       bool success, const Vec18& q_meas,
-                                      std::string* why) {
+                                      std::string* why, double meas_stamp_s,
+                                      double now_s) {
   if (state_ != FollowerState::WaitAck) {
     if (why) *why = "not_waiting_ack";
     return false;
@@ -172,6 +190,8 @@ bool TrajectoryFollower::on_stage_ack(uint64_t generation, uint32_t stage_id,
   if (!success) {
     state_ = FollowerState::Hold;
     has_package_ = false;
+    timeline_frozen_ = false;
+    settle_stable_ticks_ = 0;
     if (why) *why = "ack_failed";
     last_ = make_hold(q_meas.allFinite() ? q_meas : q_cmd_, "ack_failed");
     last_.action = FollowerAction::NeedReplan;
@@ -190,18 +210,37 @@ bool TrajectoryFollower::on_stage_ack(uint64_t generation, uint32_t stage_id,
     return false;
   }
   const Vec18& q_stage = package_.samples[b->sample_index];
-  if (!q_meas.allFinite() ||
-      (q_meas - q_stage).cwiseAbs().maxCoeff() > 0.05) {
+  if (!std::isfinite(meas_stamp_s)) {
+    // Preserve last estimated velocity; only refresh position if finite.
+    if (q_meas.allFinite()) {
+      note_feedback(q_meas, synthetic_stamp_s_, 1e-3);
+    }
+  } else {
+    note_feedback(q_meas, meas_stamp_s, 1e-3);
+  }
+  const double age_now =
+      std::isfinite(now_s) ? now_s
+                           : (std::isfinite(meas_stamp_s) ? meas_stamp_s
+                                                         : synthetic_stamp_s_);
+  const char* settle_fail = nullptr;
+  bool unused_advance = false;
+  if (!evaluate_stage_settle(q_stage, q_meas.allFinite() ? q_meas : q_cmd_,
+                             age_now, &settle_fail, &unused_advance)) {
     state_ = FollowerState::Hold;
     has_package_ = false;
-    if (why) *why = "ack_pose_drift";
-    last_ = make_hold(q_meas.allFinite() ? q_meas : q_cmd_, "ack_pose_drift");
+    timeline_frozen_ = false;
+    settle_stable_ticks_ = 0;
+    const char* tag =
+        settle_fail != nullptr ? settle_fail : "ack_pose_drift";
+    if (why) *why = tag;
+    last_ = make_hold(q_meas.allFinite() ? q_meas : q_cmd_, tag);
     last_.action = FollowerAction::NeedReplan;
     return false;
   }
   wait_ack_elapsed_s_ = 0.0;
   wait_stage_id_ = 0;
   ++stage_cursor_;
+  settle_stable_ticks_ = 0;
   // Resume from the frozen stage time — never jump to wall-clock future.
   exec_t_ = freeze_exec_t_;
   timeline_frozen_ = false;
@@ -261,6 +300,138 @@ const StageBoundary* TrajectoryFollower::stage_at_progress(double s) const {
     }
   }
   return nullptr;
+}
+
+const StageBoundary* TrajectoryFollower::next_unreleased_barrier() const {
+  if (!has_package_) {
+    return nullptr;
+  }
+  for (std::size_t i = stage_cursor_; i < package_.stage_boundaries.size();
+       ++i) {
+    const StageBoundary& b = package_.stage_boundaries[i];
+    if (b.sample_index == 0) {
+      continue;
+    }
+    if (b.stop_required || b.wait_for_external_ack) {
+      return &b;
+    }
+  }
+  return nullptr;
+}
+
+void TrajectoryFollower::fill_barrier_fields(FollowerTick* tick) const {
+  if (tick == nullptr) {
+    return;
+  }
+  tick->barrier_pending = false;
+  tick->barrier_released = true;
+  tick->barrier_t_s = 0.0;
+  tick->barrier_stage_id = 0;
+  tick->barrier_stop_required = false;
+  tick->barrier_wait_ack = false;
+  tick->barrier_q.setZero();
+  const StageBoundary* b = next_unreleased_barrier();
+  if (b == nullptr || b->sample_index >= package_.samples.size()) {
+    return;
+  }
+  tick->barrier_pending = true;
+  tick->barrier_released = false;
+  tick->barrier_t_s = time_at_sample_index(package_, b->sample_index);
+  tick->barrier_stage_id = b->stage_id;
+  tick->barrier_stop_required = b->stop_required;
+  tick->barrier_wait_ack = b->wait_for_external_ack;
+  tick->barrier_q = package_.samples[b->sample_index];
+}
+
+void TrajectoryFollower::note_feedback(const Vec18& q_meas, double meas_stamp_s,
+                                       double dt) {
+  if (!q_meas.allFinite()) {
+    dq_meas_valid_ = false;
+    return;
+  }
+  double stamp = meas_stamp_s;
+  if (!std::isfinite(stamp)) {
+    synthetic_stamp_s_ += std::max(dt, 1e-4);
+    stamp = synthetic_stamp_s_;
+  }
+  if (have_meas_prev_ && std::isfinite(q_meas_prev_stamp_s_) &&
+      stamp > q_meas_prev_stamp_s_ + 1e-9) {
+    const double dts = stamp - q_meas_prev_stamp_s_;
+    dq_meas_est_ = (q_meas - q_meas_prev_) / dts;
+    dq_meas_valid_ = dq_meas_est_.allFinite();
+  } else if (have_meas_prev_ && std::abs(stamp - q_meas_prev_stamp_s_) <= 1e-9) {
+    // Duplicate stamp: keep prior velocity estimate if any.
+  } else if (have_meas_prev_ && stamp < q_meas_prev_stamp_s_ - 1e-9) {
+    // Time went backwards — drop velocity until a fresh pair arrives.
+    dq_meas_valid_ = false;
+  } else if (have_meas_prev_) {
+    // No usable delta; estimate with control dt only when stamps absent path.
+    const double dts = std::max(dt, 1e-4);
+    dq_meas_est_ = (q_meas - q_meas_prev_) / dts;
+    dq_meas_valid_ = dq_meas_est_.allFinite();
+  } else {
+    dq_meas_valid_ = false;
+  }
+  q_meas_prev_ = q_meas;
+  q_meas_prev_stamp_s_ = stamp;
+  have_meas_prev_ = true;
+  last_meas_stamp_s_ = stamp;
+}
+
+bool TrajectoryFollower::evaluate_stage_settle(const Vec18& q_stage,
+                                               const Vec18& q_meas,
+                                               double now_s,
+                                               const char** fail_tag,
+                                               bool* advance_stable) const {
+  if (advance_stable != nullptr) {
+    *advance_stable = false;
+  }
+  if (!q_meas.allFinite() || !q_stage.allFinite()) {
+    if (fail_tag != nullptr) {
+      *fail_tag = "ack_meas_missing";
+    }
+    return false;
+  }
+  if (std::isfinite(now_s) && std::isfinite(last_meas_stamp_s_)) {
+    const double age = now_s - last_meas_stamp_s_;
+    if (age > settle_.meas_max_age_s) {
+      if (fail_tag != nullptr) {
+        *fail_tag = "ack_meas_stale";
+      }
+      return false;
+    }
+  }
+  if ((q_meas - q_stage).cwiseAbs().maxCoeff() > settle_.q_abs_max_rad) {
+    if (fail_tag != nullptr) {
+      *fail_tag = "ack_pose_drift";
+    }
+    return false;
+  }
+  const auto frame = ee_frame(package_.left);
+  const Vec3 p_stage = kin_.fk_pos(q_stage, frame);
+  const Vec3 p_meas = kin_.fk_pos(q_meas, frame);
+  if ((p_meas - p_stage).norm() > settle_.tcp_abs_max_m) {
+    if (fail_tag != nullptr) {
+      *fail_tag = "ack_tcp_drift";
+    }
+    return false;
+  }
+  if (!dq_meas_valid_) {
+    if (fail_tag != nullptr) {
+      *fail_tag = "ack_dq_unknown";
+    }
+    return false;
+  }
+  if (dq_meas_est_.cwiseAbs().maxCoeff() > settle_.dq_abs_max) {
+    if (fail_tag != nullptr) {
+      *fail_tag = "ack_feedback_moving";
+    }
+    return false;
+  }
+  if (advance_stable != nullptr) {
+    *advance_stable = true;
+  }
+  return true;
 }
 
 bool TrajectoryFollower::command_feasible(
@@ -588,14 +759,24 @@ FollowerTick TrajectoryFollower::brake_tick(const Vec18& q_meas, double dt) {
   return tick;
 }
 
-FollowerTick TrajectoryFollower::step(const Vec18& q_meas, double dt) {
+FollowerTick TrajectoryFollower::step(const Vec18& q_meas, double dt,
+                                      double meas_stamp_s, double now_s) {
   const double dtp = std::max(dt, 1e-4);
   if (!q_meas.allFinite()) {
     state_ = FollowerState::Hold;
+    dq_meas_valid_ = false;
+    settle_stable_ticks_ = 0;
     last_ = make_hold(has_cmd_ ? q_cmd_ : Vec18::Zero(), "meas_nonfinite");
     last_.action = FollowerAction::ProtectStop;
+    fill_barrier_fields(&last_);
     return last_;
   }
+  note_feedback(q_meas, meas_stamp_s, dtp);
+  const double age_now =
+      std::isfinite(now_s)
+          ? now_s
+          : (std::isfinite(last_meas_stamp_s_) ? last_meas_stamp_s_
+                                               : synthetic_stamp_s_);
   if (!has_cmd_) {
     q_cmd_ = q_meas;
     q_prev_cmd_ = q_meas;
@@ -621,6 +802,7 @@ FollowerTick TrajectoryFollower::step(const Vec18& q_meas, double dt) {
     last_.exec_t_s = exec_t_;
     last_.timeline_frozen = timeline_frozen_;
     last_.freeze_q = freeze_q_;
+    fill_barrier_fields(&last_);
     return last_;
   }
   if (state_ == FollowerState::Braking) {
@@ -629,6 +811,7 @@ FollowerTick TrajectoryFollower::step(const Vec18& q_meas, double dt) {
     last_.exec_t_s = exec_t_;
     last_.timeline_frozen = timeline_frozen_;
     last_.freeze_q = freeze_q_;
+    fill_barrier_fields(&last_);
     return last_;
   }
   if (state_ == FollowerState::WaitAck) {
@@ -649,14 +832,19 @@ FollowerTick TrajectoryFollower::step(const Vec18& q_meas, double dt) {
     tick.q_plan = freeze_q_;
     tick.q_ref = freeze_q_;
     tick.q_follow = freeze_q_;
+    tick.settle_stable_ticks = settle_stable_ticks_;
+    fill_barrier_fields(&tick);
     if (ack_timeout_s_ > 0.0 && wait_ack_elapsed_s_ > ack_timeout_s_) {
       state_ = FollowerState::Hold;
       has_package_ = false;
       timeline_frozen_ = false;
+      settle_stable_ticks_ = 0;
       tick.state = FollowerState::Hold;
       tick.action = FollowerAction::NeedReplan;
       tick.reason = "ack_timeout";
       tick.timeline_frozen = false;
+      tick.barrier_pending = false;
+      tick.barrier_released = true;
     }
     last_ = tick;
     return last_;
@@ -666,6 +854,7 @@ FollowerTick TrajectoryFollower::step(const Vec18& q_meas, double dt) {
     last_.t_s = exec_t_;
     last_.exec_t_s = exec_t_;
     last_.timeline_frozen = timeline_frozen_;
+    fill_barrier_fields(&last_);
     return last_;
   }
 
@@ -693,6 +882,7 @@ FollowerTick TrajectoryFollower::step(const Vec18& q_meas, double dt) {
     tick.reason = samp.reason != nullptr ? samp.reason : "sample_fail";
     tick.q_ref = q_cmd_;
     tick.q_follow = q_cmd_;
+    fill_barrier_fields(&tick);
     last_ = tick;
     return last_;
   }
@@ -716,16 +906,31 @@ FollowerTick TrajectoryFollower::step(const Vec18& q_meas, double dt) {
       tick.exec_t_s = exec_t_;
       tick.timeline_frozen = true;
       tick.freeze_q = q_stage;
+      const char* settle_fail = nullptr;
+      bool advance = false;
+      const bool cmd_near =
+          (q_cmd_ - q_stage).cwiseAbs().maxCoeff() <= settle_.q_abs_max_rad;
+      const bool pose_ok =
+          evaluate_stage_settle(q_stage, q_meas, age_now, &settle_fail,
+                                &advance) &&
+          cmd_near;
+      if (pose_ok && advance) {
+        ++settle_stable_ticks_;
+      } else {
+        settle_stable_ticks_ = 0;
+      }
+      tick.settle_stable_ticks = settle_stable_ticks_;
       const bool stopped =
-          (q_meas - q_stage).cwiseAbs().maxCoeff() < 0.03 &&
-          (q_cmd_ - q_stage).cwiseAbs().maxCoeff() < 0.03;
+          settle_stable_ticks_ >= settle_.stable_ticks;
+      fill_barrier_fields(&tick);
       if (b->wait_for_external_ack) {
         if (!stopped) {
           tick.q_ref = q_stage;
           tick.q_follow = q_stage;
           tick.q_plan = q_stage;
           tick.action = FollowerAction::Continue;
-          tick.reason = "decel_to_stage_stop";
+          tick.reason = settle_fail != nullptr ? settle_fail
+                                               : "decel_to_stage_stop";
           q_prev_cmd_ = q_cmd_;
           q_cmd_ = q_stage;
           last_ = tick;
@@ -750,7 +955,8 @@ FollowerTick TrajectoryFollower::step(const Vec18& q_meas, double dt) {
         tick.q_follow = q_stage;
         tick.q_plan = q_stage;
         tick.action = FollowerAction::Continue;
-        tick.reason = "stop_required_decel";
+        tick.reason =
+            settle_fail != nullptr ? settle_fail : "stop_required_decel";
         q_cmd_ = q_stage;
         last_ = tick;
         return last_;
@@ -758,11 +964,17 @@ FollowerTick TrajectoryFollower::step(const Vec18& q_meas, double dt) {
       if (b->stop_required && stopped) {
         // Actually stopped: release the barrier and continue the next stage.
         ++stage_cursor_;
+        settle_stable_ticks_ = 0;
         timeline_frozen_ = false;
         tick.timeline_frozen = false;
+        fill_barrier_fields(&tick);
       }
     }
+  } else {
+    settle_stable_ticks_ = 0;
   }
+
+  fill_barrier_fields(&tick);
 
   const double dur = package_.time_law.duration_s;
   const bool time_done = dur > 0.0 && exec_t_ >= dur - 1e-9;

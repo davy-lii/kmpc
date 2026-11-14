@@ -11,6 +11,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -538,14 +539,22 @@ class KmpcNode : public rclcpp::Node {
           const kmpc::Vec18 q =
               q_opt && q_opt->allFinite() ? *q_opt : kmpc::Vec18::Zero();
           std::string why;
+          const double meas_stamp =
+              v2_meas_valid_ ? (v2_meas_source_stamp_s_ > 0.0
+                                    ? v2_meas_source_stamp_s_
+                                    : v2_meas_stamp_s_)
+                             : std::numeric_limits<double>::quiet_NaN();
           if (!follower_->on_stage_ack(msg->generation, msg->stage_id,
-                                       msg->success, q, &why)) {
+                                       msg->success, q, &why, meas_stamp,
+                                       now().seconds())) {
             RCLCPP_WARN(get_logger(),
                         "kmpc stage_ack rejected gen=%llu stage=%u why=%s",
                         static_cast<unsigned long long>(msg->generation),
                         msg->stage_id, why.c_str());
             if (!msg->success || why == "ack_failed" || why == "ack_pose_drift" ||
-                why == "ack_timeout") {
+                why == "ack_tcp_drift" || why == "ack_feedback_moving" ||
+                why == "ack_meas_stale" || why == "ack_meas_missing" ||
+                why == "ack_dq_unknown" || why == "ack_timeout") {
               v2_request_plan_ = true;
             }
             return;
@@ -934,8 +943,13 @@ class KmpcNode : public rclcpp::Node {
           q_plan = slot.freeze_q.allFinite() ? slot.freeze_q : slot.q_follow_hint;
           q_cmd = q_plan + slot.q_offset;
         } else {
-          const double t_s = std::max(
+          // Extrapolate from last 50 Hz exec_t, then clamp to any unreleased
+          // TIP/STOP barrier so 250 Hz cannot cross before ACK/settle.
+          const double t_raw = std::max(
               0.0, slot.exec_t_s + (now_s - slot.exec_t_wall_s));
+          const double t_s = kmpc::clamp_exec_t_to_unreleased_barrier(
+              t_raw, slot.barrier_pending, slot.barrier_released,
+              slot.barrier_t_s);
           kmpc::TrajectoryTimeSample samp;
           if (!kmpc::sample_trajectory_at(slot.package, t_s, &samp) ||
               !samp.ok) {
@@ -947,6 +961,14 @@ class KmpcNode : public rclcpp::Node {
           }
           q_plan = samp.q;
           q_cmd = samp.q + slot.q_offset;
+          // At an unreleased STOP/ACK barrier time, prefer the certified
+          // barrier sample (no wall-clock jump past the tip).
+          if (slot.barrier_pending && !slot.barrier_released &&
+              slot.barrier_q.allFinite() &&
+              t_s + 1e-12 >= slot.barrier_t_s) {
+            q_plan = slot.barrier_q;
+            q_cmd = slot.barrier_q + slot.q_offset;
+          }
         }
         if (slot.recovering) {
           q_cmd = slot.q_recovery_cmd.allFinite() ? slot.q_recovery_cmd : q_cmd;
@@ -1844,6 +1866,28 @@ class KmpcNode : public rclcpp::Node {
           slot.exec_t_wall_s = v2_follow_t0_;
           slot.timeline_frozen = false;
           slot.freeze_q = q_meas_adopt;
+          // Seed next unreleased barrier so 250 Hz clamps before first 50 Hz
+          // tick observes the tip (TIP may sit between 50 Hz cycles).
+          for (const auto& b : plan.package.stage_boundaries) {
+            if (b.sample_index == 0) {
+              continue;
+            }
+            if (!(b.stop_required || b.wait_for_external_ack)) {
+              continue;
+            }
+            if (b.sample_index >= plan.package.samples.size()) {
+              continue;
+            }
+            slot.barrier_pending = true;
+            slot.barrier_released = false;
+            slot.barrier_t_s =
+                kmpc::time_at_sample_index(plan.package, b.sample_index);
+            slot.barrier_stage_id = b.stage_id;
+            slot.barrier_stop_required = b.stop_required;
+            slot.barrier_wait_ack = b.wait_for_external_ack;
+            slot.barrier_q = plan.package.samples[b.sample_index];
+            break;
+          }
           slot.generation = plan.package.generation;
           slot.path_id = plan.package.path_id;
           slot.task_digest = v2_active_digest_;
@@ -1871,7 +1915,13 @@ class KmpcNode : public rclcpp::Node {
       const double dt = std::max(cfg_.params.dt, 1e-3);
       const kmpc::Vec18 q_meas_step =
           (q_meas && q_meas->allFinite()) ? *q_meas : q0;
-      const kmpc::FollowerTick tick = follower_->step(q_meas_step, dt);
+      const double meas_stamp =
+          v2_meas_valid_ ? (v2_meas_source_stamp_s_ > 0.0
+                                ? v2_meas_source_stamp_s_
+                                : v2_meas_stamp_s_)
+                         : std::numeric_limits<double>::quiet_NaN();
+      const kmpc::FollowerTick tick =
+          follower_->step(q_meas_step, dt, meas_stamp, now().seconds());
       kmpc::Vec18 q_cmd = tick.q_follow;
       kmpc::Vec18 dq = tick.q_follow - q0;
       if (tick.action == kmpc::FollowerAction::ProtectStop) {
@@ -1928,6 +1978,13 @@ class KmpcNode : public rclcpp::Node {
         slot.exec_t_s = tick.exec_t_s;
         slot.exec_t_wall_s = now().seconds();
         slot.timeline_frozen = tick.timeline_frozen;
+        slot.barrier_pending = tick.barrier_pending;
+        slot.barrier_released = tick.barrier_released;
+        slot.barrier_t_s = tick.barrier_t_s;
+        slot.barrier_stage_id = tick.barrier_stage_id;
+        slot.barrier_stop_required = tick.barrier_stop_required;
+        slot.barrier_wait_ack = tick.barrier_wait_ack;
+        slot.barrier_q = tick.barrier_q;
         slot.freeze_q =
             tick.freeze_q.allFinite() ? tick.freeze_q : tick.q_follow;
         slot.generation = tick.generation;
@@ -3214,6 +3271,15 @@ class KmpcNode : public rclcpp::Node {
     // between 50 Hz ticks. When frozen, 250 Hz must hold freeze_q.
     double exec_t_s = 0.0;
     double exec_t_wall_s = 0.0;
+    // Next unreleased StageBoundary — 250 Hz clamps before sampling so a TIP
+    // between two 50 Hz ticks cannot produce LIFT commands.
+    bool barrier_pending = false;
+    bool barrier_released = false;
+    double barrier_t_s = 0.0;
+    uint32_t barrier_stage_id = 0;
+    bool barrier_stop_required = false;
+    bool barrier_wait_ack = false;
+    kmpc::Vec18 barrier_q = kmpc::Vec18::Zero();
     uint64_t generation = 0;
     uint32_t path_id = 0;
     uint64_t task_digest = 0;

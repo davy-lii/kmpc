@@ -1,5 +1,5 @@
-// x86 control-only bench for certified planning latency.
-// Numbers here are NOT Jetson proof. Fill Jetson results in the issue draft note.
+// Certified planning latency bench. Label host by actual machine arch so Jetson
+// aarch64 runs are not mis-tagged as x86_control_only.
 
 #include <algorithm>
 #include <chrono>
@@ -7,6 +7,10 @@
 #include <iostream>
 #include <string>
 #include <vector>
+
+#if defined(__linux__)
+#include <sys/utsname.h>
+#endif
 
 #include "kmpc/config.hpp"
 #include "kmpc/kinematics.hpp"
@@ -72,8 +76,27 @@ int main() {
   const kmpc::Vec18 q0 = config.q_pref;
   const kmpc::Vec3 p0 = kin.fk_pos(q0, kmpc::kEeFrameLeft);
 
-  std::cout << "bench_certified_planning host=x86_control_only "
-               "(NOT jetson proof)\n";
+  std::string host_tag = "unknown_host";
+#if defined(__linux__)
+  utsname uts{};
+  if (uname(&uts) == 0) {
+    const std::string mach = uts.machine;
+    if (mach.find("aarch64") != std::string::npos ||
+        mach.find("arm64") != std::string::npos) {
+      host_tag = "jetson_offline_aarch64";
+    } else if (mach.find("x86_64") != std::string::npos ||
+               mach.find("amd64") != std::string::npos) {
+      host_tag = "x86_control_only";
+    } else {
+      host_tag = mach;
+    }
+  }
+#endif
+  std::cout << "bench_certified_planning host=" << host_tag;
+  if (host_tag == "x86_control_only") {
+    std::cout << " (NOT jetson proof)";
+  }
+  std::cout << "\n";
 
   const Case cases[] = {
       {"reach_5cm_1stage", 1, 0.05},
@@ -141,7 +164,7 @@ int main() {
                              ? 0.0
                              : 100.0 * static_cast<double>(certified_before_10) /
                                    static_cast<double>(total_ok);
-  std::cout << "overall_certified_before_10ms_rate=" << overall
-            << "% (x86_control_only; jetson TBD)\n";
+  std::cout << "overall_certified_before_10ms_rate=" << overall << "% ("
+            << host_tag << ")\n";
   return 0;
 }
