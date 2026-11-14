@@ -1,0 +1,284 @@
+{
+  "issue": "20261113_r40_dq03右手抓停_dq08左手抓停",
+  "honesty": {
+    "field_replay_true_means": "entry contains a real 18D joint vector extracted from field logs (jitter *_meas and/or terminal from=/to=).",
+    "not_field_replay": [
+      "q_pref + 0.01 rad synthetic near-J1 cases (lab only; never mark field_replay=passed)",
+      "Invented LIFT when field only sent PRE/TIP then a later separate LIFT generation",
+      "Body_Link 160mm drop is historical documentation/FK comparison, not a CSV Body column"
+    ],
+    "missing_or_partial": [
+      "run1 terminal has stream_joint stop but NO from=/to= ERROR line (only generation+reason)",
+      "Field sent stages as separate PoseArray generations, not one MotionSequence of 3",
+      "jitter *_cmd is nan outside motion windows; dq_meas not logged as a dedicated column (only *_dq derived)",
+      "No continuous offline bag of certified package samples from the old planner — only stop snapshot + targets from notes.txt",
+      "notes.txt quat_xyzw are tool-frame (same as PoseArray); replay_r40_unified_v2 applies tool_to_flange like production from_pose — do not feed raw tool quat into MotionTask"
+    ],
+    "what_field_proved": [
+      "18D q_meas at PRE/TIP/LIFT boundaries for run1 (right, dq=0.3) and run2 (left, dq=0.8)",
+      "LIFT stop reasons stream_joint; run2 has explicit from=/to= with joint_margin_rad<0 (J1~57.70°)",
+      "Vertical tip targets (same xy, Δz=-0.15m) and lift targets (+0.15m) from notes.txt",
+      "Historical free_fit pose_report drop_mm ~ -48..-51.5 on the failing LIFT builds (not the older 160mm tip drop anecdote)"
+    ]
+  },
+  "stages": [
+    {
+      "id": "run2_left_pre_tip",
+      "field_replay": true,
+      "hand": "left",
+      "dq_scale": 0.8,
+      "source": "run2_dq0.8_20261113T095937Z/notes.txt t=34.078 + jitter q_meas",
+      "q0_source": "jitter_meas",
+      "q0": [
+        0.6982488798856953,
+        -0.8726792733831602,
+        -0.17455023574651846,
+        -0.026209499868014824,
+        -0.0017104984338874557,
+        0.5153256656719677,
+        -0.13651829800936938,
+        -2.1265793775351924,
+        -1.2752267514246083,
+        -0.2429138871923779,
+        0.01394424488862764,
+        -0.0017108979080509674,
+        0.5153260152118608,
+        0.13651865753611656,
+        -2.126578658481698,
+        1.2752292681118385,
+        -0.24291316813888353,
+        0.01394592268011439
+      ],
+      "q0_t_s": 34.0863,
+      "goals": [
+        {
+          "name": "PRE",
+          "xyz": [
+            0.516071795,
+            0.272798503,
+            0.615
+          ],
+          "quat_xyzw": [
+            0.778376915,
+            0.229195584,
+            -0.312912199,
+            0.493644324
+          ]
+        },
+        {
+          "name": "TIP",
+          "xyz": [
+            0.516071795,
+            0.272798503,
+            0.465
+          ],
+          "quat_xyzw": [
+            0.778376915,
+            0.229195584,
+            -0.312912199,
+            0.493644324
+          ]
+        }
+      ],
+      "note": "Field PoseArray poses=2; do not invent LIFT into this task"
+    },
+    {
+      "id": "run2_left_lift_stop",
+      "field_replay": true,
+      "hand": "left",
+      "dq_scale": 0.8,
+      "source": "notes t=41.103 + terminal from=/to= + jitter",
+      "q0_source": "terminal_from_and_jitter_meas",
+      "q0": [
+        1.007055,
+        -2.15432022166,
+        0.635523446731,
+        -0.105581021416,
+        -0.00170435651862,
+        0.51529056188,
+        -0.136513744004,
+        -2.12657973706,
+        -1.27522591253,
+        -0.242912449085,
+        0.0139435258351,
+        -1.41338627905,
+        1.23487246065,
+        1.67159468374,
+        -2.04710910597,
+        1.72191296869,
+        0.132740870319,
+        -0.666711193625
+      ],
+      "q0_t_s": 41.103,
+      "q_to_rejected": [
+        1.00713150677,
+        -2.15427022166,
+        0.635527983635,
+        -0.10558189602,
+        -0.00170439267998,
+        0.515290734139,
+        -0.136513767673,
+        -2.1265797418,
+        -1.27522591411,
+        -0.242912455397,
+        0.0139435211013,
+        -1.41341820606,
+        1.2348422683,
+        1.67158762976,
+        -2.04717580586,
+        1.72187344121,
+        0.132720534295,
+        -0.666835427124
+      ],
+      "stop_reason": "stream_joint",
+      "joint_margin_rad": -1.53013549e-05,
+      "historical_pose_report": "src=free_fit;q=1.045;drop_mm=-51.5;dx_mm=-30.5;foldx_mm=4.5;pitch_deg=-23.47",
+      "goals": [
+        {
+          "name": "LIFT",
+          "xyz": [
+            0.516071795,
+            0.272798503,
+            0.615
+          ],
+          "quat_xyzw": [
+            0.778376915,
+            0.229195584,
+            -0.312912199,
+            0.493644324
+          ]
+        }
+      ],
+      "note": "Separate generation after tip; field did not co-send PRE+TIP+LIFT"
+    },
+    {
+      "id": "run1_right_pre_tip",
+      "field_replay": true,
+      "hand": "right",
+      "dq_scale": 0.3,
+      "source": "run1 notes t=62.002 + jitter",
+      "q0_source": "jitter_meas",
+      "q0": [
+        0.6982249114358846,
+        -0.8726553049333495,
+        -0.17453825152161312,
+        -0.026173547193298754,
+        -0.0017105483681578945,
+        0.5153258654090495,
+        -0.13651865753611656,
+        -2.126579257692943,
+        -1.2752269911091063,
+        -0.2429150856148684,
+        0.01394496394212196,
+        -0.0017103985653465778,
+        0.5153260651461312,
+        0.13651877737836562,
+        -2.1265791378506944,
+        1.2752299871653328,
+        -0.24291688324860422,
+        0.013946402049110603
+      ],
+      "q0_t_s": 62.0061,
+      "goals": [
+        {
+          "name": "PRE",
+          "xyz": [
+            0.498429119,
+            -0.286684478,
+            0.61
+          ],
+          "quat_xyzw": [
+            -0.785307554,
+            0.204189333,
+            0.328536754,
+            0.48338635
+          ]
+        },
+        {
+          "name": "TIP",
+          "xyz": [
+            0.498429119,
+            -0.286684478,
+            0.46
+          ],
+          "quat_xyzw": [
+            -0.785307554,
+            0.204189333,
+            0.328536754,
+            0.48338635
+          ]
+        }
+      ],
+      "note": "Field PoseArray poses=2"
+    },
+    {
+      "id": "run1_right_lift_stop",
+      "field_replay": true,
+      "hand": "right",
+      "dq_scale": 0.3,
+      "source": "notes t=77.242 + jitter (terminal lacks from=/to=)",
+      "q0_source": "jitter_meas",
+      "q0": [
+        1.0070943399216394,
+        -2.1586704953022577,
+        0.6423904076018283,
+        0.05075319247418508,
+        1.4215502825933342,
+        1.1573431142078872,
+        -1.7302283429810585,
+        -2.011456995618352,
+        -1.6704305361285519,
+        0.11358576459947528,
+        0.5982875012121237,
+        -0.0017102986968056998,
+        0.5153259652775903,
+        0.13651817816712034,
+        -2.1265794973774415,
+        1.2752299871653328,
+        -0.24291688324860422,
+        0.01394628220686155
+      ],
+      "q0_t_s": 77.2459,
+      "stop_reason": "stream_joint",
+      "historical_pose_report": "src=free_fit;q=1.079;drop_mm=-48.0;dx_mm=-26.6;foldx_mm=4.6;pitch_deg=-24.04",
+      "goals": [
+        {
+          "name": "LIFT",
+          "xyz": [
+            0.498429119,
+            -0.286684478,
+            0.61
+          ],
+          "quat_xyzw": [
+            -0.785307554,
+            0.204189333,
+            0.328536754,
+            0.48338635
+          ]
+        }
+      ],
+      "missing": [
+        "terminal_from_to"
+      ]
+    },
+    {
+      "id": "synthetic_q_pref_j1_wall",
+      "field_replay": false,
+      "hand": "right",
+      "dq_scale": 1.0,
+      "source": "lab synthetic: config.q_pref with J1 = q_max-0.01",
+      "q0_source": "synthetic_q_pref",
+      "goals": [
+        {
+          "name": "UP",
+          "xyz_offset": [
+            0.0,
+            0.0,
+            0.04
+          ]
+        }
+      ],
+      "note": "Must NEVER be reported as field_replay=passed"
+    }
+  ]
+}

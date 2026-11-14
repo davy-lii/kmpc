@@ -111,13 +111,14 @@ kmpc_node:
     line_brake_profile: sqrt
     # 直线 sparse ProxQP 迭代预算；非 SOLVED 仍拒绝。
     line_qp_max_iter: 200
-    # 直线名义路径俯仰单调化（与 launch 默认一致；真机以 launch/节点参数为准）。
+    # 单臂笛卡尔生产规划器（默认 v2：PlannerWorker + Follower + SafetySupervisor）。
+    planner: unified_multistage_v2
+    # 以下开关在 planner=unified_multistage_v2 下无决策权（兼容保留）。
     line_pitch_straighten_enable: true
     line_qp_pitch_monotonic_enable: true
     reverse_last_line_enable: true
-    # Strict waist J1/J2/J3 + pitch-sum direction contract on single-arm line.
-    # Fold/backtracking on these axes refuses the candidate; final-send hard gate
-    # never publishes a reversing packet. Do not silently shrink this mask.
+    # Strict waist J1/J2/J3 + pitch-sum direction contract：仅 legacy 链生效。
+    # v2 生产链改用 SafetySupervisor，不走 direction_envelope_accept。
     line_direction_strict_enable: true
     joint_states_topic: /joint_states
     enable_topic: /kmpc/enable

@@ -276,7 +276,7 @@ TEST(LineContract, R30Gate0PitchMarginAllowsAcceptOrderChange) {
     GTEST_SKIP() << "gate0 free/arm build refused: " << tracker.line_reason();
   }
   ASSERT_GE(tracker.line_sample_count(), 2u);
-  EXPECT_EQ(tracker.line_candidate(), "unified_multistage")
+  EXPECT_EQ(tracker.line_candidate(), "unified_multistage_v2")
       << "cand=" << tracker.line_candidate();
   const auto& samples = tracker.line_samples();
   const double pitch_max = cfg_all.params.torso_pitch_max_deg * deg;
@@ -354,7 +354,7 @@ TEST(LineContract, ExclusivePoolPicksBetterPitchMargin) {
   // Poisoned reverse must not win; free/fold may win with squat, else qa_seed.
   EXPECT_NE(tracker.line_candidate(), "reverse_cache")
       << "rev=" << tracker.reverse_line_decision();
-  EXPECT_EQ(tracker.line_candidate(), "unified_multistage")
+  EXPECT_EQ(tracker.line_candidate(), "unified_multistage_v2")
       << "cand=" << tracker.line_candidate()
       << " rev=" << tracker.reverse_line_decision();
   const auto chk = kmpc::check_path_direction_strict(tracker.line_samples());
@@ -404,6 +404,6 @@ TEST(LineContract, FoldContrastSameStartDoesNotTakeOfficialPath) {
   EXPECT_FALSE(contrast.fold_hard_ok);
   ASSERT_TRUE(tracker.rearm_line(1));
   tracker.compute(q0, cfg_all.q_pref, nullptr, &target, nullptr, nullptr);
-  EXPECT_EQ(tracker.line_candidate(), "unified_multistage")
+  EXPECT_EQ(tracker.line_candidate(), "unified_multistage_v2")
       << tracker.line_reason();
 }

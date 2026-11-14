@@ -3,6 +3,7 @@
 // q_limit_margin is not a second joint hard wall.
 
 #include <algorithm>
+#include <string>
 
 #include "kmpc/config.hpp"
 #include "kmpc/types.hpp"
@@ -25,22 +26,41 @@ inline bool joint_violates_hard_box(
   return joint_hard_margin_rad(q, q_min, q_max) < -kHardBoxSlackRad;
 }
 
-// Shared numbers. q_limit_margin_rad is recorded so a caller can see the old
-// planner preference. It is not an argument to joint_violates_hard_box.
 struct MotionConstraintPolicy {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
   Vec18 q_min = Vec18::Zero();
   Vec18 q_max = Vec18::Zero();
+  Vec18 dq_max = Vec18::Ones();
+  Vec18 ddq_max = Vec18::Ones();
+  Vec18 dddq_max = Vec18::Ones();
   double torso_pitch_max_rad = 32.0 * kPi / 180.0;
+  // Preference scale only. Never a second hard wall.
   double q_limit_margin_rad = 0.0;
+  double yaw_abs_max_rad = 0.0;
+  bool yaw_limited = false;
+  bool a_max_calibrated = false;
+  bool j_max_calibrated = false;
+  std::string accel_source = "software_limited_from_step_cap";
+  std::string jerk_source = "software_limited";
+  std::string collision_coverage = "NOT_AVAILABLE";
+  std::string com_model = "xy_work_rectangle";
 };
 
 inline MotionConstraintPolicy policy_from_config(const Config& cfg) {
   MotionConstraintPolicy policy;
   policy.q_min = cfg.limits.q_min;
   policy.q_max = cfg.limits.q_max;
+  policy.dq_max = cfg.limits.dq_max;
+  // Conservative stand-in until device a/j are calibrated.
+  for (int j = 0; j < kNDof; ++j) {
+    const double dq = std::max(cfg.limits.dq_max[j], 1e-3);
+    policy.ddq_max[j] = 8.0 * dq;
+    policy.dddq_max[j] = 40.0 * dq;
+  }
   policy.torso_pitch_max_rad = cfg.params.torso_pitch_max_deg * kPi / 180.0;
   policy.q_limit_margin_rad = cfg.params.q_limit_margin;
+  policy.a_max_calibrated = false;
+  policy.j_max_calibrated = false;
   return policy;
 }
 

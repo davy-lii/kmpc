@@ -9,6 +9,7 @@ kmpc_cpp/
 **/__pycache__/
 *.pyc
 *.log
-# bags also contains the maintained C++ source
+# bags also contains the maintained C++ source and ROS msgs
 /bags/*
 !/bags/kmpc_cpp/
+!/bags/kmpc_msgs/

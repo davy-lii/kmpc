@@ -1,5 +1,7 @@
 #pragma once
-// Discrete checker. continuous_certified stays false until a bound exists.
+// Multi-stage path + timed trajectory certification.
+
+#include <string>
 
 #include "kmpc/constraint_policy.hpp"
 #include "kmpc/kinematics.hpp"
@@ -11,6 +13,8 @@ namespace kmpc {
 
 enum class PathCoverage {
   DiscreteSamples = 0,
+  ConservativeSplineBounds = 1,
+  AdaptiveSampledWithOnlineGuard = 2,
 };
 
 struct TrajectoryCertificate {
@@ -29,12 +33,24 @@ struct TrajectoryCertificate {
   const char* first_fault = "not_checked";
   // What CoM check this certificate actually ran.
   const char* com_model = "not_checked";
+  std::string coverage_note = "sampled_only";
 };
 
 // guards == nullptr is not a pass. CoM is then "not checked", not "inside".
-// One stage only. FollowCurve and orientation return an explicit fault.
 TrajectoryCertificate validate_discrete_trajectory(
     const MotionTask& task, const JointCurve& samples,
+    const MotionConstraintPolicy& policy, const Kinematics& kin,
+    const WholeBodyGuards* guards);
+
+// Multi-stage geometry validation on the spline samples that will execute.
+TrajectoryCertificate validate_path(
+    const MotionTask& task, const JointCurve& samples,
+    const MotionConstraintPolicy& policy, const Kinematics& kin,
+    const WholeBodyGuards* guards);
+
+// Re-check the timed package that execution will interpolate.
+TrajectoryCertificate validate_actual_q_of_t(
+    const TrajectoryPackage& package, const MotionTask& task,
     const MotionConstraintPolicy& policy, const Kinematics& kin,
     const WholeBodyGuards* guards);
 

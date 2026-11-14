@@ -249,6 +249,7 @@ def _real_setup(context, *args, **kwargs):
             LaunchConfiguration('stream_dedicated_thread'), value_type=bool),
         'stream_debug_q_hz': ParameterValue(
             LaunchConfiguration('stream_debug_q_hz'), value_type=float),
+        'planner': LaunchConfiguration('planner'),
         'line_pose_pref_enable': ParameterValue(
             LaunchConfiguration('line_pose_pref_enable'), value_type=bool),
         'line_pitch_straighten_enable': ParameterValue(
@@ -316,17 +317,20 @@ def generate_real_launch():
             'stream_debug_q_hz', default_value='50.0',
             description='/kmpc/debug/q 频率；从 250 Hz 热路径降下来。0=不发'),
         DeclareLaunchArgument(
+            'planner', default_value='unified_multistage_v2',
+            description='单臂笛卡尔生产规划器；unified_multistage_v2 走 PlannerWorker+Follower+SafetySupervisor'),
+        DeclareLaunchArgument(
             'line_pose_pref_enable', default_value='false',
-            description='直线段默认关闭的姿态偏好候选'),
+            description='v2 下无决策权（保留参数兼容）；legacy 姿态偏好候选'),
         DeclareLaunchArgument(
             'line_pitch_straighten_enable', default_value='true',
-            description='直线名义路径俯仰单调化；不可行时显式拒绝'),
+            description='v2 下无决策权；legacy 名义路径俯仰单调化'),
         DeclareLaunchArgument(
             'line_qp_pitch_monotonic_enable', default_value='true',
-            description='P0：line_qp 俯仰单调方向约束；默认开，可独立关掉对照'),
+            description='v2 下无决策权；legacy line_qp 俯仰单调约束'),
         DeclareLaunchArgument(
             'reverse_last_line_enable', default_value='true',
-            description='P0：reverse_cache 复用上一段名义样点；默认开，可独立关掉对照'),
+            description='v2 下无决策权；legacy reverse_cache 复用'),
         DeclareLaunchArgument(
             'line_diag_enable', default_value='false',
             description='启动晃动分层诊断环（默认关闭）'),

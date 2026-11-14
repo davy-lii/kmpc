@@ -1,0 +1,11 @@
+uint8 LIN=0
+uint8 PTP=1
+uint8 FOLLOW_CURVE=2
+uint8 geometry
+geometry_msgs/Pose target
+bool constrain_orientation
+float64 position_tol_m
+float64 orientation_tol_rad
+bool stop_at_end
+bool wait_for_external_ack
+uint32 stage_id

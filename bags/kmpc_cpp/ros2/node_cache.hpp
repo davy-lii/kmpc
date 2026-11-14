@@ -14,6 +14,8 @@
 
 #include "kmpc/types.hpp"
 #include "kmpc/cartesian_tracker.hpp"
+#include "kmpc/motion_task.hpp"
+#include "kmpc/tracker_math.hpp"
 #include "kmpc/upper_planner.hpp"
 
 namespace kmpc {
@@ -28,6 +30,10 @@ struct CartesianTarget {
   std::optional<LineTarget> cascade;
 
 };
+
+// MotionSequence stage payload without ROS types (conversion stays in kmpc_node).
+using StageTarget = TaskStage;
+static constexpr std::size_t kMaxMotionStages = 3;
 
 class CommandArbiter {
  public:
@@ -86,6 +92,7 @@ class TaskReceiver {
   }
 
   // Single message installs current pose, real next pose and generation atomically.
+  // PoseArray adapter also fills motion_ with 1 (or 2 if cascade) StageTarget entries.
   bool on_segment(bool left, const CartesianTarget& t) {
     if (!t.generation || t.frame_id!=kBaseFrame || !t.xyz.allFinite() ||
         !t.quat_xyzw.allFinite() || t.quat_xyzw.norm()<1e-6) return false;
@@ -95,6 +102,10 @@ class TaskReceiver {
     auto& current=left?left_:right_;
     if (current && current->generation==t.generation) {
       current->xyz=t.xyz; current->quat_xyzw=t.quat_xyzw;
+      if (motion_ && motion_->generation == t.generation && !motion_->stages.empty()) {
+        motion_->stages[0].position = t.xyz;
+        motion_->stages[0].quat = t.quat_xyzw;
+      }
       return true; // Same segment drift cannot replace its cascade or rearm.
     }
     if (t.generation<=generation_) return false;
@@ -102,7 +113,63 @@ class TaskReceiver {
     mode_=std::string(kModeSingleEe);
     if(left) { left_=t; right_.reset(); } else { right_=t; left_.reset(); }
     saw_cartesian_=true;
+    motion_ = motion_task_from_segment(left, t);
     return true;
+  }
+
+  // Atomic generation replace for typed MotionSequence (1..3 stages). Rejects >3.
+  bool on_motion_sequence(const MotionTask& task) {
+    if (!task.generation || task.stages.empty() ||
+        task.stages.size() > kMaxMotionStages) {
+      return false;
+    }
+    const std::string frame =
+        task.frame.empty() ? std::string(kBaseFrame) : task.frame;
+    if (frame != kBaseFrame) {
+      return false;
+    }
+    for (const auto& st : task.stages) {
+      if (!st.position.allFinite() || !st.quat.allFinite() ||
+          st.quat.norm() < 1e-6 || !(st.position_tol_m > 0.0) ||
+          !(st.orientation_tol_rad > 0.0)) {
+        return false;
+      }
+      if (st.geometry != TaskGeometry::Lin && st.geometry != TaskGeometry::Ptp &&
+          st.geometry != TaskGeometry::FollowCurve) {
+        return false;
+      }
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    if (task.generation <= generation_) {
+      return false;
+    }
+    generation_ = task.generation;
+    mode_ = std::string(kModeSingleEe);
+    MotionTask next = task;
+    next.frame = frame;
+    motion_ = next;
+    // Mirror first 1–2 stages into legacy CartesianTarget so PoseArray path stays usable.
+    CartesianTarget cart = cartesian_from_stages(next);
+    if (task.left) {
+      left_ = cart;
+      right_.reset();
+    } else {
+      right_ = cart;
+      left_.reset();
+    }
+    saw_cartesian_ = true;
+    waist_locked_hint_ = task.waist_locked;
+    return true;
+  }
+
+  std::optional<MotionTask> motion_task() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return motion_;
+  }
+
+  bool waist_locked_hint() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return waist_locked_hint_;
   }
   std::pair<std::optional<CartesianTarget>,std::optional<CartesianTarget>> targets() const {
     std::lock_guard<std::mutex> lock(mu_);
@@ -114,6 +181,9 @@ class TaskReceiver {
     auto& target=left?left_:right_;
     if(!target || target->generation!=generation) return false;
     target.reset();
+    if (motion_ && motion_->generation == generation && motion_->left == left) {
+      motion_.reset();
+    }
     saw_cartesian_=left_.has_value() || right_.has_value();
     return true;
   }
@@ -122,6 +192,7 @@ class TaskReceiver {
     std::lock_guard<std::mutex> lock(mu_);
     left_.reset();
     right_.reset();
+    motion_.reset();
     saw_cartesian_ = false;
   }
 
@@ -143,6 +214,9 @@ class TaskReceiver {
     if (right_ && right_->generation <= gen) {
       right_.reset();
     }
+    if (motion_ && motion_->generation <= gen) {
+      motion_.reset();
+    }
     saw_cartesian_ = left_.has_value() || right_.has_value();
     if (!saw_cartesian_) {
       generation_ = gen;
@@ -152,6 +226,9 @@ class TaskReceiver {
   void clear_left() {
     std::lock_guard<std::mutex> lock(mu_);
     left_.reset();
+    if (motion_ && motion_->left) {
+      motion_.reset();
+    }
     if (!right_) {
       saw_cartesian_ = false;
     }
@@ -160,6 +237,9 @@ class TaskReceiver {
   void clear_right() {
     std::lock_guard<std::mutex> lock(mu_);
     right_.reset();
+    if (motion_ && !motion_->left) {
+      motion_.reset();
+    }
     if (!left_) {
       saw_cartesian_ = false;
     }
@@ -200,6 +280,48 @@ class TaskReceiver {
   }
 
  private:
+  static MotionTask motion_task_from_segment(bool left, const CartesianTarget& t) {
+    MotionTask mt;
+    mt.generation = t.generation;
+    mt.left = left;
+    mt.frame = t.frame_id;
+    StageTarget s0;
+    s0.geometry = TaskGeometry::Lin;
+    s0.position = t.xyz;
+    s0.quat = t.quat_xyzw;
+    // Legacy PoseArray: identity quat means unconstrained orientation.
+    s0.has_orientation = !quat_is_identity_xyzw(&t.quat_xyzw);
+    s0.stage_id = 0;
+    mt.stages.push_back(s0);
+    if (t.cascade) {
+      StageTarget s1;
+      s1.geometry = TaskGeometry::Lin;
+      s1.position = t.cascade->xyz;
+      s1.quat = t.cascade->quat_xyzw;
+      s1.has_orientation = t.cascade->ori_on;
+      s1.stage_id = 1;
+      mt.stages.push_back(s1);
+    }
+    return mt;
+  }
+
+  static CartesianTarget cartesian_from_stages(const MotionTask& task) {
+    CartesianTarget cart;
+    cart.generation = task.generation;
+    cart.frame_id = task.frame.empty() ? std::string(kBaseFrame) : task.frame;
+    cart.xyz = task.stages[0].position;
+    cart.quat_xyzw = task.stages[0].quat;
+    if (task.stages.size() >= 2) {
+      LineTarget tip;
+      tip.xyz = task.stages[1].position;
+      tip.quat_xyzw = task.stages[1].quat;
+      tip.ori_on = task.stages[1].has_orientation;
+      tip.frame = cart.frame_id;
+      cart.cascade = tip;
+    }
+    return cart;
+  }
+
   mutable std::mutex mu_;
   uint64_t generation_ = 0;
   Vec18 q_pref_ = Vec18::Zero();
@@ -207,7 +329,9 @@ class TaskReceiver {
   std::string mode_ = std::string(kModeSingleEe);
   std::optional<CartesianTarget> left_;
   std::optional<CartesianTarget> right_;
+  std::optional<MotionTask> motion_;
   bool saw_cartesian_ = false;
+  bool waist_locked_hint_ = false;
 };
 
 class PlannerReceiver {

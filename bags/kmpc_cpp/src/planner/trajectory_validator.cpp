@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <vector>
 
 #include "kmpc/tracker_math.hpp"
 
@@ -18,9 +19,20 @@ void note(const char** fault, const char* why) {
 
 double pitch_abs(const Vec18& q) { return std::abs(q[0] + q[1] + q[2]); }
 
+// Distance from p to segment ab; returns distance and the clamped parameter.
+double segment_distance(const Vec3& p, const Vec3& a, const Vec3& b) {
+  const Vec3 ab = b - a;
+  const double ab2 = ab.squaredNorm();
+  if (ab2 < 1e-16) {
+    return (p - b).norm();
+  }
+  const double t = std::clamp((p - a).dot(ab) / ab2, 0.0, 1.0);
+  return (p - (a + t * ab)).norm();
+}
+
 }  // namespace
 
-TrajectoryCertificate validate_discrete_trajectory(
+TrajectoryCertificate validate_path(
     const MotionTask& task, const JointCurve& samples,
     const MotionConstraintPolicy& policy, const Kinematics& kin,
     const WholeBodyGuards* guards) {
@@ -36,36 +48,49 @@ TrajectoryCertificate validate_discrete_trajectory(
     out.first_fault = "too_few_samples";
     return out;
   }
-  if (task.stages.size() != 1) {
+  if (task.stages.empty()) {
     out.first_fault = "stage_count_not_supported";
     return out;
   }
-  const TaskStage& stage = task.stages.front();
-  if (stage.geometry == TaskGeometry::FollowCurve) {
-    out.first_fault = "follow_curve_not_implemented";
-    return out;
-  }
-  if (stage.has_orientation) {
-    out.first_fault = "orientation_check_not_implemented";
-    return out;
-  }
-  if (!(stage.position_tol_m > 0.0) || !std::isfinite(stage.position_tol_m)) {
-    out.first_fault = "bad_task_tol";
-    return out;
-  }
-  if (stage.geometry == TaskGeometry::Lin &&
-      stage.position_tol_m >= kLegacyHardTubeM) {
-    out.first_fault = "lin_tol_is_legacy_hard_tube";
-    return out;
+  const std::string_view frame = task.left ? kEeFrameLeft : kEeFrameRight;
+  const std::size_t nstage = task.stages.size();
+  // Polyline vertices: certified start TCP, then one endpoint per stage.
+  std::vector<Vec3, Eigen::aligned_allocator<Vec3>> poly;
+  poly.reserve(nstage + 1);
+  poly.push_back(kin.fk_pos(samples.front(), frame));
+  for (const TaskStage& stage : task.stages) {
+    if (stage.geometry == TaskGeometry::FollowCurve) {
+      out.first_fault = "follow_curve_not_implemented";
+      return out;
+    }
+    if (!(stage.position_tol_m > 0.0) ||
+        !std::isfinite(stage.position_tol_m)) {
+      out.first_fault = "bad_task_tol";
+      return out;
+    }
+    // LIN uses the task tolerance only. The 0.20 m hard tube is retired.
+    if (stage.geometry == TaskGeometry::Lin &&
+        stage.position_tol_m >= kLegacyHardTubeM) {
+      out.first_fault = "lin_tol_is_legacy_hard_tube";
+      return out;
+    }
+    if (!stage.position.allFinite()) {
+      out.first_fault = "bad_task_tol";
+      return out;
+    }
+    poly.push_back(stage.position);
   }
 
+  // Joint hard box + pitch hard wall. A start already outside the pitch cap
+  // keeps its |start| envelope (recovery); the envelope never grows.
   out.hard_box_ok = true;
   out.pitch_ok = true;
+  const double cap = policy.torso_pitch_max_rad;
+  const double start_abs = pitch_abs(samples.front());
+  const double pitch_bound = pitch_abs_bound(cap, start_abs, false);
   out.min_joint_margin_rad = joint_hard_margin_rad(
       samples.front(), policy.q_min, policy.q_max);
-  const double pitch_limit = policy.torso_pitch_max_rad + kPitchRoundEpsRad;
-  out.min_pitch_margin_rad = pitch_limit - pitch_abs(samples.front());
-
+  out.min_pitch_margin_rad = pitch_bound - start_abs;
   for (const Vec18& q : samples) {
     const double joint_margin =
         joint_hard_margin_rad(q, policy.q_min, policy.q_max);
@@ -74,9 +99,10 @@ TrajectoryCertificate validate_discrete_trajectory(
       out.hard_box_ok = false;
       note(&fault, "joint");
     }
-    const double pitch_margin = pitch_limit - pitch_abs(q);
+    const double pa = pitch_abs(q);
+    const double pitch_margin = pitch_bound - pa;
     out.min_pitch_margin_rad = std::min(out.min_pitch_margin_rad, pitch_margin);
-    if (!(pitch_margin >= 0.0) || !q.head<3>().allFinite()) {
+    if (!(pitch_margin >= -kPitchRoundEpsRad) || !q.head<3>().allFinite()) {
       out.pitch_ok = false;
       note(&fault, "pitch");
     }
@@ -99,42 +125,134 @@ TrajectoryCertificate validate_discrete_trajectory(
     }
   }
 
-  const std::string_view frame = task.left ? kEeFrameLeft : kEeFrameRight;
-  const Vec3 start = kin.fk_pos(samples.front(), frame);
-  const Vec3 target = stage.position;
-  const Vec3 ab = target - start;
-  const double ab2 = ab.squaredNorm();
+  // Task path: per-sample cross-track to the stage polyline with the owning
+  // stage tolerance (LIN only), stage endpoint coverage, and final endpoint.
   out.task_path_ok = true;
-  for (std::size_t i = 0; i < samples.size(); ++i) {
-    const Vec3 p = kin.fk_pos(samples[i], frame);
-    double cross = 0.0;
-    if (stage.geometry == TaskGeometry::Ptp) {
-      cross = 0.0;
-    } else if (ab2 < 1e-16) {
-      cross = (p - target).norm();
-    } else {
-      double t = (p - start).dot(ab) / ab2;
-      if (t < 0.0) {
-        t = 0.0;
-      } else if (t > 1.0) {
-        t = 1.0;
+  std::vector<Vec3, Eigen::aligned_allocator<Vec3>> tcps;
+  tcps.reserve(samples.size());
+  for (const Vec18& q : samples) {
+    tcps.push_back(kin.fk_pos(q, frame));
+  }
+  for (const Vec3& p : tcps) {
+    double best = 1e30;
+    std::size_t best_seg = 0;
+    for (std::size_t s = 0; s < nstage; ++s) {
+      const double d = segment_distance(p, poly[s], poly[s + 1]);
+      if (d < best) {
+        best = d;
+        best_seg = s;
       }
-      cross = (p - (start + t * ab)).norm();
     }
-    out.worst_tcp_cross_track_m = std::max(out.worst_tcp_cross_track_m, cross);
-    if (stage.geometry == TaskGeometry::Lin && cross > stage.position_tol_m) {
+    out.worst_tcp_cross_track_m = std::max(out.worst_tcp_cross_track_m, best);
+    const TaskStage& stage = task.stages[best_seg];
+    if (stage.geometry == TaskGeometry::Lin &&
+        best > stage.position_tol_m) {
       out.task_path_ok = false;
       note(&fault, "tcp_cross_track");
     }
   }
-  out.worst_tcp_endpoint_m = (kin.fk_pos(samples.back(), frame) - target).norm();
-  if (out.worst_tcp_endpoint_m > stage.position_tol_m) {
+  for (std::size_t s = 0; s + 1 < nstage; ++s) {
+    double reached = 1e30;
+    for (const Vec3& p : tcps) {
+      reached = std::min(reached, (p - poly[s + 1]).norm());
+    }
+    if (reached > task.stages[s].position_tol_m) {
+      out.task_path_ok = false;
+      note(&fault, "tcp_stage_endpoint");
+    }
+  }
+  out.worst_tcp_endpoint_m = (tcps.back() - poly.back()).norm();
+  if (out.worst_tcp_endpoint_m > task.stages.back().position_tol_m) {
     out.task_path_ok = false;
     note(&fault, "tcp_endpoint");
   }
 
+  // Orientation, only where the stage asks for it, at the stage endpoint.
+  for (std::size_t s = 0; s < nstage; ++s) {
+    const TaskStage& stage = task.stages[s];
+    if (!stage.has_orientation) {
+      continue;
+    }
+    std::size_t best_i = tcps.size() - 1;
+    if (s + 1 < nstage) {
+      double reached = 1e30;
+      for (std::size_t i = 0; i < tcps.size(); ++i) {
+        const double d = (tcps[i] - poly[s + 1]).norm();
+        if (d < reached) {
+          reached = d;
+          best_i = i;
+        }
+      }
+    }
+    const auto pose = kin.fk(samples[best_i], frame);
+    const double oe = ori_error_xyzw(
+        stage.quat, rot_to_quat_xyzw(pose.block<3, 3>(0, 0))).norm();
+    if (!(oe <= stage.orientation_tol_rad)) {
+      out.task_path_ok = false;
+      note(&fault, "tcp_orientation");
+    }
+  }
+
   out.passed = fault == nullptr && out.hard_box_ok && out.pitch_ok &&
                out.com_checked && out.com_ok && out.task_path_ok;
+  out.first_fault = fault == nullptr ? "ok" : fault;
+  return out;
+}
+
+TrajectoryCertificate validate_discrete_trajectory(
+    const MotionTask& task, const JointCurve& samples,
+    const MotionConstraintPolicy& policy, const Kinematics& kin,
+    const WholeBodyGuards* guards) {
+  if (task.stages.empty()) {
+    TrajectoryCertificate out;
+    out.first_fault = "stage_count_not_supported";
+    return out;
+  }
+  return validate_path(task, samples, policy, kin, guards);
+}
+
+TrajectoryCertificate validate_actual_q_of_t(
+    const TrajectoryPackage& package, const MotionTask& task,
+    const MotionConstraintPolicy& policy, const Kinematics& kin,
+    const WholeBodyGuards* guards) {
+  TrajectoryCertificate out =
+      validate_path(task, package.samples, policy, kin, guards);
+  const char* fault = nullptr;
+  if (out.first_fault != nullptr && out.first_fault[0] != '\0' &&
+      std::string(out.first_fault) != "ok") {
+    fault = out.first_fault;
+  }
+  // The executed interpolation follows s(t): it must be monotone in both.
+  const TimeLawTable& law = package.time_law;
+  bool law_ok = true;
+  if (law.s.size() != law.t_s.size()) {
+    law_ok = false;
+    note(&fault, "time_law_size");
+  } else if (!law.s.empty()) {
+    if (law.s.front() < -1e-9 || law.s.back() > 1.0 + 1e-9) {
+      law_ok = false;
+      note(&fault, "time_law_range");
+    }
+    for (std::size_t i = 1; i < law.s.size(); ++i) {
+      if (law.s[i] < law.s[i - 1] - 1e-12) {
+        law_ok = false;
+        note(&fault, "time_law_s_not_monotone");
+        break;
+      }
+    }
+    for (std::size_t i = 1; i < law.t_s.size(); ++i) {
+      if (law.t_s[i] < law.t_s[i - 1] - 1e-9) {
+        law_ok = false;
+        note(&fault, "time_law_t_not_monotone");
+        break;
+      }
+    }
+  }
+  if (!(law.duration_s >= 0.0) || !std::isfinite(law.duration_s)) {
+    law_ok = false;
+    note(&fault, "time_law_duration");
+  }
+  out.passed = out.passed && law_ok;
   out.first_fault = fault == nullptr ? "ok" : fault;
   return out;
 }

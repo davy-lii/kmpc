@@ -1,13 +1,18 @@
 #pragma once
-// Production pose selector. One cost, real FK/Jacobian, known stages only.
-// A missing later stage is not invented.
+// Production pose selector, v2 chain.
+// plan_unified_multistage is an adapter: it builds a MotionTask from the
+// goal/next pair and runs FastTrajectoryOptimizer (unified_multistage_v2).
+// The DirectionContract fields stay filled for diagnostics only; there is no
+// direction sign hard reject on this chain anymore.
 
 #include <string>
 #include <vector>
 
 #include "kmpc/constraint_policy.hpp"
+#include "kmpc/fast_trajectory_optimizer.hpp"
 #include "kmpc/kinematics.hpp"
 #include "kmpc/line_contract.hpp"
+#include "kmpc/motion_task.hpp"
 #include "kmpc/trajectory_package.hpp"
 #include "kmpc/whole_body_guards.hpp"
 
@@ -58,11 +63,20 @@ struct UnifiedPlanResult {
   double waist_tcp_m = 0.0;
   double arm_tcp_m = 0.0;
   uint32_t path_id = 0;
+  // Full certified package for v2 follower/supervisor (immutable samples).
+  TrajectoryPackage package;
+  bool has_package = false;
 };
 
 UnifiedPlanResult plan_unified_multistage(
     const Kinematics& kin, const WholeBodyGuards& guards,
     const UnifiedPlanRequest& req);
+
+// Direct v2 entry: one MotionTask in, one certified immutable package out.
+FastPlanResult solve_to_verified_package(
+    const Kinematics& kin, const WholeBodyGuards& guards,
+    const MotionTask& task, const MotionConstraintPolicy& policy,
+    const TrajectoryCostWeights& weights);
 
 // Replacing samples.front() is a new curve. This does not rewrite it.
 // False means the caller must drop the package and plan again from q_meas.

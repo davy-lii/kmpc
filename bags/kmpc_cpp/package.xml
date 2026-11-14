@@ -14,6 +14,8 @@
   <depend>sensor_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>visualization_msgs</depend>
+  <!-- Required when KMPC_BUILD_ROS2=ON (kmpc_node). Offline -DKMPC_BUILD_ROS2=OFF skips find_package. -->
+  <depend>kmpc_msgs</depend>
   <depend>eigen</depend>
   <depend>yaml-cpp</depend>
   <depend>pinocchio</depend>

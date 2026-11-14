@@ -97,7 +97,12 @@ add_library(kmpc_core
   src/planner/trajectory_cost.cpp
   src/planner/trajectory_package.cpp
   src/planner/trajectory_validator.cpp
+  src/planner/time_parameterizer.cpp
+  src/planner/fast_trajectory_optimizer.cpp
   src/planner/unified_multistage_planner.cpp
+  src/planner/planner_worker.cpp
+  src/tracker/trajectory_follower.cpp
+  src/tracker/safety_supervisor.cpp
 )
 target_include_directories(kmpc_core PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -163,6 +168,12 @@ if(BUILD_TESTING)
   kmpc_add_test(test_motion_evaluator tests/unit/test_motion_evaluator.cpp)
   kmpc_add_test(test_r40_rise_soft_wall tests/unit/test_r40_rise_soft_wall.cpp)
   kmpc_add_test(test_unified_planner tests/unit/test_unified_planner.cpp)
+  kmpc_add_test(test_trajectory_follower tests/unit/test_trajectory_follower.cpp)
+  kmpc_add_test(test_pitch_recovery_v2 tests/unit/test_pitch_recovery_v2.cpp)
+  kmpc_add_test(test_trajectory_adoption tests/unit/test_trajectory_adoption.cpp)
+  kmpc_add_test(test_multistage_v2 tests/unit/test_multistage_v2.cpp)
+  kmpc_add_test(test_body_posture_cost tests/unit/test_body_posture_cost.cpp)
+  kmpc_add_test(test_stream_v2 tests/unit/test_stream_v2.cpp)
   kmpc_add_test(test_mock_eye_cycle_fold tests/unit/test_mock_eye_cycle_fold.cpp)
   kmpc_add_test(test_grasp_place_targets_624_525
                 tests/unit/test_grasp_place_targets_624_525.cpp)
@@ -179,6 +190,13 @@ if(BUILD_TESTING)
   target_link_libraries(replay_recent PRIVATE kmpc_core)
   add_executable(probe_field_line tests/replay/probe_field_line.cpp)
   target_link_libraries(probe_field_line PRIVATE kmpc_core)
+  add_executable(replay_r40_unified_v2 tests/replay/replay_r40_unified_v2.cpp)
+  target_link_libraries(replay_r40_unified_v2 PRIVATE kmpc_core)
+  target_compile_options(replay_r40_unified_v2 PRIVATE -Wall -Wextra -Werror)
+  add_executable(bench_certified_planning
+    tests/bench/bench_certified_planning.cpp)
+  target_link_libraries(bench_certified_planning PRIVATE kmpc_core)
+  target_compile_options(bench_certified_planning PRIVATE -Wall -Wextra -Werror)
 endif()
 
 # Thor colcon 常关 BUILD_TESTING；插补单测仍要能编、能 ctest。
@@ -200,6 +218,7 @@ if(KMPC_BUILD_ROS2)
   find_package(sensor_msgs REQUIRED)
   find_package(geometry_msgs REQUIRED)
   find_package(visualization_msgs REQUIRED)
+  find_package(kmpc_msgs REQUIRED)
   find_package(xoip_ros2 QUIET)
 
   add_executable(kmpc_node ros2/kmpc_node.cpp)
@@ -208,7 +227,7 @@ if(KMPC_BUILD_ROS2)
     "${CMAKE_CURRENT_SOURCE_DIR}/interpolator/include")
   target_compile_options(kmpc_node PRIVATE -Wall -Wextra -Werror)
   ament_target_dependencies(kmpc_node
-    rclcpp std_msgs sensor_msgs geometry_msgs visualization_msgs)
+    rclcpp std_msgs sensor_msgs geometry_msgs visualization_msgs kmpc_msgs)
   target_link_libraries(kmpc_node kmpc_core)
   if(xoip_ros2_FOUND)
     ament_target_dependencies(kmpc_node xoip_ros2)

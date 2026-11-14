@@ -21,12 +21,18 @@
 
 #include "kmpc/cartesian_tracker.hpp"
 #include "kmpc/config.hpp"
+#include "kmpc/constraint_policy.hpp"
+#include "kmpc/fast_trajectory_optimizer.hpp"
 #include "kmpc/kinematics.hpp"
 #include "kmpc/line_async_handoff.hpp"
 #include "kmpc/line_contract.hpp"
 #include "kmpc/line_final_gate.hpp"
+#include "kmpc/motion_task.hpp"
 #include "kmpc/path_layer_metrics.hpp"
+#include "kmpc/safety_supervisor.hpp"
 #include "kmpc/tracker_math.hpp"
+#include "kmpc/trajectory_cost.hpp"
+#include "kmpc/trajectory_follower.hpp"
 #include "kmpc/types.hpp"
 #include "kmpc/whole_body_guards.hpp"
 #include "line_stream.hpp"
@@ -237,11 +243,354 @@ inline void write_vec18_csv(std::ostream& os, const Vec18& q) {
   }
 }
 
+// NewUnified production mirror: plan → TrajectoryFollower (50 Hz) →
+// SafetySupervisor (250 Hz). No line_path_qp posture reshape, no
+// direction_envelope_accept sign hard gate.
+inline ChainRunResult run_offline_full_chain_v2(
+    CartesianTracker& tracker, Kinematics& kin, const Config& cfg,
+    const Vec18& q0, const Vec3& goal, const Vec4& quat, bool left,
+    const OfflineChainConfig& opt = {}) {
+  ChainRunResult out;
+  out.profile_name = "new_unified";
+  tracker.reset();
+  tracker.set_line_chain_profile(CartesianTracker::LineChainProfile::NewUnified);
+  tracker.rearm_line(1);
+  tracker.set_line_pace(opt.speed_scale, opt.accel_s);
+  tracker.set_line_diag_enable(true);
+
+  const MotionConstraintPolicy policy = policy_from_config(cfg);
+  const WholeBodyGuards& guards = tracker.guards();
+  const std::string frame =
+      left ? std::string(kEeFrameLeft) : std::string(kEeFrameRight);
+
+  MotionTask task;
+  task.generation = 1;
+  task.q = q0;
+  task.dq_known = false;
+  task.left = left;
+  task.frame = frame;
+  TaskStage st;
+  st.geometry = TaskGeometry::Lin;
+  st.position = goal;
+  st.has_orientation = !quat_is_identity_xyzw(&quat);
+  st.quat = quat;
+  st.position_tol_m = opt.arrive_pos_tol_m;
+  st.orientation_tol_rad = opt.arrive_ori_tol_rad;
+  st.stop = StageStop::StopRequired;
+  st.stage_id = 0;
+  task.stages.push_back(st);
+
+  RobotState state;
+  state.q = q0;
+  state.dq_known = false;
+  state.fresh = true;
+  FastTrajectoryOptimizer optimizer(kin, &guards);
+  const FastPlanResult planned =
+      optimizer.plan(task, state, policy, default_cost_weights(cfg.limits.dq_max),
+                     /*deadline_ms=*/0.0);
+  if (!planned.ok || planned.package.samples.size() < 2) {
+    out.refused = true;
+    out.refuse_reason = planned.reason.empty() ? "unified_plan" : planned.reason;
+    out.first_fault =
+        make_fault(ChainLayer::Plan, 0.0, -1, 0.0, 0.0, out.refuse_reason.c_str());
+    return out;
+  }
+
+  // Keep tracker candidate/report aligned with production logs / tests.
+  {
+    auto plan = tracker.prepare_line(q0, left, goal, &quat);
+    if (plan.on) {
+      tracker.adopt_line(std::move(plan));
+    }
+  }
+
+  TrajectoryFollower follower(kin, &guards, policy);
+  follower.set_enable_qp_correction(true);
+  std::string why;
+  if (!follower.adopt(planned.package, q0, Vec18::Zero(), false, 1e-3, 0.5,
+                      &why)) {
+    out.refused = true;
+    out.refuse_reason = why.empty() ? "adopt_failed" : why;
+    out.first_fault =
+        make_fault(ChainLayer::Plan, 0.0, -1, 0.0, 0.0, out.refuse_reason.c_str());
+    return out;
+  }
+
+  SafetySupervisor gate(kin, &guards, policy);
+  gate.seed(q0);
+  // Lag/stale feedback suites intentionally desync meas from plan; keep Ideal
+  // track tight, widen only for injected feedback faults.
+  if (opt.feedback != FeedbackMode::IdealFinal) {
+    gate.set_track_err_m(0.50);
+  }
+
+  Vec18 q_meas = q0;
+  Vec18 q_final = q0;
+  Vec18 q_feedback = q0;
+  Vec18 prev_final = q0;
+  Vec18 prev_dq = Vec18::Zero();
+  Vec18 q_follow = q0;
+  Vec18 q_plan = q0;
+  double t = 0.0;
+  double follow_t = 0.0;
+  bool hold_seen = false;
+  int drain_left = 0;
+  int control_tick_i = 0;
+  bool stale_frozen = false;
+  bool stale_resumed = false;
+  const int lag_n = std::max(1, opt.feedback_lag_ticks);
+  std::deque<Vec18, Eigen::aligned_allocator<Vec18>> lag_buf;
+  for (int i = 0; i < lag_n; ++i) {
+    lag_buf.push_back(q0);
+  }
+
+  auto note_fault_once = [&](const ChainFault& f) {
+    if (!out.first_fault.found) {
+      out.first_fault = f;
+    }
+  };
+  auto note_axis_once = [&](ChainLayer layer, double ts, int j, double v,
+                            double lim, const char* src) {
+    if (out.first_axis.found) {
+      return;
+    }
+    out.first_axis.found = true;
+    out.first_axis.layer = layer;
+    out.first_axis.t_s = ts;
+    out.first_axis.joint = j;
+    out.first_axis.value = v;
+    out.first_axis.limit = lim;
+    std::snprintf(out.first_axis.source, sizeof(out.first_axis.source), "%s",
+                  src ? src : "unknown");
+  };
+  auto update_feedback = [&](const Vec18& final_cmd) {
+    const bool resume =
+        opt.feedback_resume_control_ticks >= 0 &&
+        control_tick_i >= opt.feedback_resume_control_ticks;
+    if (resume) {
+      stale_resumed = true;
+      stale_frozen = false;
+    }
+    if (opt.feedback == FeedbackMode::StaleHold && stale_frozen && !resume) {
+      return;
+    }
+    if (opt.feedback == FeedbackMode::LagFinal && !resume) {
+      q_feedback = lag_buf.front();
+      lag_buf.pop_front();
+      lag_buf.push_back(final_cmd);
+      return;
+    }
+    if (opt.feedback == FeedbackMode::StaleHold && !stale_frozen) {
+      q_feedback = final_cmd;
+      return;
+    }
+    q_feedback = final_cmd;
+  };
+
+  for (int tick = 0; tick < opt.max_control_ticks; ++tick) {
+    control_tick_i = tick;
+    ChainTickRecord rec;
+    rec.tick_id = static_cast<uint64_t>(tick + 1);
+    rec.generation = planned.package.generation;
+    rec.t_s = t;
+    rec.dt_s = opt.control_dt;
+    q_meas = q_feedback;
+
+    const FollowerTick ft =
+        follower.step(q_meas, follow_t, opt.control_dt);
+    follow_t += opt.control_dt;
+    rec.plan_ran = true;
+    rec.qp_ran = true;  // follower layer (optional δq); not line_path_qp
+    rec.commit_ran = true;
+    rec.prog = ft.s;
+    rec.s_dot = 0.0;
+    rec.q_plan = ft.q_plan;
+    rec.q_qp = ft.q_ref;
+    rec.q_commit = ft.q_follow;
+    q_plan = ft.q_plan;
+    q_follow = ft.q_follow;
+    std::snprintf(rec.note, sizeof(rec.note), "v2_%s", ft.reason);
+
+    if (ft.action == FollowerAction::ProtectStop ||
+        ft.action == FollowerAction::Brake) {
+      out.refused = true;
+      out.refuse_reason = ft.reason;
+      note_fault_once(make_fault(ChainLayer::Qp, t, -1, 0.0, 0.0, ft.reason));
+      out.ticks.push_back(rec);
+      break;
+    }
+    if (ft.action == FollowerAction::NeedReplan) {
+      out.refused = true;
+      out.refuse_reason = ft.reason;
+      note_fault_once(make_fault(ChainLayer::Plan, t, -1, 0.0, 0.0, ft.reason));
+      out.ticks.push_back(rec);
+      break;
+    }
+    if (ft.action == FollowerAction::Arrived) {
+      hold_seen = true;
+      if (drain_left <= 0) {
+        drain_left = opt.drain_extra_ticks;
+      }
+    }
+
+    if (opt.feedback == FeedbackMode::StaleHold && !stale_resumed &&
+        !stale_frozen) {
+      q_feedback = q_follow;
+      stale_frozen = true;
+    }
+
+    const int n_stream = std::max(
+        1, static_cast<int>(std::lround(opt.control_dt / opt.stream_dt)));
+    bool stream_fault = false;
+    // Linear blend previous final → this 50 Hz follow across 250 Hz ticks.
+    const Vec18 blend_from = prev_final;
+    for (int s = 0; s < n_stream; ++s) {
+      const double now_s = t + s * opt.stream_dt;
+      const double u =
+          static_cast<double>(s + 1) / static_cast<double>(n_stream);
+      const Vec18 raw = (1.0 - u) * blend_from + u * q_follow;
+      SafetySupervisorInput in;
+      in.q_cmd = raw;
+      in.q_prev = prev_final;
+      in.q_meas = q_meas;
+      // Authorized 250 Hz sample on the blend toward the 50 Hz follow.
+      in.q_follow = raw;
+      in.q_plan = q_plan;
+      in.dt = opt.stream_dt;
+      in.cmd_timestamp_s = now_s;
+      in.meas_timestamp_s = now_s;
+      in.now_s = now_s;
+      in.expected_generation = planned.package.generation;
+      in.expected_path_id = planned.package.path_id;
+      in.claim_arrived = (ft.action == FollowerAction::Arrived);
+      in.package = &planned.package;
+      const SafetyDecision dec = gate.check(in);
+      rec.interp_ran = true;
+      rec.q_raw = raw;
+      rec.q_filt = raw;
+      if (!dec.accept) {
+        note_fault_once(make_fault(ChainLayer::FinalGate, now_s, -1, 0.0, 0.0,
+                                   dec.reason));
+        std::snprintf(rec.note, sizeof(rec.note), "final_%.80s", dec.reason);
+        out.refused = true;
+        out.refuse_reason = dec.reason;
+        out.ticks.push_back(rec);
+        stream_fault = true;
+        break;
+      }
+      const Vec18 filt = dec.q_send;
+      const Vec18 dq = (filt - prev_final) / opt.stream_dt;
+      const Vec18 ddq = (dq - prev_dq) / opt.stream_dt;
+      for (int a = 0; a < 3; ++a) {
+        out.max_waist_speed = std::max(out.max_waist_speed, std::abs(dq[a]));
+      }
+      out.max_joint_speed =
+          std::max(out.max_joint_speed, dq.cwiseAbs().maxCoeff());
+      out.max_joint_accel =
+          std::max(out.max_joint_accel, ddq.cwiseAbs().maxCoeff());
+      const double dp =
+          (filt.head<3>().sum() - prev_final.head<3>().sum()) / opt.stream_dt;
+      out.max_pitch_speed = std::max(out.max_pitch_speed, std::abs(dp));
+      const Vec18 dq_lim = tracker.effective_dq_max();
+      for (int j = 0; j < kNDof; ++j) {
+        if (dq_lim[j] > 1e-9 && std::abs(dq[j]) > dq_lim[j] * 1.05) {
+          note_axis_once(ChainLayer::FinalGate, now_s, j, dq[j], dq_lim[j],
+                         "final_speed");
+        }
+      }
+      prev_dq = dq;
+      prev_final = filt;
+      q_final = filt;
+      rec.final_ran = true;
+      rec.q_final = filt;
+      update_feedback(filt);
+      rec.q_feedback = q_feedback;
+
+      ChainStreamSample ss;
+      ss.tick_id = rec.tick_id;
+      ss.stream_i = static_cast<uint64_t>(s);
+      ss.t_s = now_s;
+      ss.dt_s = opt.stream_dt;
+      ss.q_raw = raw;
+      ss.q_filt = filt;
+      ss.q_final = filt;
+      ss.q_feedback = q_feedback;
+      ss.dq_final = dq;
+      ss.ddq_final = ddq;
+      out.stream.push_back(ss);
+    }
+    if (stream_fault) {
+      return out;
+    }
+
+    if (hold_seen) {
+      const auto pose = kin.fk(q_final, frame);
+      out.final_pos_err_m = (goal - pose.col(3).head<3>()).norm();
+      out.final_ori_err_rad =
+          ori_error_xyzw(quat, rot_to_quat_xyzw(pose.block<3, 3>(0, 0))).norm();
+      const bool cmd_ok = out.final_pos_err_m <= opt.arrive_pos_tol_m &&
+                          out.final_ori_err_rad <= opt.arrive_ori_tol_rad;
+      out.cmd_arrived = out.cmd_arrived || cmd_ok;
+      const double fb_err = (q_feedback - q_final).cwiseAbs().maxCoeff();
+      const bool fb_ok = fb_err < opt.feedback_joint_tol_rad;
+      out.feedback_arrived = out.feedback_arrived || (cmd_ok && fb_ok);
+      if (cmd_ok && fb_ok) {
+        out.completed = true;
+        std::snprintf(rec.note, sizeof(rec.note), "hold_arrived");
+        out.ticks.push_back(rec);
+        break;
+      }
+      if (--drain_left <= 0) {
+        if (cmd_ok && !fb_ok) {
+          note_fault_once(make_fault(ChainLayer::FinalGate, t, -1, fb_err,
+                                     opt.feedback_joint_tol_rad,
+                                     "hold_feedback_not_caught_up"));
+          std::snprintf(rec.note, sizeof(rec.note),
+                        "hold_feedback_not_caught_up");
+        } else if (!cmd_ok) {
+          note_fault_once(make_fault(ChainLayer::FinalGate, t, -1,
+                                     out.final_pos_err_m, opt.arrive_pos_tol_m,
+                                     "hold_not_arrived"));
+          std::snprintf(rec.note, sizeof(rec.note), "hold_not_arrived");
+        }
+        out.ticks.push_back(rec);
+        break;
+      }
+      std::snprintf(rec.note, sizeof(rec.note), "hold_drain");
+    }
+
+    out.ticks.push_back(rec);
+    t += opt.control_dt;
+  }
+
+  if (!out.completed && !out.refused && !out.first_fault.found) {
+    if (opt.feedback == FeedbackMode::StaleHold && !stale_resumed) {
+      // Freeze never resumed: feedback cannot catch the final command.
+      out.first_fault =
+          make_fault(ChainLayer::FinalGate, t, -1, 0.0,
+                     opt.feedback_joint_tol_rad, "hold_feedback_not_caught_up");
+    } else {
+      out.first_fault = make_fault(ChainLayer::Unknown, t, -1, 0.0, 0.0,
+                                   "timeout_or_incomplete", /*unknown=*/true);
+    }
+  }
+  out.smooth = tracker.last_path_smooth_report();
+  out.corners = tracker.last_path_corner_metrics();
+  return out;
+}
+
 inline ChainRunResult run_offline_full_chain(
     CartesianTracker& tracker, Kinematics& kin, const Config& cfg,
     const Vec18& q0, const Vec3& goal, const Vec4& quat, bool left,
     CartesianTracker::LineChainProfile profile,
     const OfflineChainConfig& opt = {}) {
+  // NewUnified production path uses follower+supervisor unless a Hermite
+  // handoff test explicitly reuses an already-adopted active line.
+  if (profile == CartesianTracker::LineChainProfile::NewUnified &&
+      !opt.reuse_active_line) {
+    return run_offline_full_chain_v2(tracker, kin, cfg, q0, goal, quat, left,
+                                     opt);
+  }
   ChainRunResult out;
   out.profile_name = CartesianTracker::line_chain_profile_name(profile);
   if (!opt.reuse_active_line) {

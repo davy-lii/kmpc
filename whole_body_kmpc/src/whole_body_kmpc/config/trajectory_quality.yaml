@@ -1,0 +1,29 @@
+# Trajectory quality / cost weights (spec §4.2).
+# Initial dimensionless weights for reproducible debug only — not a calibrated human model.
+# Final weights must be fixed via multi-scene offline comparison (global, not height-switched).
+trajectory_quality:
+  calibration_version: "v0_uncalibrated_debug"
+  calibrated: false
+  weights:
+    move: 1.0
+    smooth: 1.0
+    body_forward: 1.0
+    neutral: 0.1
+    joint_limit: 1.0
+    pitch_comfort: 0.5
+    com_margin: 0.5
+    arm_manip: 0.25
+  normalization:
+    # Softplus length for unnecessary forward arch (Body_x - Leg_x).
+    body_forward_len_m: 0.05
+    # Pitch comfort scale; hard pitch box remains ±32°.
+    pitch_scale_rad: 0.5585053606381855  # 32 deg
+  features:
+    - move          # ∫ Σ (q_s / vmax)^2 ds
+    - smooth        # accel / jerk discrete approx (+ optional TV excess diagnostic)
+    - body_forward  # softplus(d_x / ℓ_x)^2; d_z diagnostic only (no “sink more” reward)
+    - neutral       # ∫ Σ ((q - q_neutral) / range)^2 on active joints
+    - joint_limit   # smooth barrier inside hard box
+    - pitch_comfort # ∫ (pitch / pitch_scale)^2 + near-barrier
+    - com_margin    # prefer distance to CoM XY work rectangle
+    - arm_manip     # arm singularity / extreme elbow-wrist preference

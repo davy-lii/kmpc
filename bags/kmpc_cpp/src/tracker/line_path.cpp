@@ -111,10 +111,10 @@ bool CartesianTracker::set_line_qp_max_iter(int max_iter) {
 void CartesianTracker::set_line_chain_profile(LineChainProfile profile) {
   line_chain_profile_ = profile;
   if (profile == LineChainProfile::NewUnified) {
-    // NewUnified owns pace/QP: unified s(t) + QP-B. Explicit profile switch
-    // overrides prior single-parameter settings.
+    // NewUnified: unified s(t) time law + package sample follow.
+    // Do not use line_path_qp as a pose selector (see follow: v2_sample).
     line_pace_mode_ = LinePaceMode::UnifiedTimeLaw;
-    line_qp_follow_mode_ = LineQpFollowMode::B;
+    line_qp_follow_mode_ = LineQpFollowMode::B;  // unused on v2 follow path
     line_path_interp_ = LinePathInterp::Linear;  // promoted after verify
   } else {
     // Legacy must preserve already-loaded line_pace_mode_ / line_qp_follow_mode_
@@ -751,7 +751,10 @@ bool CartesianTracker::line_build(
   bool cascade_full_body = false;
   samples.clear();
   locked = upper_.waist_locked;
-  candidate = "unified_multistage";
+  // V2_CHAIN: production pose selector is unified_multistage_v2 only.
+  // Old fold_15 / pose_pref / reverse_cache / line_path_qp posture reshape
+  // are bypassed on this candidate (see docs/v2_bypass_call_sites.md).
+  candidate = "unified_multistage_v2";
   pose_decision = "unified_only";
   if (reverse_last_line_enable_) {
     reverse_decision = "not_a_selector";
@@ -791,11 +794,15 @@ bool CartesianTracker::line_build(
   } else {
     samples = planned.segment;
     ok = true;
-    line_.reason = "unified_multistage";
+    line_.reason = "unified_multistage_v2";
     accepted_contract = planned.contract;
     accepted_dir = planned.direction;
     have_accepted_dir = true;
     line_qp_follow_mode_ = LineQpFollowMode::B;
+    if (planned.has_package) {
+      line_.package = planned.package;
+      line_.has_package = true;
+    }
     if (!accepted_dir.ok) {
       ok = false;
       line_.reason = std::string("direction_search_exhausted;") + accepted_dir.reason;
@@ -879,6 +886,8 @@ bool CartesianTracker::line_build(
   built.reverse_decision=reverse_decision;
   built.direction_contract=accepted_contract;
   built.direction_check=accepted_dir;
+  built.package=line_.package;
+  built.has_package=line_.has_package;
   built.max_arm_fold=max_arm_fold(built.samples,arm);
   built.frozen=dist<=kLineFreezeM;
   last_path_corner_metrics_=measure_path_corners(built.samples);
@@ -945,7 +954,10 @@ bool CartesianTracker::line_build(
         }
         return false;
       }
-      if (ori_on && quat &&
+      // NewUnified / v2: Hermite mid-sample ori-vs-slerp is not a hard gate.
+      // Endpoint/task ori stays certified by the package; TCP tube above remains.
+      if (line_chain_profile_ != LineChainProfile::NewUnified && ori_on &&
+          quat &&
           ori_error_xyzw(quat_slerp_xyzw(start_ori, *quat, u),
                          rot_to_quat_xyzw(pose.block<3, 3>(0, 0)))
                   .norm() > arrived_ori_rad_) {
@@ -960,9 +972,11 @@ bool CartesianTracker::line_build(
         try_verified_hermite_smooth(built.samples, check_q);
     if (last_path_smooth_report_.hermite_verified &&
         last_path_smooth_report_.applied) {
-      // Also require direction contract on Hermite-sampled dense knots.
+      // Legacy: also require direction contract on Hermite-sampled dense knots.
+      // V2_CHAIN / NewUnified: sign hard gate is retired (diagnostics only).
       bool dir_ok = true;
-      if (line_direction_strict_enable_ && accepted_dir.ok) {
+      if (line_direction_strict_enable_ && accepted_dir.ok &&
+          line_chain_profile_ != LineChainProfile::NewUnified) {
         JointPath probe;
         const int n = static_cast<int>(built.samples.size());
         probe.reserve(static_cast<std::size_t>((n - 1) * 4 + 1));
@@ -1260,15 +1274,36 @@ bool CartesianTracker::follow_line(
   }
   line_.tail_feedback_wait_ticks=0;
   Vec18 next = q_from;
-  if (line_rate_ > 1e-4 && !line_path_qp(q_from,line_.prog,step_lim,next)) {
+  // V2_CHAIN: NewUnified follow uses path samples + time law only.
+  // Do NOT call line_path_qp as a posture reshape selector (QP-A/B/C).
+  // Legacy offline/profile still uses line_path_qp.
+  const bool v2_package_follow =
+      line_chain_profile_ == LineChainProfile::NewUnified;
+  if (v2_package_follow) {
+    if (line_rate_ > 1e-4) {
+      next = line_at(line_.prog);
+      if (!next.allFinite()) {
+        line_.prog = old_prog;
+        line_commit_pending_ = false;
+        line_diag_push(LineDiagLayer::FollowQp, q_from, q_from, line_.prog, 0.0,
+                       line_.candidate.c_str(), "v2_sample_nonfinite");
+        refuse_line("v2_sample_nonfinite");
+        out.dq.setZero();
+        return false;
+      }
+    }
+    line_diag_push(LineDiagLayer::FollowQp, next, q_from, line_.prog, 0.0,
+                   line_.candidate.c_str(), "v2_sample");
+  } else if (line_rate_ > 1e-4 && !line_path_qp(q_from,line_.prog,step_lim,next)) {
     line_.prog=old_prog;
     line_commit_pending_=false;
     line_diag_push(LineDiagLayer::FollowQp,q_from,q_from,line_.prog,0.0,
                    line_.candidate.c_str(),"qp_fail");
     refuse_line(line_.reason.empty()?"path_qp_or_tube":line_.reason); out.dq.setZero(); return false;
+  } else {
+    line_diag_push(LineDiagLayer::FollowQp,next,q_from,line_.prog,0.0,
+                   line_.candidate.c_str(),"qp");
   }
-  line_diag_push(LineDiagLayer::FollowQp,next,q_from,line_.prog,0.0,
-                 line_.candidate.c_str(),"qp");
   const Vec18 dq=next-q_from;
   // P2: propose → stream accept → confirm. With requires_stream, progress stays
   // tentative until the export confirms; offline compute confirms immediately.

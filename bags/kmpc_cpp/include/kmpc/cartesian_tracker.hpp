@@ -22,6 +22,7 @@
 #include "kmpc/path_progress.hpp"
 #include "kmpc/path_smooth_verify.hpp"
 #include "kmpc/qp_solver.hpp"
+#include "kmpc/trajectory_package.hpp"
 #include "kmpc/types.hpp"
 #include "kmpc/upper_command.hpp"
 #include "kmpc/whole_body_guards.hpp"
@@ -666,6 +667,7 @@ class CartesianTracker {
   // Replan drift outside 8 cm, freeze the endpoint inside 8 cm; refuse is latched.
  public:
   struct LineRun {
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
     bool on = false;
     bool hold = false;
     bool refused = false;
@@ -709,6 +711,10 @@ class CartesianTracker {
     Vec4 quat = Vec4(0.0, 0.0, 0.0, 1.0);
     std::string frame;
     std::vector<Vec18, Eigen::aligned_allocator<Vec18>> samples;
+    // V2_CHAIN: certified package from unified_multistage_v2 (optional).
+    // When has_package, production follow must not reshape via line_path_qp.
+    TrajectoryPackage package;
+    bool has_package = false;
     double prog = 0.0;
     double length_m = 0.0;
     int tail_feedback_wait_ticks = 0;

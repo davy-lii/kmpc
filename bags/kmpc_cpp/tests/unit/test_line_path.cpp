@@ -9,8 +9,13 @@
 
 #include "kmpc/cartesian_tracker.hpp"
 #include "kmpc/config.hpp"
+#include "kmpc/constraint_policy.hpp"
+#include "kmpc/fast_trajectory_optimizer.hpp"
 #include "kmpc/kinematics.hpp"
+#include "kmpc/motion_task.hpp"
 #include "kmpc/tracker_math.hpp"
+#include "kmpc/trajectory_follower.hpp"
+#include "kmpc/whole_body_guards.hpp"
 
 namespace {
 
@@ -395,7 +400,7 @@ TEST(LinePath, LoggedPrepAtScaleStaysOnLine) {
   // Soft tube (build/QP mid cap 0.20 m): fold_15 on this fixture bows ~33 mm.
   EXPECT_LE(worst, 0.008);
   EXPECT_LT((kin.fk_pos(q, kmpc::kEeFrameRight) - goal).norm(), 0.003);
-  EXPECT_EQ(tracker.line_candidate(), "unified_multistage");
+  EXPECT_EQ(tracker.line_candidate(), "unified_multistage_v2");
   EXPECT_NE(tracker.line_pose_report().find("planner=unified_multistage"), std::string::npos);
   const auto held = tracker.compute(q, cfg_all.q_pref, nullptr, &goal, nullptr, &quat);
   EXPECT_LT(held.dq.cwiseAbs().maxCoeff(), 1e-9);
@@ -713,7 +718,7 @@ TEST(LinePath, ReverseLastLineRestoresQa) {
   ASSERT_TRUE(tracker.rearm_line(2));
   const auto step0 = tracker.compute(q, cfg_all.q_pref, &pA, nullptr, &quat, nullptr);
   ASSERT_FALSE(tracker.line_refused()) << tracker.line_reason();
-  EXPECT_EQ(tracker.line_candidate(), "unified_multistage")
+  EXPECT_EQ(tracker.line_candidate(), "unified_multistage_v2")
       << tracker.line_candidate() << " " << tracker.reverse_line_decision();
   if (tracker.line_candidate() == "reverse_cache") {
     EXPECT_EQ(tracker.reverse_line_decision(), "accepted");
@@ -788,7 +793,7 @@ TEST(LinePath, ReverseRejectsQbMismatch) {
   q[4] += 10.0 * kmpc::kPi / 180.0;  // spoil qB
   ASSERT_TRUE(tracker.rearm_line(2));
   tracker.compute(q, cfg_all.q_pref, &pA, nullptr, &quat, nullptr);
-  EXPECT_EQ(tracker.line_candidate(), "unified_multistage");
+  EXPECT_EQ(tracker.line_candidate(), "unified_multistage_v2");
   EXPECT_NE(tracker.line_candidate(), "reverse_cache");
   EXPECT_EQ(tracker.reverse_line_decision(), "not_a_selector");
 }
@@ -1002,7 +1007,7 @@ TEST(LinePath, LoggedFixedPointsNoPitchReversalOrOvershoot) {
       // and fall back to qa_seed; both are valid retreat candidates.
       play(tracker, q, 3, nullptr, grasp_prep, grasp_quat, (tag + " retreat").c_str(),
            nullptr);
-      EXPECT_EQ(tracker.line_candidate(), "unified_multistage")
+      EXPECT_EQ(tracker.line_candidate(), "unified_multistage_v2")
           << tag << " retreat cand=" << tracker.line_candidate()
           << " rev=" << tracker.reverse_line_decision();
     }
@@ -1020,7 +1025,7 @@ TEST(LinePath, LoggedFixedPointsNoPitchReversalOrOvershoot) {
          nullptr);
     play(place_tracker, q, 3, nullptr, place_prep, place_quat, (ptag + " retreat").c_str(),
          nullptr);
-    EXPECT_EQ(place_tracker.line_candidate(), "unified_multistage")
+    EXPECT_EQ(place_tracker.line_candidate(), "unified_multistage_v2")
         << ptag << " retreat cand=" << place_tracker.line_candidate()
         << " rev=" << place_tracker.reverse_line_decision();
   }
@@ -1361,13 +1366,16 @@ TEST(LinePath, StartPitchAdmitWindow) {
   }
 }
 
-// Field A/B structural issue: start a ~0.24 m line with pitch slightly outside
-// ±22° and mono ON. First QP tick must not refuse (soft admit + skip/clamp mono).
+// v2: pitch slightly outside ±32° must enter TrajectoryFollower::RECOVERING
+// without refusing the first tick; then recover + replan + follow to goal.
+// Caps / excesses unchanged (2.54e-4, 6.13e-4). No old line_qp path.
 TEST(LinePath, PitchRecoveryOutsideFirstQpDoesNotRefuse) {
   const auto cfg_all = kmpc::Config::load(
       cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
-  const double limit = cfg_all.params.torso_pitch_max_deg * kmpc::kPi / 180.0;
+  kmpc::WholeBodyGuards guards(cfg_all.params, cfg_all.q_pref[kmpc::kIdxYaw]);
+  const auto policy = kmpc::policy_from_config(cfg_all);
+  const double limit = policy.torso_pitch_max_rad;
   ASSERT_GT(limit, 0.0);
   const double home_raw[18] = {
       0.69813170, -0.87264718, -0.17453293, -0.02630211,
@@ -1377,38 +1385,76 @@ TEST(LinePath, PitchRecoveryOutsideFirstQpDoesNotRefuse) {
       1.27522486, -0.24291493, 0.01394518};
 
   for (const double excess : {2.54e-4, 6.13e-4}) {
-    kmpc::CartesianTracker tracker(kin, cfg_all);
-    tracker.set_line_pitch_straighten_enable(false);
-    tracker.set_line_qp_pitch_monotonic_enable(true);
-    tracker.set_line_pace(0.3, 0.8);
     kmpc::Vec18 q;
     for (int i = 0; i < 18; ++i) q[i] = home_raw[i];
-    const double p0_sum = q[0] + q[1] + q[2];
     const double want = -limit - excess;
-    const double d = want - p0_sum;
+    const double d = want - (q[0] + q[1] + q[2]);
     q[0] += d / 3.0;
     q[1] += d / 3.0;
     q[2] += d / 3.0;
     ASSERT_NEAR(q[0] + q[1] + q[2], want, 1e-9);
+
+    kmpc::TrajectoryFollower follower(kin, &guards, policy);
+    ASSERT_TRUE(follower.begin_pitch_recovery(q)) << "excess=" << excess;
+    EXPECT_EQ(follower.state(), kmpc::FollowerState::Recovering);
+    const auto first = follower.step(q, 0.0, 0.02);
+    ASSERT_NE(first.action, kmpc::FollowerAction::ProtectStop)
+        << "first tick must not refuse; excess=" << excess << " "
+        << first.reason;
+    EXPECT_EQ(first.state, kmpc::FollowerState::Recovering);
+    q = first.q_follow;
+
+    // Multi-tick recovery into the hard box (never widen caps).
+    for (int i = 0; i < 200; ++i) {
+      if (std::abs(q[0] + q[1] + q[2]) <= limit + 1e-6) break;
+      const auto tick = follower.step(q, 0.0, 0.02);
+      ASSERT_NE(tick.action, kmpc::FollowerAction::ProtectStop)
+          << "excess=" << excess << " i=" << i << " " << tick.reason;
+      EXPECT_LE(tick.q_follow[0], policy.q_max[0] + 1e-9);
+      q = tick.q_follow;
+    }
+    ASSERT_LE(std::abs(q[0] + q[1] + q[2]), limit + 1e-5)
+        << "recovery must enter hard box; excess=" << excess;
+
+    // Replan ordinary certified package from the recovered start, then follow.
     const kmpc::Vec3 p0 = kin.fk_pos(q, kmpc::kEeFrameRight);
-    const auto posed = kin.fk(q, kmpc::kEeFrameRight);
-    const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
-    // Field reverse length was ~0.24 m.
     const kmpc::Vec3 goal = p0 + kmpc::Vec3(0.24, 0.0, 0.0);
-    ASSERT_TRUE(tracker.rearm_line(1)) << "excess=" << excess;
+    kmpc::MotionTask task;
+    task.generation = 1;
+    task.q = q;
+    task.left = false;
+    task.frame = std::string(kmpc::kEeFrameRight);
+    kmpc::TaskStage st;
+    st.geometry = kmpc::TaskGeometry::Lin;
+    st.position = goal;
+    st.position_tol_m = 0.003;
+    st.stage_id = 1;
+    task.stages.push_back(st);
+    kmpc::RobotState state;
+    state.q = q;
+    kmpc::TrajectoryCostWeights w;
+    w.calibrated = true;
+    for (int j = 0; j < kmpc::kNDof; ++j) {
+      w.motion_scale[j] = 1.0 / std::max(cfg_all.limits.dq_max[j], 1e-3);
+    }
+    kmpc::FastTrajectoryOptimizer opt(kin, &guards);
+    const auto planned = opt.plan(task, state, policy, w, 0.0);
+    ASSERT_TRUE(planned.ok) << planned.reason << " " << planned.report;
+    std::string why;
+    ASSERT_TRUE(follower.adopt(planned.package, q, kmpc::Vec18::Zero(), false,
+                               1e-3, 0.5, &why))
+        << why;
+
     bool arrived = false;
-    for (int i = 0; i < 4000; ++i) {
-      const auto step =
-          tracker.compute(q, cfg_all.q_pref, nullptr, &goal, nullptr, &quat);
-      ASSERT_FALSE(tracker.line_refused())
-          << "refuse excess=" << excess << " i=" << i << " "
-          << tracker.line_reason() << " candidate=" << tracker.line_candidate();
-      if (i == 0) {
-        EXPECT_TRUE(tracker.line_active());
-        EXPECT_GT(std::abs(q[0] + q[1] + q[2]), limit + 1e-9);
-      }
-      q += step.dq;
-      if (tracker.last_arrived()) {
+    const double dur = std::max(planned.package.time_law.duration_s, 1.0);
+    for (int i = 0; i < static_cast<int>(dur / 0.02) + 100; ++i) {
+      const double t =
+          std::min(static_cast<double>(i) * 0.02, dur);
+      const auto tick = follower.step(q, t, 0.02);
+      ASSERT_NE(tick.action, kmpc::FollowerAction::ProtectStop)
+          << "excess=" << excess << " i=" << i << " " << tick.reason;
+      q = tick.q_follow;
+      if (tick.action == kmpc::FollowerAction::Arrived) {
         arrived = true;
         break;
       }
@@ -1419,13 +1465,15 @@ TEST(LinePath, PitchRecoveryOutsideFirstQpDoesNotRefuse) {
   }
 }
 
-// r32 regression: NewUnified Mode B + tiny start excess must actively recover
-// into the hard box (no nom_ex freeze, no direction post-proj pin at from).
+// v2: TrajectoryFollower RECOVERING must pull 2.95e-4 rad excess into the
+// hard box within ~1.6 s. Caps unchanged; no old Mode-B line_qp.
 TEST(LinePath, NewUnifiedModeBPitchRecoveryPullsIntoHardBox) {
   const auto cfg_all = kmpc::Config::load(
       cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
-  const double limit = cfg_all.params.torso_pitch_max_deg * kmpc::kPi / 180.0;
+  kmpc::WholeBodyGuards guards(cfg_all.params, cfg_all.q_pref[kmpc::kIdxYaw]);
+  const auto policy = kmpc::policy_from_config(cfg_all);
+  const double limit = policy.torso_pitch_max_rad;
   ASSERT_GT(limit, 0.0);
   const double home_raw[18] = {
       0.69813170, -0.87264718, -0.17453293, -0.02630211,
@@ -1433,14 +1481,6 @@ TEST(LinePath, NewUnifiedModeBPitchRecoveryPullsIntoHardBox) {
       -1.27522486, -0.24291493, 0.01394518,
       -0.00171042, 0.51532590, 0.13651965, -2.12657900,
       1.27522486, -0.24291493, 0.01394518};
-  kmpc::CartesianTracker tracker(kin, cfg_all);
-  tracker.set_line_chain_profile(
-      kmpc::CartesianTracker::LineChainProfile::NewUnified);
-  tracker.set_line_qp_follow_mode(kmpc::LineQpFollowMode::B);
-  tracker.set_line_pitch_straighten_enable(false);
-  tracker.set_line_qp_pitch_monotonic_enable(true);
-  tracker.set_line_direction_strict_enable(true);
-  tracker.set_line_pace(0.3, 0.0);
   kmpc::Vec18 q;
   for (int i = 0; i < 18; ++i) q[i] = home_raw[i];
   const double excess = 2.95e-4;  // r32 run1 start_excess scale
@@ -1450,26 +1490,23 @@ TEST(LinePath, NewUnifiedModeBPitchRecoveryPullsIntoHardBox) {
   q[1] += d / 3.0;
   q[2] += d / 3.0;
   ASSERT_NEAR(q[0] + q[1] + q[2], want, 1e-9);
-  const kmpc::Vec3 p0 = kin.fk_pos(q, kmpc::kEeFrameRight);
-  const auto posed = kin.fk(q, kmpc::kEeFrameRight);
-  const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
-  // Short hold-like move (same order as the false 0.15 m chord was wrong).
-  const kmpc::Vec3 goal = p0 + kmpc::Vec3(0.02, 0.0, 0.0);
-  ASSERT_TRUE(tracker.rearm_line(1));
+
+  kmpc::TrajectoryFollower follower(kin, &guards, policy);
+  ASSERT_TRUE(follower.begin_pitch_recovery(q));
+  EXPECT_EQ(follower.state(), kmpc::FollowerState::Recovering);
   bool inside = false;
   for (int i = 0; i < 80; ++i) {
-    const auto step =
-        tracker.compute(q, cfg_all.q_pref, nullptr, &goal, nullptr, &quat);
-    ASSERT_FALSE(tracker.line_refused())
-        << "i=" << i << " reason=" << tracker.line_reason()
-        << " candidate=" << tracker.line_candidate();
-    q += step.dq;
+    const auto tick = follower.step(q, 0.0, 0.02);
+    ASSERT_NE(tick.action, kmpc::FollowerAction::ProtectStop)
+        << "i=" << i << " reason=" << tick.reason;
+    EXPECT_LE(tick.q_follow[0], policy.q_max[0] + 1e-9);
+    q = tick.q_follow;
     if (std::abs(q[0] + q[1] + q[2]) <= limit + 1e-6) {
       inside = true;
       break;
     }
   }
-  EXPECT_TRUE(inside) << "Mode B recovery must enter hard box within ~1.6s; "
+  EXPECT_TRUE(inside) << "RECOVERING must enter hard box within ~1.6s; "
                       << "pitch=" << ((q[0] + q[1] + q[2]) * 180.0 / kmpc::kPi)
                       << "deg";
 }

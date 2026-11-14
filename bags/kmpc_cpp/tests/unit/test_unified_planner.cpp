@@ -32,7 +32,8 @@ kmpc::UnifiedPlanRequest request_from(const kmpc::Config& config, const kmpc::Ve
 void expect_certified(const kmpc::Kinematics& kin, const kmpc::WholeBodyGuards& guards,
                       const kmpc::UnifiedPlanResult& plan, const kmpc::UnifiedPlanRequest& req) {
   ASSERT_TRUE(plan.ok) << plan.reason << " " << plan.report;
-  EXPECT_NE(plan.report.find("planner=unified_multistage"), std::string::npos) << plan.report;
+  EXPECT_NE(plan.report.find("planner=unified_multistage_v2"), std::string::npos)
+      << plan.report;
   EXPECT_NE(plan.report.find("height_switch=0"), std::string::npos) << plan.report;
   EXPECT_GE(plan.segment.size(), 2u);
   EXPECT_LE(plan.tcp_worst_m, req.pos_tol_m + 1e-9);
@@ -142,7 +143,7 @@ TEST(UnifiedPlanner, TrackerNamesUnifiedAndTimesTheBuild) {
                              std::chrono::steady_clock::now() - t0)
                              .count();
   ASSERT_FALSE(tracker.line_refused()) << tracker.line_reason();
-  EXPECT_EQ(tracker.line_candidate(), "unified_multistage");
+  EXPECT_EQ(tracker.line_candidate(), "unified_multistage_v2");
   EXPECT_NE(tracker.line_pose_report().find("planner=unified_multistage"), std::string::npos)
       << tracker.line_pose_report();
   EXPECT_EQ(tracker.line_pose_pref_decision(), "unified_only");

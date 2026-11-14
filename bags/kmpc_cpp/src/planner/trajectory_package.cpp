@@ -7,7 +7,8 @@ namespace {
 
 constexpr uint64_t kFnvOffset = 14695981039346656037ull;
 constexpr uint64_t kFnvPrime = 1099511628211ull;
-constexpr uint64_t kDigestVersion = 1;
+// v2: digest also covers path_id, stage boundaries, and the time law.
+constexpr uint64_t kDigestVersion = 2;
 
 uint64_t mix(uint64_t hash, uint64_t value) {
   hash ^= value;
@@ -29,12 +30,25 @@ uint64_t mix_vec(uint64_t hash, const Vec18& q) {
   return hash;
 }
 
+uint64_t mix_str(uint64_t hash, const std::string& s) {
+  hash = mix(hash, static_cast<uint64_t>(s.size()));
+  for (char c : s) {
+    hash = mix(hash, static_cast<uint64_t>(static_cast<unsigned char>(c)));
+  }
+  return hash;
+}
+
 }  // namespace
 
 uint64_t package_digest(const TrajectoryPackage& package) {
   uint64_t hash = kFnvOffset;
   hash = mix(hash, kDigestVersion);
   hash = mix(hash, package.generation);
+  hash = mix(hash, package.task_digest);
+  hash = mix(hash, package.model_digest);
+  hash = mix(hash, package.limits_digest);
+  hash = mix(hash, package.path_id);
+  hash = mix(hash, package.left ? 1u : 0u);
   hash = mix(hash, package.start_dq_known ? 1u : 0u);
   hash = mix_vec(hash, package.start_q);
   hash = mix_vec(hash, package.start_dq);
@@ -42,6 +56,44 @@ uint64_t package_digest(const TrajectoryPackage& package) {
   for (const Vec18& q : package.samples) {
     hash = mix_vec(hash, q);
   }
+  hash = mix(hash, static_cast<uint64_t>(package.stage_boundaries.size()));
+  for (const StageBoundary& b : package.stage_boundaries) {
+    hash = mix(hash, static_cast<uint64_t>(b.sample_index));
+    hash = mix(hash, b.stage_id);
+    hash = mix(hash, b.stop_required ? 1u : 0u);
+    hash = mix(hash, b.wait_for_external_ack ? 1u : 0u);
+  }
+  const TimeLawTable& law = package.time_law;
+  hash = mix(hash, static_cast<uint64_t>(law.s.size()));
+  for (double v : law.s) {
+    hash = mix_double(hash, v);
+  }
+  hash = mix(hash, static_cast<uint64_t>(law.t_s.size()));
+  for (double v : law.t_s) {
+    hash = mix_double(hash, v);
+  }
+  hash = mix_double(hash, law.duration_s);
+  hash = mix(hash, law.software_limited ? 1u : 0u);
+  hash = mix_str(hash, law.accel_source);
+  hash = mix_str(hash, law.jerk_source);
+  hash = mix_str(hash, package.planner);
+  return hash;
+}
+
+uint64_t limits_digest_of(const MotionConstraintPolicy& policy) {
+  uint64_t hash = kFnvOffset;
+  hash = mix(hash, kDigestVersion);
+  hash = mix_vec(hash, policy.q_min);
+  hash = mix_vec(hash, policy.q_max);
+  hash = mix_vec(hash, policy.dq_max);
+  hash = mix_vec(hash, policy.ddq_max);
+  hash = mix_vec(hash, policy.dddq_max);
+  hash = mix_double(hash, policy.torso_pitch_max_rad);
+  hash = mix_double(hash, policy.q_limit_margin_rad);
+  hash = mix_double(hash, policy.yaw_abs_max_rad);
+  hash = mix(hash, policy.yaw_limited ? 1u : 0u);
+  hash = mix(hash, policy.a_max_calibrated ? 1u : 0u);
+  hash = mix(hash, policy.j_max_calibrated ? 1u : 0u);
   return hash;
 }
 
