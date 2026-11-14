@@ -252,7 +252,75 @@ TrajectoryCertificate validate_actual_q_of_t(
     law_ok = false;
     note(&fault, "time_law_duration");
   }
-  out.passed = out.passed && law_ok;
+
+  // Sample the *actual* executable Hermite q(t) (not knot polyline alone).
+  bool exec_ok = true;
+  if (law_ok && package.samples.size() >= 2 && law.duration_s > 0.0) {
+    const int n_check = std::max(
+        8, static_cast<int>(std::ceil(law.duration_s / 0.01)) + 1);
+    TrajectoryTimeSample prev;
+    bool have_prev = false;
+    for (int k = 0; k <= n_check; ++k) {
+      const double t =
+          law.duration_s * static_cast<double>(k) / static_cast<double>(n_check);
+      TrajectoryTimeSample samp;
+      if (!sample_trajectory_at(package, t, &samp) || !samp.ok) {
+        exec_ok = false;
+        note(&fault, "exec_sample_fail");
+        break;
+      }
+      if (joint_violates_hard_box(samp.q, policy.q_min, policy.q_max)) {
+        exec_ok = false;
+        note(&fault, "exec_hard_box");
+        break;
+      }
+      if (policy.torso_pitch_max_rad > 0.0) {
+        const double pitch = samp.q[0] + samp.q[1] + samp.q[2];
+        if (std::abs(pitch) > policy.torso_pitch_max_rad + kPitchRoundEpsRad) {
+          exec_ok = false;
+          note(&fault, "exec_pitch");
+          break;
+        }
+      }
+      if (guards != nullptr && !guards->com_xy_inside(kin.com(samp.q))) {
+        exec_ok = false;
+        note(&fault, "exec_com");
+        break;
+      }
+      // Adjacent Hermite samples must respect a send step budget. Time law
+      // was sized on chords; Hermite mid-segment can be slightly faster, so
+      // software_limited packages use a 2× design margin (not a hard-box
+      // relaxation). Calibrated velocity stays at 1×.
+      if (have_prev) {
+        const double dt = std::max(samp.t_s - prev.t_s, 1e-4);
+        const double step_scale = law.software_limited ? 2.0 : 1.0;
+        for (int j = 0; j < kNDof; ++j) {
+          if (std::abs(samp.q[j] - prev.q[j]) >
+              step_scale * policy.dq_max[j] * dt + 1e-4) {
+            exec_ok = false;
+            note(&fault, "exec_step");
+            break;
+          }
+        }
+      }
+      if (!exec_ok) {
+        break;
+      }
+      prev = samp;
+      have_prev = true;
+    }
+    out.coverage = PathCoverage::AdaptiveSampledWithOnlineGuard;
+    out.coverage_note = law.software_limited
+                            ? "hermite_q_of_t_software_limited_jerk"
+                            : "hermite_q_of_t";
+    out.continuous_certified = exec_ok;
+    if (!policy.j_max_calibrated) {
+      // Explicit: jerk bound is a software design value.
+      out.coverage_note += ";jerk_source=" + law.jerk_source;
+    }
+  }
+
+  out.passed = out.passed && law_ok && exec_ok;
   out.first_fault = fault == nullptr ? "ok" : fault;
   return out;
 }

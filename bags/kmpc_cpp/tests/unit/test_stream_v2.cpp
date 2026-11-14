@@ -19,7 +19,11 @@ kmpc::SafetySupervisorInput base_in(const kmpc::Vec18& q) {
   kmpc::SafetySupervisorInput in;
   in.q_prev = q;
   in.q_meas = q;
+  in.has_meas = true;
+  in.meas_timestamp_s = 1.0;
+  in.now_s = 1.0;
   in.q_follow = q;
+  in.has_follow = true;
   in.q_plan = q;
   in.q_cmd = q;
   in.dt = 0.004;  // 250 Hz
@@ -49,11 +53,16 @@ TEST(StreamV2, AllowsSmoothReversalAt250Hz) {
   const double step =
       std::min(0.5 * policy.dq_max[j] * dt, 2.0 * policy.ddq_max[j] * dt * dt);
   ASSERT_GT(step, 0.0);
+  double t = 1.0;
   auto tick = [&](double dq, const char* tag, int k) {
     auto in = base_in(q);
     in.q_cmd = q;
     in.q_cmd[j] = q[j] + dq;
+    in.q_follow = in.q_cmd;
     in.dt = dt;
+    t += dt;
+    in.now_s = t;
+    in.meas_timestamp_s = t;
     const auto d = gate.check(in);
     ASSERT_TRUE(d.accept) << tag << " k=" << k << " " << d.reason;
     q = d.q_send;

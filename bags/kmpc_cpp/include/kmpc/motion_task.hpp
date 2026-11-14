@@ -69,18 +69,31 @@ inline uint64_t motion_task_digest(const MotionTask& task) {
     std::memcpy(&bits, &v, sizeof(bits));
     mix(bits);
   };
+  auto mix_str = [&](const std::string& s) {
+    mix(static_cast<uint64_t>(s.size()));
+    for (unsigned char c : s) {
+      mix(static_cast<uint64_t>(c));
+    }
+  };
   mix(task.generation);
   mix(task.left ? 1u : 0u);
   mix(task.waist_locked ? 1u : 0u);
+  mix_str(task.frame);
+  mix_str(task.model_digest);
   mix(static_cast<uint64_t>(task.stages.size()));
   for (const auto& st : task.stages) {
     mix(static_cast<uint64_t>(st.geometry));
     mix(st.stage_id);
     mix(st.has_orientation ? 1u : 0u);
+    mix(static_cast<uint64_t>(st.stop));
     mix(st.wait_for_external_ack ? 1u : 0u);
     mixd(st.position.x());
     mixd(st.position.y());
     mixd(st.position.z());
+    mixd(st.quat.x());
+    mixd(st.quat.y());
+    mixd(st.quat.z());
+    mixd(st.quat.w());
     mixd(st.position_tol_m);
     mixd(st.orientation_tol_rad);
   }

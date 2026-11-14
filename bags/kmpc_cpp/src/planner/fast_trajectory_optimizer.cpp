@@ -146,8 +146,11 @@ class V2Solver {
     for (int j = 0; j < kNArm; ++j) {
       active_.push_back(arm_ + j);
     }
-    // v2 anchors the neutral term at the certified start posture.
-    q_neutral_ = q0_;
+    // Neutral posture model (mid hard-box) — NOT the measured start.
+    // Start keeping is enforced by freezing samples.front()=q0_ and move cost.
+    for (int j = 0; j < kNDof; ++j) {
+      q_neutral_[j] = 0.5 * (policy.q_min[j] + policy.q_max[j]);
+    }
     pitch_cap_ = policy.torso_pitch_max_rad > 0.0
                      ? policy.torso_pitch_max_rad
                      : 1e9;

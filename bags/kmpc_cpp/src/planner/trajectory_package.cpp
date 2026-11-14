@@ -1,6 +1,10 @@
 #include "kmpc/trajectory_package.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstring>
+
+#include "kmpc/tracker_math.hpp"
 
 namespace kmpc {
 namespace {
@@ -127,6 +131,80 @@ AdmitDecision admit_package_start(
   decision.ok = true;
   decision.reason = "ok";
   return decision;
+}
+
+bool sample_trajectory_at(const TrajectoryPackage& package, double t_s,
+                          TrajectoryTimeSample* out) {
+  if (out == nullptr) {
+    return false;
+  }
+  *out = TrajectoryTimeSample{};
+  const JointCurve& samples = package.samples;
+  const TimeLawTable& law = package.time_law;
+  if (samples.empty()) {
+    out->reason = "empty_samples";
+    return false;
+  }
+  if (samples.size() == 1) {
+    out->q = samples.front();
+    out->dq.setZero();
+    out->ddq.setZero();
+    out->s = 0.0;
+    out->t_s = 0.0;
+    out->ok = true;
+    out->reason = "ok";
+    return true;
+  }
+  if (law.t_s.size() < 2 || law.s.size() != law.t_s.size()) {
+    out->reason = "bad_time_law";
+    return false;
+  }
+  const double t_end = std::max(law.duration_s, law.t_s.back());
+  const double t = std::clamp(t_s, 0.0, t_end);
+  out->t_s = t;
+
+  auto s_at_t = [&](double tt) -> double {
+    std::size_t i = 0;
+    while (i + 1 < law.t_s.size() && law.t_s[i + 1] < tt - 1e-15) {
+      ++i;
+    }
+    const std::size_t i1 = std::min(i + 1, law.t_s.size() - 1);
+    const double t0 = law.t_s[i];
+    const double t1 = law.t_s[i1];
+    const double s0 = law.s[i];
+    const double s1 = law.s[i1];
+    if (t1 - t0 <= 1e-12) {
+      return s1;
+    }
+    const double a = (tt - t0) / (t1 - t0);
+    return s0 + a * (s1 - s0);
+  };
+
+  const double s = s_at_t(t);
+  out->s = s;
+  const double prog = s * static_cast<double>(samples.size() - 1);
+  out->q = hermite_joint_at(samples, prog);
+
+  // Time derivatives via central differences on the executed Hermite curve.
+  const double h = 1e-3;
+  const double s_m = s_at_t(std::max(0.0, t - h));
+  const double s_p = s_at_t(std::min(t_end, t + h));
+  const Vec18 q_m =
+      hermite_joint_at(samples, s_m * static_cast<double>(samples.size() - 1));
+  const Vec18 q_p =
+      hermite_joint_at(samples, s_p * static_cast<double>(samples.size() - 1));
+  const double denom = std::max(2.0 * h, 1e-9);
+  out->dq = (q_p - q_m) / denom;
+  // Second derivative: (q_p - 2 q + q_m) / h^2
+  out->ddq = (q_p - 2.0 * out->q + q_m) / (h * h);
+  if (!out->q.allFinite() || !out->dq.allFinite() || !out->ddq.allFinite()) {
+    out->reason = "nonfinite_sample";
+    out->ok = false;
+    return false;
+  }
+  out->ok = true;
+  out->reason = "ok";
+  return true;
 }
 
 }  // namespace kmpc

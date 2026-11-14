@@ -12,6 +12,13 @@ namespace {
 
 double pitch_of(const Vec18& q) { return q[0] + q[1] + q[2]; }
 
+double pitch_excess(const Vec18& q, double hard) {
+  if (!(hard > 0.0) || !q.allFinite()) {
+    return 0.0;
+  }
+  return std::max(0.0, std::abs(pitch_of(q)) - hard);
+}
+
 std::string_view ee_frame(bool left) {
   return left ? kEeFrameLeft : kEeFrameRight;
 }
@@ -25,53 +32,72 @@ SafetySupervisor::SafetySupervisor(const Kinematics& kin,
 
 void SafetySupervisor::seed(const Vec18& q_safe) {
   last_safe_ = q_safe;
+  q_last_send_ = q_safe;
   has_safe_ = q_safe.allFinite();
+  has_last_send_ = has_safe_;
   last_vel_.setZero();
+  last_acc_.setZero();
   has_vel_ = false;
+  has_acc_ = false;
+  t_last_send_s_ = -1.0;
 }
 
 SafetyDecision SafetySupervisor::check(const SafetySupervisorInput& in) {
   SafetyDecision out;
-  out.q_send = has_safe_ ? last_safe_ : in.q_prev;
+  out.q_send = has_safe_ ? last_safe_ : (has_last_send_ ? q_last_send_ : in.q_cmd);
   out.accept = false;
   out.arrived = false;
 
   auto reject = [&](const char* reason) -> SafetyDecision {
     out.reason = reason;
     out.accept = false;
-    out.arrived = false;  // never fake arrived on reject
+    out.arrived = false;
     return out;
   };
 
-  if (!in.q_cmd.allFinite() || !in.q_prev.allFinite() || !in.q_meas.allFinite()) {
+  if (!in.q_cmd.allFinite()) {
     return reject("safety_nonfinite");
   }
+  if (!in.has_meas || !in.q_meas.allFinite() || !(in.meas_timestamp_s > 0.0)) {
+    return reject("safety_no_real_meas");
+  }
+
+  // Hard joint box never widened (including Recovering).
   if (joint_violates_hard_box(in.q_cmd, policy_.q_min, policy_.q_max)) {
     return reject("safety_hard_box");
   }
+
   const double hard = policy_.torso_pitch_max_rad;
-  if (hard > 0.0 &&
-      std::abs(pitch_of(in.q_cmd)) > hard + kPitchRoundEpsRad) {
+  const double ex_cmd = pitch_excess(in.q_cmd, hard);
+  if (in.mode == SafetyExecMode::Recovering) {
+    const double ceiling =
+        std::max(in.pitch_excess_ceiling, pitch_excess(in.q_meas, hard)) +
+        kPitchRoundEpsRad;
+    if (ex_cmd > ceiling + 1e-12) {
+      return reject("safety_recovery_excess_growth");
+    }
+  } else if (hard > 0.0 && ex_cmd > kPitchRoundEpsRad) {
     return reject("safety_pitch");
   }
 
-  const double dt = std::max(in.dt, 1e-4);
+  // Adjacent-send kinematics: ignore caller q_prev.
+  const Vec18 q_prev_send = has_last_send_ ? q_last_send_ : in.q_cmd;
+  double dt = std::max(in.dt, 1e-4);
+  if (has_last_send_ && in.now_s > 0.0 && t_last_send_s_ > 0.0) {
+    dt = std::max(in.now_s - t_last_send_s_, 1e-4);
+  }
+
   Vec18 v_cmd_all = Vec18::Zero();
+  Vec18 a_cmd_all = Vec18::Zero();
   for (int j = 0; j < kNDof; ++j) {
     const double dq_max = std::max(policy_.dq_max[j], 1e-6);
-    const double step = std::abs(in.q_cmd[j] - in.q_prev[j]);
+    const double step = std::abs(in.q_cmd[j] - q_prev_send[j]);
     if (step > dq_max * dt + 1e-9) {
       return reject("safety_step");
     }
-    // Velocity of this command step; compare to last *accepted* velocity.
-    // Do not recompute from (q_prev - last_safe_): after accept those are equal
-    // so the proxy was always ~0 and falsely tripped safety_accel at 250 Hz.
     const double v_prev = has_vel_ ? last_vel_[j] : 0.0;
-    const double v_cmd = (in.q_cmd[j] - in.q_prev[j]) / dt;
+    const double v_cmd = (in.q_cmd[j] - q_prev_send[j]) / dt;
     v_cmd_all[j] = v_cmd;
-    // Accel budget: calibrated device a_max when available; otherwise a software
-    // stand-in that can reach dq_max within one 50 Hz control step (not a hard
-    // joint-box relaxation).
     const double ddq_pol = std::max(policy_.ddq_max[j], 1e-6);
     const double ddq_soft =
         policy_.a_max_calibrated ? ddq_pol : std::max(ddq_pol, dq_max / 0.02);
@@ -79,13 +105,24 @@ SafetyDecision SafetySupervisor::check(const SafetySupervisorInput& in) {
     if (dv > 4.0 * ddq_soft * dt + 1e-6) {
       return reject("safety_accel");
     }
+    a_cmd_all[j] = (v_cmd - v_prev) / dt;
+    // Jerk gate only after we have a prior accepted accel, and only with a
+    // generous software band (uncalibrated device jerk is not hardware fact).
+    if (has_acc_ && in.mode != SafetyExecMode::Recovering) {
+      const double j_pol = std::max(policy_.dddq_max[j], 1e-6);
+      const double j_soft =
+          policy_.j_max_calibrated ? j_pol : std::max(j_pol, ddq_soft / 0.02);
+      if (std::abs(a_cmd_all[j] - last_acc_[j]) > 16.0 * j_soft * dt + 1e-3) {
+        return reject("safety_jerk");
+      }
+    }
   }
 
   if (guards_ != nullptr && !guards_->com_xy_inside(kin_.com(in.q_cmd))) {
     return reject("safety_com");
   }
 
-  if (in.now_s > 0.0 && in.meas_timestamp_s > 0.0 &&
+  if (in.now_s > 0.0 &&
       (in.now_s - in.meas_timestamp_s) > freshness_s_) {
     return reject("safety_stale_meas");
   }
@@ -102,6 +139,11 @@ SafetyDecision SafetySupervisor::check(const SafetySupervisorInput& in) {
         in.package->path_id != in.expected_path_id) {
       return reject("safety_path_id");
     }
+    if (in.expected_task_digest != 0 &&
+        in.package->task_digest != 0 &&
+        in.package->task_digest != in.expected_task_digest) {
+      return reject("safety_task_digest");
+    }
     if (!in.package->certificate.passed) {
       return reject("safety_uncertified");
     }
@@ -117,42 +159,43 @@ SafetyDecision SafetySupervisor::check(const SafetySupervisorInput& in) {
     }
   }
 
-  if ((in.q_cmd - in.q_follow).cwiseAbs().maxCoeff() > follow_err_rad_ + 1e-9) {
-    // 250 Hz must not invent a geometrically different command than 50 Hz.
-    return reject("safety_follow_mismatch");
+  // Optional follow hint: only when caller marks has_follow.
+  if (in.has_follow && in.q_follow.allFinite() &&
+      (in.q_cmd - in.q_follow).cwiseAbs().maxCoeff() > follow_err_rad_ + 1e-9) {
+    if (in.mode != SafetyExecMode::Recovering) {
+      return reject("safety_follow_mismatch");
+    }
   }
 
-  // Never silent-clamp: accept only the exact q_cmd that passed.
   out.accept = true;
   out.reason = "ok";
   out.q_send = in.q_cmd;
 
   if (in.claim_arrived) {
     if (in.package == nullptr || in.package->samples.empty()) {
-      out.arrived = false;
-      out.accept = false;
-      out.reason = "safety_fake_arrived";
-      out.q_send = has_safe_ ? last_safe_ : in.q_prev;
-      return out;
+      return reject("safety_fake_arrived");
     }
     const Vec18& q_end = in.package->samples.back();
     const bool near =
         (in.q_meas - q_end).cwiseAbs().maxCoeff() < 0.02 &&
         (in.q_cmd - q_end).cwiseAbs().maxCoeff() < 0.02;
     if (!near) {
-      out.arrived = false;
-      out.accept = false;
-      out.reason = "safety_fake_arrived";
-      out.q_send = has_safe_ ? last_safe_ : in.q_prev;
-      return out;
+      return reject("safety_fake_arrived");
     }
     out.arrived = true;
   }
 
   last_safe_ = in.q_cmd;
   has_safe_ = true;
+  if (has_vel_) {
+    last_acc_ = a_cmd_all;
+    has_acc_ = true;
+  }
   last_vel_ = v_cmd_all;
   has_vel_ = true;
+  q_last_send_ = in.q_cmd;
+  has_last_send_ = true;
+  t_last_send_s_ = in.now_s > 0.0 ? in.now_s : t_last_send_s_;
   return out;
 }
 

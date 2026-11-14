@@ -112,7 +112,11 @@ TEST(TrajectoryFollower, SafetySupervisorRejectsHardBoxWithoutClamp) {
   kmpc::SafetySupervisorInput in;
   in.q_prev = config.q_pref;
   in.q_meas = config.q_pref;
+  in.has_meas = true;
+  in.meas_timestamp_s = 1.0;
+  in.now_s = 1.0;
   in.q_follow = config.q_pref;
+  in.has_follow = true;
   in.q_plan = config.q_pref;
   in.q_cmd = config.q_pref;
   in.q_cmd[0] = policy.q_max[0] + 0.05;  // past J1 58°
@@ -148,7 +152,11 @@ TEST(TrajectoryFollower, SafetyNeverFakesArrived) {
   in.q_prev = config.q_pref;
   in.q_cmd = config.q_pref;
   in.q_meas = config.q_pref;
+  in.has_meas = true;
+  in.meas_timestamp_s = 1.0;
+  in.now_s = 1.0;
   in.q_follow = config.q_pref;
+  in.has_follow = true;
   in.q_plan = config.q_pref;
   in.dt = 0.004;
   in.claim_arrived = true;

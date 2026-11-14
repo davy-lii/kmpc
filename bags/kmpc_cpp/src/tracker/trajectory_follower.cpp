@@ -14,7 +14,7 @@ namespace {
 
 constexpr double kExcessEps = 1e-9;
 constexpr double kNumericEps = 1e-12;
-constexpr int kRecoveryTimeoutTicks = 500;  // 10 s at 50 Hz
+constexpr int kRecoveryTimeoutTicks = 500;
 constexpr int kBrakeTicks = 5;
 
 double pitch_of(const Vec18& q) { return q[0] + q[1] + q[2]; }
@@ -40,6 +40,10 @@ void TrajectoryFollower::reset() {
   recovery_excess0_ = 0.0;
   recovery_ticks_ = 0;
   brake_ticks_ = 0;
+  wait_stage_id_ = 0;
+  wait_ack_t0_ = -1.0;
+  stage_cursor_ = 0;
+  brake_requested_ = false;
   last_ = FollowerTick{};
 }
 
@@ -49,6 +53,17 @@ void TrajectoryFollower::hold_at(const Vec18& q) {
   q_prev_cmd_ = q;
   has_cmd_ = q.allFinite();
   last_ = make_hold(q, "hold");
+}
+
+void TrajectoryFollower::request_brake() {
+  if (state_ == FollowerState::Hold) {
+    return;
+  }
+  brake_requested_ = true;
+  if (state_ != FollowerState::Braking) {
+    state_ = FollowerState::Braking;
+    brake_ticks_ = 0;
+  }
 }
 
 bool TrajectoryFollower::begin_pitch_recovery(const Vec18& q_meas) {
@@ -73,6 +88,7 @@ bool TrajectoryFollower::begin_pitch_recovery(const Vec18& q_meas) {
                                 : "hold_inside");
   last_.state = state_;
   last_.pitch_excess = recovery_excess0_;
+  last_.pitch_excess_ceiling = recovery_excess0_;
   return true;
 }
 
@@ -110,9 +126,11 @@ bool TrajectoryFollower::adopt(const TrajectoryPackage& package,
   recovery_ticks_ = 0;
   brake_ticks_ = 0;
   recovery_excess0_ = ex;
+  stage_cursor_ = 0;
+  wait_stage_id_ = 0;
+  wait_ack_t0_ = -1.0;
+  brake_requested_ = false;
   if (ex > kExcessEps) {
-    // Measured start outside hard pitch: recover first; do not treat the
-    // ordinary certified package as executable until inside.
     state_ = FollowerState::Recovering;
   } else {
     state_ = FollowerState::Active;
@@ -127,6 +145,57 @@ bool TrajectoryFollower::adopt(const TrajectoryPackage& package,
   last_.generation = package.generation;
   last_.path_id = package.path_id;
   last_.pitch_excess = ex;
+  last_.pitch_excess_ceiling = ex;
+  return true;
+}
+
+bool TrajectoryFollower::on_stage_ack(uint64_t generation, uint32_t stage_id,
+                                      bool success, const Vec18& q_meas,
+                                      std::string* why) {
+  if (state_ != FollowerState::WaitAck) {
+    if (why) *why = "not_waiting_ack";
+    return false;
+  }
+  if (!has_package_ || package_.generation != generation ||
+      wait_stage_id_ != stage_id) {
+    if (why) *why = "ack_mismatch";
+    return false;
+  }
+  if (!success) {
+    state_ = FollowerState::Hold;
+    has_package_ = false;
+    if (why) *why = "ack_failed";
+    last_ = make_hold(q_meas.allFinite() ? q_meas : q_cmd_, "ack_failed");
+    last_.action = FollowerAction::NeedReplan;
+    return false;
+  }
+  // Must still be near the stage endpoint sample.
+  const StageBoundary* b = nullptr;
+  for (const auto& sb : package_.stage_boundaries) {
+    if (sb.stage_id == stage_id) {
+      b = &sb;
+      break;
+    }
+  }
+  if (b == nullptr || b->sample_index >= package_.samples.size()) {
+    if (why) *why = "ack_stage_missing";
+    return false;
+  }
+  const Vec18& q_stage = package_.samples[b->sample_index];
+  if (!q_meas.allFinite() ||
+      (q_meas - q_stage).cwiseAbs().maxCoeff() > 0.05) {
+    state_ = FollowerState::Hold;
+    has_package_ = false;
+    if (why) *why = "ack_pose_drift";
+    last_ = make_hold(q_meas.allFinite() ? q_meas : q_cmd_, "ack_pose_drift");
+    last_.action = FollowerAction::NeedReplan;
+    return false;
+  }
+  wait_ack_t0_ = -1.0;
+  wait_stage_id_ = 0;
+  ++stage_cursor_;
+  state_ = FollowerState::Active;
+  if (why) *why = "ok";
   return true;
 }
 
@@ -165,44 +234,22 @@ FollowerTick TrajectoryFollower::make_hold(const Vec18& q,
   return tick;
 }
 
-Vec18 TrajectoryFollower::interpolate_plan(double t_s, double* s_out) const {
-  const JointCurve& samples = package_.samples;
-  const TimeLawTable& law = package_.time_law;
-  if (samples.empty()) {
-    if (s_out != nullptr) {
-      *s_out = 0.0;
+const StageBoundary* TrajectoryFollower::stage_at_progress(double s) const {
+  if (!has_package_ || package_.samples.size() < 2) {
+    return nullptr;
+  }
+  const double u = s * static_cast<double>(package_.samples.size() - 1);
+  for (std::size_t i = stage_cursor_; i < package_.stage_boundaries.size();
+       ++i) {
+    const StageBoundary& b = package_.stage_boundaries[i];
+    if (b.sample_index == 0) {
+      continue;
     }
-    return has_cmd_ ? q_cmd_ : Vec18::Zero();
-  }
-  if (samples.size() == 1 || law.t_s.size() < 2 ||
-      law.s.size() != law.t_s.size()) {
-    if (s_out != nullptr) {
-      *s_out = 0.0;
+    if (static_cast<double>(b.sample_index) <= u + 1e-9) {
+      return &b;
     }
-    return samples.front();
   }
-  const double t_end = law.t_s.back();
-  const double t = std::clamp(t_s, 0.0, t_end);
-  std::size_t i = 0;
-  while (i + 1 < law.t_s.size() && law.t_s[i + 1] < t - kNumericEps) {
-    ++i;
-  }
-  const double t0 = law.t_s[i];
-  const double t1 = law.t_s[std::min(i + 1, law.t_s.size() - 1)];
-  const double alpha =
-      (t1 - t0) > kNumericEps ? (t - t0) / (t1 - t0) : 0.0;
-  const double s0 = law.s[i];
-  const double s1 = law.s[std::min(i + 1, law.s.size() - 1)];
-  const double s = s0 + alpha * (s1 - s0);
-  if (s_out != nullptr) {
-    *s_out = s;
-  }
-  const double u = s * static_cast<double>(samples.size() - 1);
-  const std::size_t j =
-      std::min(static_cast<std::size_t>(std::floor(u)), samples.size() - 1);
-  const std::size_t j1 = std::min(j + 1, samples.size() - 1);
-  const double frac = u - static_cast<double>(j);
-  return samples[j] + frac * (samples[j1] - samples[j]);
+  return nullptr;
 }
 
 bool TrajectoryFollower::command_feasible(
@@ -251,16 +298,30 @@ bool TrajectoryFollower::command_feasible(
 bool TrajectoryFollower::try_qp_correction(
     const Vec18& q_nom, const Vec18& q_prev, const Vec18& q_meas, double dt,
     Vec18* q_out, const char** fail_tag) const {
-  // Small δq about the certified nominal. No posture reselection: trust region
-  // is a few milliradians and the objective prefers staying on q_nom.
   constexpr int n = kNDof;
   const Vec18 cap = step_cap(dt);
-  // Stay on the certified nominal: min ||δq||² (+ tiny prev smoothness).
-  (void)q_meas;
-  Eigen::MatrixXd H = Eigen::MatrixXd::Identity(n, n) * 200.0;
+  // Track measured TCP/joint error toward certified nominal — not zero gradient.
+  Eigen::MatrixXd H = Eigen::MatrixXd::Identity(n, n) * 40.0;
   Eigen::VectorXd g = Eigen::VectorXd::Zero(n);
   for (int j = 0; j < n; ++j) {
-    H(j, j) += 0.2;
+    // Prefer δq that moves q_nom+δq toward reducing (q_meas - q_nom) error
+    // while staying near q_nom (trust).
+    const double e = q_meas[j] - q_nom[j];
+    g[j] = -2.0 * 8.0 * e;  // soft pull of corrected cmd toward meas-consistent
+    H(j, j) += 80.0;        // stay near certified q_nom
+    H(j, j) += 0.5;         // tiny prev smoothness
+    (void)q_prev;
+  }
+  if (has_package_) {
+    const auto frame = ee_frame(package_.left);
+    const Vec3 p_nom = kin_.fk_pos(q_nom, frame);
+    const Vec3 p_meas = kin_.fk_pos(q_meas, frame);
+    const Mat3x18 J = kin_.jacobian_pos(q_nom, frame);
+    const Vec3 e_tcp = p_meas - p_nom;
+    // min ||J δq - (-e_tcp * scale)|| roughly → g += 2 J^T (J*0 - (-e))
+    const double w_tcp = 200.0;
+    g -= (2.0 * w_tcp) * (J.transpose() * (-e_tcp));
+    H += (2.0 * w_tcp) * (J.transpose() * J);
   }
   Eigen::VectorXd lb(n);
   Eigen::VectorXd ub(n);
@@ -271,7 +332,6 @@ bool TrajectoryFollower::try_qp_correction(
     const double step_hi = (q_prev[j] + cap[j]) - q_nom[j];
     lb[j] = std::max(box_lo, step_lo);
     ub[j] = std::min(box_hi, step_hi);
-    // Tiny trust so QP cannot mint a new waist/arm division.
     lb[j] = std::max(lb[j], -0.015);
     ub[j] = std::min(ub[j], 0.015);
     if (lb[j] > ub[j] + 1e-12) {
@@ -282,13 +342,13 @@ bool TrajectoryFollower::try_qp_correction(
     }
   }
 
-  // Pitch / CoM linear inequalities on δq.
   std::vector<Eigen::Matrix<double, 1, kNDof>> Arows;
   std::vector<double> blo;
   std::vector<double> bup;
   const double hard = policy_.torso_pitch_max_rad;
   if (hard > 0.0) {
-    Eigen::Matrix<double, 1, kNDof> pitch = Eigen::Matrix<double, 1, kNDof>::Zero();
+    Eigen::Matrix<double, 1, kNDof> pitch =
+        Eigen::Matrix<double, 1, kNDof>::Zero();
     pitch.head<3>().setOnes();
     const double p0 = pitch_of(q_nom);
     Arows.push_back(pitch);
@@ -298,7 +358,6 @@ bool TrajectoryFollower::try_qp_correction(
   if (guards_ != nullptr) {
     const Vec3 com = kin_.com(q_nom);
     const Mat3x18 Jc = kin_.jacobian_com(q_nom);
-    // Stay-feasible half-spaces (same as historical QP CoM rows).
     Eigen::Vector2d dlo;
     Eigen::Vector2d dhi;
     guards_->com_step_bounds(com, dlo, dhi);
@@ -352,7 +411,6 @@ bool TrajectoryFollower::try_qp_correction(
   if (!command_feasible(q_cand, q_prev, dt, 0.0, fail_tag)) {
     return false;
   }
-  // TCP tube vs certified nominal.
   if (has_package_) {
     const auto frame = ee_frame(package_.left);
     const Vec3 p_nom = kin_.fk_pos(q_nom, frame);
@@ -378,6 +436,7 @@ FollowerTick TrajectoryFollower::recover_tick(const Vec18& q_meas, double dt) {
   const double hard = policy_.torso_pitch_max_rad;
   const double ex_meas = pitch_excess_of(q_meas);
   tick.pitch_excess = ex_meas;
+  tick.pitch_excess_ceiling = std::max(recovery_excess0_, ex_meas);
   tick.q_plan = q_meas;
   if (!(hard > 0.0)) {
     state_ = has_package_ ? FollowerState::Active : FollowerState::Hold;
@@ -391,8 +450,6 @@ FollowerTick TrajectoryFollower::recover_tick(const Vec18& q_meas, double dt) {
     return tick;
   }
   if (ex_meas <= kExcessEps) {
-    // Back inside hard box: leave recovery. Ordinary package only resumes if
-    // present and still admissible; otherwise HOLD and ask for replan.
     if (has_package_) {
       state_ = FollowerState::Active;
       tick.state = FollowerState::Active;
@@ -421,27 +478,21 @@ FollowerTick TrajectoryFollower::recover_tick(const Vec18& q_meas, double dt) {
     return tick;
   }
 
-  // §7.4: excess(t+dt) <= excess(t) + eps. Reduce with available waist step
-  // room without widening joint caps or J1 58°.
   const Vec18 cap = step_cap(dt);
   const double pitch = pitch_of(q_meas);
   const double sign = pitch > 0.0 ? 1.0 : -1.0;
   Vec18 q_cmd = q_meas;
   double remaining = ex_meas;
-  // Prefer J2 then J3 then J1 for recovery pull (class-human sit), but never
-  // violate hard box or per-tick cap. Do not assume one axis can take all.
   const int order[3] = {1, 2, 0};
   for (int k = 0; k < 3 && remaining > kExcessEps; ++k) {
     const int a = order[k];
     const double room_box = sign > 0.0 ? (q_cmd[a] - policy_.q_min[a])
                                        : (policy_.q_max[a] - q_cmd[a]);
-    const double room_step = cap[a];
-    const double room = std::max(0.0, std::min(room_box, room_step));
+    const double room = std::max(0.0, std::min(room_box, cap[a]));
     const double take = std::min(remaining, room);
     q_cmd[a] -= sign * take;
     remaining -= take;
   }
-  // Clamp only to the true hard box (no soft margin widen).
   for (int j = 0; j < kNDof; ++j) {
     q_cmd[j] = std::clamp(q_cmd[j], policy_.q_min[j], policy_.q_max[j]);
   }
@@ -451,7 +502,6 @@ FollowerTick TrajectoryFollower::recover_tick(const Vec18& q_meas, double dt) {
   const char* fail = nullptr;
   if (ex_cmd > ceiling + kExcessEps ||
       !command_feasible(q_cmd, q_cmd_, dt, ceiling, &fail)) {
-    // Cannot safely reduce or even hold excess → protect stop.
     state_ = FollowerState::Hold;
     tick.state = FollowerState::Hold;
     tick.action = FollowerAction::ProtectStop;
@@ -462,8 +512,6 @@ FollowerTick TrajectoryFollower::recover_tick(const Vec18& q_meas, double dt) {
   }
   if (!(ex_cmd < ex_meas - 1e-12) && remaining > kExcessEps &&
       recovery_ticks_ > 1) {
-    // No progress possible under caps: still OK if excess did not grow; keep
-    // trying until timeout. If literally zero waist room → protect.
     double waist_room = 0.0;
     for (int a = 0; a < 3; ++a) {
       const double room_box = sign > 0.0 ? (q_meas[a] - policy_.q_min[a])
@@ -500,7 +548,6 @@ FollowerTick TrajectoryFollower::brake_tick(const Vec18& q_meas, double dt) {
   ++brake_ticks_;
   const Vec18 cap = step_cap(dt);
   Vec18 q_cmd = q_cmd_;
-  // Decelerate toward measured/hold: shrink step each brake tick.
   const double scale =
       std::max(0.0, 1.0 - static_cast<double>(brake_ticks_) /
                               static_cast<double>(kBrakeTicks));
@@ -519,6 +566,7 @@ FollowerTick TrajectoryFollower::brake_tick(const Vec18& q_meas, double dt) {
   if (brake_ticks_ >= kBrakeTicks) {
     state_ = FollowerState::Hold;
     has_package_ = false;
+    brake_requested_ = false;
     tick.state = FollowerState::Hold;
     tick.action = FollowerAction::NeedReplan;
     tick.reason = "braked_need_replan";
@@ -543,7 +591,12 @@ FollowerTick TrajectoryFollower::step(const Vec18& q_meas, double t_s,
     has_cmd_ = true;
   }
 
-  // Auto-enter recovery if pitch leaves the hard box while active.
+  if (brake_requested_ && state_ != FollowerState::Braking &&
+      state_ != FollowerState::Recovering) {
+    state_ = FollowerState::Braking;
+    brake_ticks_ = 0;
+  }
+
   if (state_ == FollowerState::Active &&
       pitch_excess_of(q_meas) > kExcessEps) {
     state_ = FollowerState::Recovering;
@@ -559,31 +612,114 @@ FollowerTick TrajectoryFollower::step(const Vec18& q_meas, double t_s,
     last_ = brake_tick(q_meas, dt);
     return last_;
   }
+  if (state_ == FollowerState::WaitAck) {
+    FollowerTick tick = make_hold(q_cmd_, "wait_external_ack");
+    tick.state = FollowerState::WaitAck;
+    tick.action = FollowerAction::WaitExternalAck;
+    tick.wait_stage_id = wait_stage_id_;
+    tick.generation = package_.generation;
+    tick.path_id = package_.path_id;
+    tick.t_s = t_s;
+    if (wait_ack_t0_ < 0.0) {
+      wait_ack_t0_ = t_s;
+    }
+    if (ack_timeout_s_ > 0.0 && (t_s - wait_ack_t0_) > ack_timeout_s_) {
+      state_ = FollowerState::Hold;
+      has_package_ = false;
+      tick.state = FollowerState::Hold;
+      tick.action = FollowerAction::NeedReplan;
+      tick.reason = "ack_timeout";
+    }
+    last_ = tick;
+    return last_;
+  }
   if (state_ == FollowerState::Hold || !has_package_) {
     last_ = make_hold(q_cmd_, "hold");
     return last_;
   }
 
-  // ACTIVE: follow certified plan.
   FollowerTick tick;
   tick.state = FollowerState::Active;
   tick.generation = package_.generation;
   tick.path_id = package_.path_id;
-  double s = 0.0;
-  const Vec18 q_plan = interpolate_plan(t_s, &s);
-  tick.q_plan = q_plan;
-  tick.s = s;
   tick.t_s = t_s;
   tick.pitch_excess = pitch_excess_of(q_meas);
 
+  TrajectoryTimeSample samp;
+  if (!sample_trajectory_at(package_, t_s, &samp) || !samp.ok) {
+    state_ = FollowerState::Braking;
+    brake_ticks_ = 0;
+    tick.state = FollowerState::Braking;
+    tick.action = FollowerAction::Brake;
+    tick.reason = samp.reason != nullptr ? samp.reason : "sample_fail";
+    tick.q_ref = q_cmd_;
+    tick.q_follow = q_cmd_;
+    last_ = tick;
+    return last_;
+  }
+  const Vec18 q_plan = samp.q;
+  tick.q_plan = q_plan;
+  tick.s = samp.s;
+
+  // Stage stop / external ACK gates — never auto-advance past wait_ack.
+  if (const StageBoundary* b = stage_at_progress(samp.s)) {
+    const bool at_stop =
+        b->stop_required || b->wait_for_external_ack;
+    if (at_stop && b->sample_index < package_.samples.size()) {
+      const Vec18& q_stage = package_.samples[b->sample_index];
+      const bool stopped =
+          samp.dq.cwiseAbs().maxCoeff() < 0.05 &&
+          (q_meas - q_stage).cwiseAbs().maxCoeff() < 0.03;
+      if (b->wait_for_external_ack) {
+        if (!stopped) {
+          // Hold progress by freezing command toward stage end.
+          tick.q_ref = q_stage;
+          tick.q_follow = q_stage;
+          tick.action = FollowerAction::Continue;
+          tick.reason = "decel_to_stage_stop";
+          q_prev_cmd_ = q_cmd_;
+          q_cmd_ = q_stage;
+          last_ = tick;
+          return last_;
+        }
+        state_ = FollowerState::WaitAck;
+        wait_stage_id_ = b->stage_id;
+        wait_ack_t0_ = t_s;
+        tick.state = FollowerState::WaitAck;
+        tick.action = FollowerAction::WaitExternalAck;
+        tick.wait_stage_id = b->stage_id;
+        tick.q_ref = q_stage;
+        tick.q_follow = q_stage;
+        tick.reason = "wait_external_ack";
+        q_cmd_ = q_stage;
+        last_ = tick;
+        return last_;
+      }
+      if (b->stop_required && !stopped) {
+        tick.q_ref = q_stage;
+        tick.q_follow = q_stage;
+        tick.action = FollowerAction::Continue;
+        tick.reason = "stop_required_decel";
+        q_cmd_ = q_stage;
+        last_ = tick;
+        return last_;
+      }
+      if (b->stop_required && stopped) {
+        ++stage_cursor_;
+      }
+    }
+  }
+
   const double dur = package_.time_law.duration_s;
-  if (dur > 0.0 && t_s >= dur - 1e-9 &&
-      (q_meas - package_.samples.back()).cwiseAbs().maxCoeff() < 0.02) {
+  const bool time_done = dur > 0.0 && t_s >= dur - 1e-9;
+  tick.time_done = time_done;
+  if (time_done) {
+    // Local time done — Arrived only after 250 Hz safety + measured confirm.
     tick.q_ref = package_.samples.back();
     tick.q_follow = tick.q_ref;
+    tick.q_offset.setZero();
     tick.action = FollowerAction::Arrived;
-    tick.reason = "arrived";
-    state_ = FollowerState::Hold;
+    tick.reason = "time_done_claim";
     q_prev_cmd_ = q_cmd_;
     q_cmd_ = tick.q_ref;
     last_ = tick;
@@ -594,10 +730,8 @@ FollowerTick TrajectoryFollower::step(const Vec18& q_meas, double t_s,
   const char* fail = nullptr;
   bool qp_used = false;
   if (enable_qp_) {
-    const Vec3 p_plan =
-        kin_.fk_pos(q_plan, ee_frame(package_.left));
-    const Vec3 p_meas =
-        kin_.fk_pos(q_meas, ee_frame(package_.left));
+    const Vec3 p_plan = kin_.fk_pos(q_plan, ee_frame(package_.left));
+    const Vec3 p_meas = kin_.fk_pos(q_meas, ee_frame(package_.left));
     const double err = (p_meas - p_plan).norm();
     if (err > 1e-4 && err <= track_err_m_) {
       Vec18 q_corr;
@@ -605,7 +739,6 @@ FollowerTick TrajectoryFollower::step(const Vec18& q_meas, double t_s,
         q_ref = q_corr;
         qp_used = true;
       } else {
-        // Infeasible small correction → brake / need replan. Do not reshape.
         state_ = FollowerState::Braking;
         brake_ticks_ = 0;
         tick.state = FollowerState::Braking;
@@ -613,7 +746,6 @@ FollowerTick TrajectoryFollower::step(const Vec18& q_meas, double t_s,
         tick.reason = fail != nullptr ? fail : "qp_need_replan";
         tick.q_ref = q_cmd_;
         tick.q_follow = q_cmd_;
-        tick.qp_used = false;
         last_ = tick;
         return last_;
       }
@@ -634,6 +766,7 @@ FollowerTick TrajectoryFollower::step(const Vec18& q_meas, double t_s,
 
   tick.q_ref = q_ref;
   tick.q_follow = q_ref;
+  tick.q_offset = q_ref - q_plan;
   tick.action = FollowerAction::Continue;
   tick.reason = qp_used ? "follow_qp" : "follow_nominal";
   tick.qp_used = qp_used;

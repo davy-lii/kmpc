@@ -55,6 +55,9 @@ class PlannerWorker {
   // Non-blocking. Returns true and fills out when a newer result is ready.
   bool try_take(FastPlanResult& out);
 
+  // Drop pending job and any unconsumed result (task replace / cancel).
+  void clear_pending_and_result();
+
   bool running() const { return running_.load(std::memory_order_acquire); }
   uint64_t submitted_seq() const {
     return submitted_seq_.load(std::memory_order_relaxed);
@@ -62,6 +65,8 @@ class PlannerWorker {
   uint64_t completed_seq() const {
     return completed_seq_.load(std::memory_order_relaxed);
   }
+  const TrajectoryCostWeights& default_weights() const;
+  const std::string& quality_load_note() const;
 
  private:
   void loop();
@@ -71,6 +76,7 @@ class PlannerWorker {
   Config config_;
   MotionConstraintPolicy default_policy_;
   TrajectoryCostWeights default_weights_;
+  std::string quality_load_note_;
 
   std::unique_ptr<Kinematics> kin_;
   std::unique_ptr<WholeBodyGuards> guards_;

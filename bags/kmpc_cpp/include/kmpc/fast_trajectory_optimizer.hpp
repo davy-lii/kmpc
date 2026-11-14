@@ -36,6 +36,12 @@ struct FastPlanResult {
   double duration_s = 0.0;
   bool deadline_hit = false;
   bool software_limited = true;
+  // PlannerWorker submit sequence that produced this result.
+  uint64_t submit_seq = 0;
+  uint64_t task_digest = 0;
+  uint64_t model_digest = 0;
+  uint64_t limits_digest = 0;
+  uint64_t generation = 0;
 };
 
 class FastTrajectoryOptimizer {

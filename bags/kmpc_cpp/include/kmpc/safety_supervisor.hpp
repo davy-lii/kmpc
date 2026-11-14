@@ -1,8 +1,9 @@
 #pragma once
 // 250 Hz final gate before send for unified_multistage_v2.
-// Hard box, pitch, step/accel, CoM, freshness, TCP tube, package generation,
-// tracking error. No direction_envelope_accept / sign hard gate.
+// Hard box, pitch, step/accel/jerk from *accepted sends*, CoM, freshness,
+// TCP tube, package generation, tracking error. No direction_envelope_accept.
 // Rejects unsafe cmds; never silent-clamps geometry; never fakes arrived.
+// Step/accel/jerk use internal q_last_send — never trust caller q_prev.
 
 #include <algorithm>
 #include <cstdint>
@@ -16,20 +17,32 @@
 
 namespace kmpc {
 
+enum class SafetyExecMode {
+  Normal = 0,
+  Recovering = 1,
+};
+
 struct SafetySupervisorInput {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
   Vec18 q_cmd = Vec18::Zero();
+  // Deprecated for step/accel: ignored when supervisor has q_last_send.
   Vec18 q_prev = Vec18::Zero();
   Vec18 q_meas = Vec18::Zero();
-  Vec18 q_follow = Vec18::Zero();  // 50 Hz layer
+  Vec18 q_follow = Vec18::Zero();  // optional 50 Hz hint / offset target
+  bool has_follow = false;         // only then enforce follow_err
   Vec18 q_plan = Vec18::Zero();
-  double dt = 0.004;               // 250 Hz
+  double dt = 0.004;  // nominal 250 Hz; actual dt from last_send timestamp
   double cmd_timestamp_s = 0.0;
-  double meas_timestamp_s = 0.0;
+  double meas_timestamp_s = 0.0;  // real joint_states receive/source time
   double now_s = 0.0;
+  bool has_meas = false;  // must be true with finite q_meas + timestamp
   uint64_t expected_generation = 0;
   uint32_t expected_path_id = 0;
+  uint64_t expected_task_digest = 0;
   bool claim_arrived = false;
+  SafetyExecMode mode = SafetyExecMode::Normal;
+  // Recovering: measured excess ceiling; cmd excess must not grow.
+  double pitch_excess_ceiling = 0.0;
   const TrajectoryPackage* package = nullptr;
 };
 
@@ -54,19 +67,26 @@ class SafetySupervisor {
   void set_track_err_m(double m) { track_err_m_ = std::max(m, 1e-4); }
   void set_follow_err_rad(double r) { follow_err_rad_ = std::max(r, 1e-6); }
 
-  // Updates last_safe_ only when accept=true. Reject never mutates geometry.
+  // Updates q_last_send_ only when accept=true. Reject never mutates geometry.
   SafetyDecision check(const SafetySupervisorInput& in);
 
   const Vec18& last_safe() const { return last_safe_; }
+  const Vec18& q_last_send() const { return q_last_send_; }
+  bool has_last_send() const { return has_last_send_; }
 
  private:
   const Kinematics& kin_;
   const WholeBodyGuards* guards_;
   MotionConstraintPolicy policy_;
   Vec18 last_safe_ = Vec18::Zero();
-  Vec18 last_vel_ = Vec18::Zero();  // accepted command velocity (rad/s)
+  Vec18 q_last_send_ = Vec18::Zero();
+  Vec18 last_vel_ = Vec18::Zero();
+  Vec18 last_acc_ = Vec18::Zero();
+  double t_last_send_s_ = -1.0;
   bool has_safe_ = false;
+  bool has_last_send_ = false;
   bool has_vel_ = false;
+  bool has_acc_ = false;
   double freshness_s_ = 0.05;
   double tcp_tube_m_ = 0.02;
   double track_err_m_ = 0.05;

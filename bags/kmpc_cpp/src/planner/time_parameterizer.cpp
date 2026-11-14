@@ -30,6 +30,7 @@ TimeLawTable TimeParameterizer::compute(
   if (n == 1) {
     out.s.push_back(0.0);
     out.t_s.push_back(0.0);
+    out.ds_dt.push_back(0.0);
     out.duration_s = 0.0;
     return out;
   }
@@ -63,6 +64,7 @@ TimeLawTable TimeParameterizer::compute(
   if (!any_motion) {
     out.s.resize(n);
     out.t_s.resize(n);
+    out.ds_dt.assign(n, 0.0);
     for (std::size_t i = 0; i < n; ++i) {
       out.s[i] = static_cast<double>(i) / static_cast<double>(n - 1);
       out.t_s[i] = static_cast<double>(i) * kNominalDt;
@@ -137,10 +139,14 @@ TimeLawTable TimeParameterizer::compute(
   }
 
   // Integrate: du = 1 per segment, dt = 2 du / (v_i + v_{i+1}).
+  // v[i] is du/dt in sample-index domain; s = u/(n-1) so ds/dt = v/(n-1).
   out.s.resize(n);
   out.t_s.resize(n);
+  out.ds_dt.resize(n);
   out.s[0] = 0.0;
   out.t_s[0] = 0.0;
+  const double s_scale = 1.0 / static_cast<double>(n - 1);
+  out.ds_dt[0] = v[0] * s_scale;
   for (std::size_t i = 0; i + 1 < n; ++i) {
     out.s[i + 1] = static_cast<double>(i + 1) / static_cast<double>(n - 1);
     const double rates = v[i] + v[i + 1];
@@ -153,6 +159,7 @@ TimeLawTable TimeParameterizer::compute(
       dt = vref > 1e8 ? kNominalDt : std::max(2.0 / vref, kNominalDt);
     }
     out.t_s[i + 1] = out.t_s[i] + dt;
+    out.ds_dt[i + 1] = v[i + 1] * s_scale;
   }
   out.duration_s = out.t_s.back();
   return out;

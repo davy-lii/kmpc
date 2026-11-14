@@ -25,6 +25,7 @@ struct TrajectoryCostWeights {
   double body_forward_len_m = 0.05;
   double pitch_scale_rad = 32.0 * kPi / 180.0;
   bool calibrated = false;
+  std::string calibration_version = "unset";
 };
 
 struct PathCostBreakdown {
@@ -72,5 +73,11 @@ CostLinearization value_and_linearize(
     const std::vector<int>& active_joints);
 
 TrajectoryCostWeights default_cost_weights(const Vec18& dq_max);
+
+// Load bags/kmpc_cpp/config/trajectory_quality.yaml (or absolute path).
+// On failure returns default_cost_weights and sets *why. Never marks
+// calibrated=true unless the yaml says so.
+TrajectoryCostWeights load_trajectory_quality_weights(
+    const std::string& yaml_path, const Vec18& dq_max, std::string* why);
 
 }  // namespace kmpc

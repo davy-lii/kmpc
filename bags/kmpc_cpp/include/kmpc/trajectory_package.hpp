@@ -23,10 +23,25 @@ struct TimeLawTable {
   // Monotone s in [0,1] and wall time samples for the certified curve.
   std::vector<double> s;
   std::vector<double> t_s;
+  // Optional node rates ds/dt (same length as s). Empty → inferred from t_s/s.
+  std::vector<double> ds_dt;
   double duration_s = 0.0;
   bool software_limited = true;
   std::string accel_source = "software_limited";
   std::string jerk_source = "software_limited";
+};
+
+// Actual executable sample at wall time along the certified package.
+// q is Hermite (C1) on geometric knots; dq/ddq from time-consistent derivatives.
+struct TrajectoryTimeSample {
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+  Vec18 q = Vec18::Zero();
+  Vec18 dq = Vec18::Zero();
+  Vec18 ddq = Vec18::Zero();
+  double s = 0.0;
+  double t_s = 0.0;
+  bool ok = false;
+  const char* reason = "not_sampled";
 };
 
 struct TrajectoryCertificateSummary {
@@ -75,5 +90,11 @@ uint64_t limits_digest_of(const MotionConstraintPolicy& policy);
 AdmitDecision admit_package_start(
     const TrajectoryPackage& package, const Vec18& q, const Vec18& dq,
     bool dq_known, double q_tol_rad, double dq_tol);
+
+// Sample the *executed* continuous trajectory at wall time t_s (clamped to
+// [0, duration]). Uses Hermite on samples with s(t) from the time law.
+// This is the single source of truth for 50 Hz monitor and 250 Hz send.
+bool sample_trajectory_at(const TrajectoryPackage& package, double t_s,
+                          TrajectoryTimeSample* out);
 
 }  // namespace kmpc

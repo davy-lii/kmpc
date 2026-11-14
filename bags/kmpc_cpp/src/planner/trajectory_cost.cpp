@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <string>
+
+#include <yaml-cpp/yaml.h>
 
 #include "kmpc/motion_evaluator.hpp"
 
@@ -368,6 +371,59 @@ TrajectoryCostWeights default_cost_weights(const Vec18& dq_max) {
     weights.motion_scale[i] = dq_max[i] > 1e-6 ? 1.0 / dq_max[i] : 1.0;
   }
   weights.calibrated = false;
+  weights.calibration_version = "default_uncalibrated";
+  return weights;
+}
+
+TrajectoryCostWeights load_trajectory_quality_weights(
+    const std::string& yaml_path, const Vec18& dq_max, std::string* why) {
+  TrajectoryCostWeights weights = default_cost_weights(dq_max);
+  try {
+    const YAML::Node root = YAML::LoadFile(yaml_path);
+    const YAML::Node tq = root["trajectory_quality"]
+                              ? root["trajectory_quality"]
+                              : root;
+    if (tq["calibration_version"]) {
+      weights.calibration_version = tq["calibration_version"].as<std::string>();
+    }
+    if (tq["calibrated"]) {
+      weights.calibrated = tq["calibrated"].as<bool>();
+    } else {
+      weights.calibrated = false;
+    }
+    const YAML::Node w = tq["weights"] ? tq["weights"] : tq;
+    auto rd = [&](const char* key, double* dst) {
+      if (w[key]) {
+        *dst = w[key].as<double>();
+      }
+    };
+    rd("move", &weights.move);
+    rd("smooth", &weights.smooth);
+    rd("body_forward", &weights.body_forward);
+    rd("neutral", &weights.neutral);
+    rd("joint_limit", &weights.joint_limit);
+    rd("pitch_comfort", &weights.pitch_comfort);
+    rd("com_margin", &weights.com_margin);
+    rd("arm_manip", &weights.arm_manip);
+    if (tq["normalization"]) {
+      const YAML::Node n = tq["normalization"];
+      if (n["body_forward_len_m"]) {
+        weights.body_forward_len_m = n["body_forward_len_m"].as<double>();
+      }
+      if (n["pitch_scale_rad"]) {
+        weights.pitch_scale_rad = n["pitch_scale_rad"].as<double>();
+      }
+    }
+    if (why != nullptr) {
+      *why = "ok";
+    }
+  } catch (const std::exception& e) {
+    if (why != nullptr) {
+      *why = std::string("quality_yaml_fail:") + e.what();
+    }
+    weights = default_cost_weights(dq_max);
+    weights.calibrated = false;
+  }
   return weights;
 }
 
