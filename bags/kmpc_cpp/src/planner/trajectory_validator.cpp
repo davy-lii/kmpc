@@ -274,8 +274,14 @@ TrajectoryCertificate validate_actual_q_of_t(
         return false;
       }
       if (policy.torso_pitch_max_rad > 0.0) {
+        // Same recovery envelope as validate_path / seed IK: start already
+        // outside ±cap may keep |start|, but pitch must not grow. Using the
+        // bare hard cap here falsely rejects every Hermite sample near q0.
+        const double start_abs = pitch_abs(package.samples.front());
+        const double bound = pitch_abs_bound(policy.torso_pitch_max_rad,
+                                             start_abs, /*for_gate=*/true);
         const double pitch = samp.q[0] + samp.q[1] + samp.q[2];
-        if (std::abs(pitch) > policy.torso_pitch_max_rad + kPitchRoundEpsRad) {
+        if (std::abs(pitch) > bound) {
           note(&fault, "exec_pitch");
           return false;
         }
