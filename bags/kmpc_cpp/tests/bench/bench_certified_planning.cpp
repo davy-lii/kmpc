@@ -1,5 +1,6 @@
 // Certified planning latency bench. Label host by actual machine arch so Jetson
 // aarch64 runs are not mis-tagged as x86_control_only.
+// Uses production quality weights, sealed task identity, and a 10 ms deadline.
 
 #include <algorithm>
 #include <chrono>
@@ -13,10 +14,11 @@
 #endif
 
 #include "kmpc/config.hpp"
+#include "kmpc/fast_trajectory_optimizer.hpp"
 #include "kmpc/kinematics.hpp"
 #include "kmpc/motion_task.hpp"
 #include "kmpc/trajectory_cost.hpp"
-#include "kmpc/unified_multistage_planner.hpp"
+#include "kmpc/trajectory_package.hpp"
 #include "kmpc/whole_body_guards.hpp"
 
 namespace {
@@ -33,6 +35,16 @@ double percentile(std::vector<double> xs, double p) {
   return xs[lo] * (1.0 - frac) + xs[hi] * frac;
 }
 
+struct PhaseAcc {
+  std::vector<double> total;
+  std::vector<double> seed;
+  std::vector<double> sqp;
+  std::vector<double> densify;
+  std::vector<double> time_law;
+  std::vector<double> certify;
+  std::vector<double> report;
+};
+
 kmpc::MotionTask make_reach(const kmpc::Vec18& q0, bool left,
                             const std::vector<kmpc::Vec3>& goals) {
   kmpc::MotionTask task;
@@ -47,6 +59,7 @@ kmpc::MotionTask make_reach(const kmpc::Vec18& q0, bool left,
     st.geometry = kmpc::TaskGeometry::Lin;
     st.position = goals[i];
     st.position_tol_m = 0.003;
+    st.orientation_tol_rad = 0.05;
     st.stage_id = static_cast<uint32_t>(i + 1);
     st.stop = (i + 1 == goals.size()) ? kmpc::StageStop::StopRequired
                                       : kmpc::StageStop::Continuous;
@@ -63,18 +76,41 @@ struct Case {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  int warmup = 3;
+  int reps = 60;
+  double deadline_ms = 10.0;
+  for (int i = 1; i + 1 < argc; ++i) {
+    const std::string a = argv[i];
+    if (a == "--warmup") {
+      warmup = std::max(0, std::atoi(argv[++i]));
+    } else if (a == "--reps") {
+      reps = std::max(1, std::atoi(argv[++i]));
+    } else if (a == "--deadline_ms") {
+      deadline_ms = std::atof(argv[++i]);
+    }
+  }
+
   const auto config = kmpc::Config::load(
       std::string(KMPC_CONFIG_DIR) + "/joint_limits.yaml",
       std::string(KMPC_CONFIG_DIR) + "/q_pref.yaml",
       std::string(KMPC_CONFIG_DIR) + "/kmpc_params.yaml");
-  kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
-                       "/Light-duty wheeled robot.urdf");
+  const std::string urdf =
+      std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf";
+  kmpc::Kinematics kin(urdf);
   kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
   const auto policy = kmpc::policy_from_config(config);
-  const auto weights = kmpc::default_cost_weights(config.limits.dq_max);
+  std::string weight_why;
+  auto weights = kmpc::load_trajectory_quality_weights(
+      std::string(KMPC_CONFIG_DIR) + "/trajectory_quality.yaml",
+      config.limits.dq_max, &weight_why);
+  for (int j = 0; j < kmpc::kNDof; ++j) {
+    const double dq = std::max(config.limits.dq_max[j], 1e-3);
+    weights.motion_scale[j] = 1.0 / dq;
+  }
   const kmpc::Vec18 q0 = config.q_pref;
   const kmpc::Vec3 p0 = kin.fk_pos(q0, kmpc::kEeFrameLeft);
+  kmpc::FastTrajectoryOptimizer optimizer(kin, &guards);
 
   std::string host_tag = "unknown_host";
 #if defined(__linux__)
@@ -96,7 +132,10 @@ int main() {
   if (host_tag == "x86_control_only") {
     std::cout << " (NOT jetson proof)";
   }
-  std::cout << "\n";
+  std::cout << " warmup=" << warmup << " reps=" << reps
+            << " deadline_ms=" << deadline_ms
+            << " weights=" << (weight_why.empty() ? "production_yaml" : weight_why)
+            << "\n";
 
   const Case cases[] = {
       {"reach_5cm_1stage", 1, 0.05},
@@ -106,10 +145,10 @@ int main() {
       {"reach_15cm_3stage", 3, 0.15},
   };
 
-  const int warmup = 2;
-  const int reps = 25;
   int certified_before_10 = 0;
   int total_ok = 0;
+  int total_deadline_reject = 0;
+  int total_reps_all = 0;
 
   for (const auto& c : cases) {
     std::vector<kmpc::Vec3> goals;
@@ -123,22 +162,47 @@ int main() {
       goals.push_back(p0 + kmpc::Vec3(c.reach_m * 0.7, 0.0, -0.05));
       goals.push_back(p0 + kmpc::Vec3(c.reach_m, 0.0, 0.02));
     }
-    const auto task = make_reach(q0, true, goals);
-    std::vector<double> cpu_ms;
-    cpu_ms.reserve(reps);
+
+    PhaseAcc acc;
     int ok_n = 0;
     int under_10 = 0;
+    int deadline_reject = 0;
+    int cert_fail = 0;
+
     for (int i = 0; i < warmup + reps; ++i) {
+      kmpc::MotionTask task = make_reach(q0, true, goals);
+      kmpc::seal_motion_task_identity(&task, urdf, /*is_xml=*/false, policy);
+      kmpc::RobotState state;
+      state.q = task.q;
+      state.dq_known = false;
+      state.fresh = true;
+
       const auto t0 = std::chrono::steady_clock::now();
       const auto res =
-          kmpc::solve_to_verified_package(kin, guards, task, policy, weights);
+          optimizer.plan(task, state, policy, weights, deadline_ms);
       const double ms = std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - t0)
                             .count();
       if (i < warmup) {
         continue;
       }
-      cpu_ms.push_back(ms);
+      ++total_reps_all;
+      acc.total.push_back(ms);
+      acc.seed.push_back(res.seed_ik_ms);
+      acc.sqp.push_back(res.sqp_ms);
+      acc.densify.push_back(res.densify_ms);
+      acc.time_law.push_back(res.time_law_ms);
+      acc.certify.push_back(res.certify_ms);
+      acc.report.push_back(res.report_ms);
+
+      const bool deadline_rej =
+          res.deadline_hit || res.reason == "deadline" ||
+          (!res.ok && ms > deadline_ms && res.reason.find("deadline") !=
+                                              std::string::npos);
+      if (deadline_rej) {
+        ++deadline_reject;
+        ++total_deadline_reject;
+      }
       if (res.ok) {
         ++ok_n;
         ++total_ok;
@@ -146,25 +210,60 @@ int main() {
           ++under_10;
           ++certified_before_10;
         }
+      } else if (!deadline_rej) {
+        ++cert_fail;
       }
     }
+
     const double rate =
-        cpu_ms.empty() ? 0.0
-                       : 100.0 * static_cast<double>(under_10) /
-                             static_cast<double>(cpu_ms.size());
+        acc.total.empty()
+            ? 0.0
+            : 100.0 * static_cast<double>(under_10) /
+                  static_cast<double>(acc.total.size());
+    const double deadline_rate =
+        acc.total.empty()
+            ? 0.0
+            : 100.0 * static_cast<double>(deadline_reject) /
+                  static_cast<double>(acc.total.size());
     std::cout << "case=" << c.name << " stages=" << c.stages
               << " reach_m=" << c.reach_m << " ok=" << ok_n << "/" << reps
-              << " planning_cpu_ms_p50=" << percentile(cpu_ms, 0.50)
-              << " p95=" << percentile(cpu_ms, 0.95)
-              << " p99=" << percentile(cpu_ms, 0.99)
-              << " certified_before_10ms_rate=" << rate << "%\n";
+              << " planning_cpu_ms_p50=" << percentile(acc.total, 0.50)
+              << " p95=" << percentile(acc.total, 0.95)
+              << " p99=" << percentile(acc.total, 0.99)
+              << " certified_before_10ms_rate=" << rate << "%"
+              << " deadline_reject_rate=" << deadline_rate << "%"
+              << " cert_fail=" << cert_fail << "\n";
+    std::cout << "  phases_p50 seed=" << percentile(acc.seed, 0.50)
+              << " sqp=" << percentile(acc.sqp, 0.50)
+              << " densify=" << percentile(acc.densify, 0.50)
+              << " time=" << percentile(acc.time_law, 0.50)
+              << " certify=" << percentile(acc.certify, 0.50)
+              << " report=" << percentile(acc.report, 0.50) << "\n";
+    std::cout << "  phases_p95 seed=" << percentile(acc.seed, 0.95)
+              << " sqp=" << percentile(acc.sqp, 0.95)
+              << " densify=" << percentile(acc.densify, 0.95)
+              << " time=" << percentile(acc.time_law, 0.95)
+              << " certify=" << percentile(acc.certify, 0.95)
+              << " report=" << percentile(acc.report, 0.95) << "\n";
+    std::cout << "  phases_p99 seed=" << percentile(acc.seed, 0.99)
+              << " sqp=" << percentile(acc.sqp, 0.99)
+              << " densify=" << percentile(acc.densify, 0.99)
+              << " time=" << percentile(acc.time_law, 0.99)
+              << " certify=" << percentile(acc.certify, 0.99)
+              << " report=" << percentile(acc.report, 0.99) << "\n";
   }
 
-  const double overall = total_ok == 0
-                             ? 0.0
-                             : 100.0 * static_cast<double>(certified_before_10) /
-                                   static_cast<double>(total_ok);
+  const double overall =
+      total_ok == 0 ? 0.0
+                    : 100.0 * static_cast<double>(certified_before_10) /
+                          static_cast<double>(total_ok);
+  const double deadline_overall =
+      total_reps_all == 0
+          ? 0.0
+          : 100.0 * static_cast<double>(total_deadline_reject) /
+                static_cast<double>(total_reps_all);
   std::cout << "overall_certified_before_10ms_rate=" << overall << "% ("
-            << host_tag << ")\n";
+            << host_tag << ") overall_deadline_reject_rate="
+            << deadline_overall << "%\n";
   return 0;
 }

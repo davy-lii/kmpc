@@ -38,12 +38,13 @@ enum class FollowerAction {
 };
 
 // Physically motivated stage settle / ACK re-entry tolerances.
-// Defaults are at least as tight as the old one-shot 0.03/0.05 rad gates and
-// add TCP + measured velocity + multi-tick stability (grasp precision not
-// loosened).
+// Joint/velocity/freshness/multi-tick are follower-local. TCP position and
+// orientation use StageBoundary task tolerances when a boundary is present;
+// tcp_abs_max_m / ori_abs_max_rad are fallbacks only (missing/invalid boundary).
 struct StageSettleTol {
   double q_abs_max_rad = 0.02;   // ~1.15° joint abs vs stage sample
-  double tcp_abs_max_m = 0.01;   // 10 mm TCP vs stage FK
+  double tcp_abs_max_m = 0.01;   // fallback TCP vs stage FK if no boundary tol
+  double ori_abs_max_rad = 0.05; // fallback ori vs stage FK if no boundary tol
   double dq_abs_max = 0.05;      // rad/s infinity-norm "near stop"
   double meas_max_age_s = 0.06;  // stale feedback cannot claim settled
   int stable_ticks = 3;          // consecutive 50 Hz ticks
@@ -151,7 +152,8 @@ class TrajectoryFollower {
   void fill_barrier_fields(FollowerTick* tick) const;
   void note_feedback(const Vec18& q_meas, double meas_stamp_s, double dt);
   bool evaluate_stage_settle(const Vec18& q_stage, const Vec18& q_meas,
-                             double now_s, const char** fail_tag,
+                             double now_s, const StageBoundary* boundary,
+                             const char** fail_tag,
                              bool* advance_stable) const;
 
   const Kinematics& kin_;

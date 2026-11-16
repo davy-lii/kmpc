@@ -26,8 +26,16 @@ struct FastPlanResult {
   TrajectoryPackage package;
   TrajectoryCertificate certificate;
   int iterations = 0;
-  double optimize_ms = 0.0;
-  double certify_ms = 0.0;
+  // Wall-clock phase breakdown (steady_clock). Sum ≈ total_ms; report_ms is
+  // post-cert quality string work and is still inside the measured plan call.
+  double seed_ik_ms = 0.0;
+  double sqp_ms = 0.0;
+  double densify_ms = 0.0;
+  double time_law_ms = 0.0;
+  double optimize_ms = 0.0;  // seed+sqp+densify+time_law
+  double certify_ms = 0.0;   // FK/CoM/Hermite exec certification
+  double report_ms = 0.0;
+  double total_ms = 0.0;
   double tcp_worst_m = 0.0;
   double min_hard_margin_rad = 0.0;
   double body_dx_m = 0.0;

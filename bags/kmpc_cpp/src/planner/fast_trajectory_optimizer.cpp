@@ -162,30 +162,46 @@ class V2Solver {
     std::string why;
     if (!preflight(&why)) {
       out.reason = why;
+      out.total_ms = elapsed_ms();
       finish_report(out);
       return out;
     }
     JointCurve knots;
     std::vector<KnotTarget> targets;
+    const double t_pre = elapsed_ms();
     if (!solve_knots(&knots, &targets, &why)) {
       out.reason = why;
       out.iterations = iterations_;
+      out.seed_ik_ms = seed_ik_ms_;
+      out.sqp_ms = sqp_ms_;
+      out.optimize_ms = elapsed_ms() - t_pre;
+      out.total_ms = elapsed_ms();
       finish_report(out);
       return out;
     }
-    out.optimize_ms = elapsed_ms();
+    out.seed_ik_ms = seed_ik_ms_;
+    out.sqp_ms = sqp_ms_;
     out.iterations = iterations_;
 
+    const double t_den0 = elapsed_ms();
     JointCurve samples;
     std::vector<StageBoundary> boundaries;
     if (!densify(knots, &samples, &boundaries, &why)) {
       out.reason = why;
+      out.densify_ms = elapsed_ms() - t_den0;
+      out.optimize_ms = elapsed_ms() - t_pre;
+      out.total_ms = elapsed_ms();
       finish_report(out);
       return out;
     }
+    out.densify_ms = elapsed_ms() - t_den0;
+
+    const double t_law0 = elapsed_ms();
     const TimeParameterizer parameterizer;
     const TimeLawTable law =
         parameterizer.compute(samples, policy_, boundaries);
+    out.time_law_ms = elapsed_ms() - t_law0;
+    out.optimize_ms = elapsed_ms() - t_pre;
 
     TrajectoryPackage pkg;
     pkg.generation = task_.generation;
@@ -202,9 +218,10 @@ class V2Solver {
     pkg.stage_boundaries = boundaries;
     pkg.planner = "unified_multistage_v2";
 
+    const double t_cert0 = elapsed_ms();
     const TrajectoryCertificate cert =
         validate_actual_q_of_t(pkg, task_, policy_, kin_, guards_);
-    out.certify_ms = elapsed_ms() - out.optimize_ms;
+    out.certify_ms = elapsed_ms() - t_cert0;
     out.certificate = cert;
     out.package = pkg;
     out.package.certificate.passed = cert.passed;
@@ -230,8 +247,17 @@ class V2Solver {
     out.duration_s = law.duration_s;
     out.software_limited = law.software_limited;
     samples_ = std::move(samples);
+    const double t_rep0 = elapsed_ms();
     fill_body_metrics(&out);
     finish_report(out);
+    out.report_ms = elapsed_ms() - t_rep0;
+    out.total_ms = elapsed_ms();
+    {
+      std::ostringstream tail;
+      tail << std::fixed << std::setprecision(3)
+           << " report_ms=" << out.report_ms << " total_ms=" << out.total_ms;
+      out.report += tail.str();
+    }
     out.package.quality_report = out.report;
     return out;
   }
@@ -321,6 +347,17 @@ class V2Solver {
       // Prefer ~2 interior spans so mid-chord bow is still checked, without
       // allocating a long-path knot budget for a 5 cm reach.
       spacing = std::max(kKnotSpacingM, path_len / 2.0);
+    } else if (stages_.size() == 1 && path_len > 0.18) {
+      // Medium single-stage (e.g. 24 cm): slightly coarser SQP knots so the
+      // hot path fits 10 ms. Densify stays ≤8 mm and validate_actual_q_of_t
+      // still covers the task tube / CoM / Hermite exec grid — never widened.
+      spacing = std::max(kKnotSpacingM, path_len / 12.0);
+    } else if (stages_.size() >= 2 && path_len <= 0.40) {
+      // Short multi-stage: keep ~10–12 spans total so 2/3-stage P99 can clear
+      // 10 ms without thinning densify/certify coverage.
+      const double target_spans =
+          std::max(8.0, 12.0 - static_cast<double>(stages_.size()));
+      spacing = std::max(kKnotSpacingM, path_len / target_spans);
     }
     int total = 0;
     for (int attempt = 0; attempt < 10; ++attempt) {
@@ -426,6 +463,8 @@ class V2Solver {
     JointCurve best_knots;
     bool have_best = false;
     double best_end_axis = 1e9;
+    seed_ik_ms_ = 0.0;
+    sqp_ms_ = 0.0;
 
     for (SeedKind kind : order) {
       if (deadline_hit()) {
@@ -433,22 +472,23 @@ class V2Solver {
         return false;
       }
       JointCurve trial = *knots;  // already q0-filled layout
+      const double t_seed0 = elapsed_ms();
       seed_curve(&trial, *targets, kind);
       std::string accept_why;
       // First seed that already hard-certifies: light quality polish only,
       // then stop — do not burn the remaining seed budget (§9.3).
       const bool seed_certified = accept_knots(trial, *targets, &accept_why);
+      seed_ik_ms_ += elapsed_ms() - t_seed0;
       if (seed_certified) {
-        JointCurve polished = trial;
-        gauss_newton(&polished, *targets, /*already_certified=*/true);
-        if (!deadline_hit_ && accept_knots(polished, *targets, &accept_why)) {
-          trial = std::move(polished);
-        }
-        // Soft polish must not undo hard geometry; keep the certified seed.
+        // Seed already hard-feasible: do not soft-polish. Extra GN can dent
+        // waist enough for Hermite exec samples to trip pitch while knots
+        // still pass accept_knots — and it burns the 10 ms budget.
         *knots = std::move(trial);
         return true;
       }
+      const double t_sqp0 = elapsed_ms();
       gauss_newton(&trial, *targets, /*already_certified=*/false);
+      sqp_ms_ += elapsed_ms() - t_sqp0;
       if (deadline_hit_) {
         last_why = "deadline";
         continue;
@@ -1477,6 +1517,9 @@ class V2Solver {
           b.stage_id = stages_[s].stage_id;
           b.stop_required = stages_[s].stop_required;
           b.wait_for_external_ack = stages_[s].wait_ack;
+          b.position_tol_m = stages_[s].tol;
+          b.orientation_tol_rad = stages_[s].ori_tol;
+          b.has_orientation = stages_[s].ori;
           boundaries->push_back(b);
         }
       }
@@ -1555,8 +1598,10 @@ class V2Solver {
 
   void finish_report(FastPlanResult& out) {
     out.deadline_hit = deadline_hit_;
-    const PathCostBreakdown cost = evaluate_path_cost(
-        samples_, q_neutral_, policy_, weights_, kin_, left_, guards_);
+    // Do not re-run evaluate_path_cost on densified samples here — that is a
+    // second full FK/feature pass after certification and was dominating the
+    // post-cert tail on Jetson. Soft cost already ran inside GN; report the
+    // certificate metrics instead.
     std::ostringstream os;
     os << std::fixed << std::setprecision(3);
     os << "planner=unified_multistage_v2"
@@ -1570,9 +1615,13 @@ class V2Solver {
        << " body_dz_mm=" << (out.body_dz_m * 1000.0)
        << " body_leg_dx_mm=" << (out.body_minus_leg_dx_m * 1000.0)
        << " iters=" << out.iterations
+       << " seed_ms=" << out.seed_ik_ms
+       << " sqp_ms=" << out.sqp_ms
+       << " densify_ms=" << out.densify_ms
+       << " time_ms=" << out.time_law_ms
        << " opt_ms=" << out.optimize_ms
        << " cert_ms=" << out.certify_ms
-       << " cost=" << cost.total
+       << " cost=cert_metrics"
        << " height_switch=0"
        << " dur_s=" << out.duration_s
        << " sw_limited=" << (out.software_limited ? 1 : 0)
@@ -1648,6 +1697,8 @@ class V2Solver {
   double start_pitch_abs_ = 0.0;
   int iterations_ = 0;
   bool deadline_hit_ = false;
+  double seed_ik_ms_ = 0.0;
+  double sqp_ms_ = 0.0;
   JointCurve samples_;
 };
 

@@ -18,6 +18,11 @@ struct StageBoundary {
   uint32_t stage_id = 0;
   bool stop_required = false;
   bool wait_for_external_ack = false;
+  // Task-stage TCP settle contract (from MotionStage / TaskStage). ACK and
+  // WaitAck settle must use these — never a fixed 10 mm substitute.
+  double position_tol_m = 0.003;
+  double orientation_tol_rad = 0.05;
+  bool has_orientation = false;
 };
 
 struct TimeLawTable {
@@ -110,8 +115,11 @@ AdmitDecision admit_package_start(
 // Sample the *executed* continuous trajectory at execution time t_s (clamped to
 // [0, duration]). Uses Hermite on samples with s(t) from the time law.
 // This is the single source of truth for 50 Hz monitor and 250 Hz send.
+// need_derivatives=false returns q/s/t only (certify Hermite grid uses this;
+// dq/ddq then come from the send-period finite differences).
 bool sample_trajectory_at(const TrajectoryPackage& package, double t_s,
-                          TrajectoryTimeSample* out);
+                          TrajectoryTimeSample* out,
+                          bool need_derivatives = true);
 
 // 250 Hz may extrapolate exec time between 50 Hz publishes. Clamp so it cannot
 // cross an unreleased TIP/STOP StageBoundary before Follower freezes / ACK.

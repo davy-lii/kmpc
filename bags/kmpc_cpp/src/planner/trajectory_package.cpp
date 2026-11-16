@@ -70,6 +70,9 @@ uint64_t package_digest(const TrajectoryPackage& package) {
     hash = mix(hash, b.stage_id);
     hash = mix(hash, b.stop_required ? 1u : 0u);
     hash = mix(hash, b.wait_for_external_ack ? 1u : 0u);
+    hash = mix_double(hash, b.position_tol_m);
+    hash = mix_double(hash, b.orientation_tol_rad);
+    hash = mix(hash, b.has_orientation ? 1u : 0u);
   }
   const TimeLawTable& law = package.time_law;
   hash = mix(hash, static_cast<uint64_t>(law.s.size()));
@@ -220,7 +223,7 @@ AdmitDecision admit_package_start(
 }
 
 bool sample_trajectory_at(const TrajectoryPackage& package, double t_s,
-                          TrajectoryTimeSample* out) {
+                          TrajectoryTimeSample* out, bool need_derivatives) {
   if (out == nullptr) {
     return false;
   }
@@ -270,6 +273,19 @@ bool sample_trajectory_at(const TrajectoryPackage& package, double t_s,
   out->s = s;
   const double prog = s * static_cast<double>(samples.size() - 1);
   out->q = hermite_joint_at(samples, prog);
+
+  if (!need_derivatives) {
+    out->dq.setZero();
+    out->ddq.setZero();
+    if (!out->q.allFinite()) {
+      out->reason = "nonfinite_sample";
+      out->ok = false;
+      return false;
+    }
+    out->ok = true;
+    out->reason = "ok";
+    return true;
+  }
 
   // Time derivatives via central differences on the executed Hermite curve.
   const double h = 1e-3;

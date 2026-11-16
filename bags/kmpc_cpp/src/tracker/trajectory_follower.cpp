@@ -225,7 +225,7 @@ bool TrajectoryFollower::on_stage_ack(uint64_t generation, uint32_t stage_id,
   const char* settle_fail = nullptr;
   bool unused_advance = false;
   if (!evaluate_stage_settle(q_stage, q_meas.allFinite() ? q_meas : q_cmd_,
-                             age_now, &settle_fail, &unused_advance)) {
+                             age_now, b, &settle_fail, &unused_advance)) {
     state_ = FollowerState::Hold;
     has_package_ = false;
     timeline_frozen_ = false;
@@ -381,6 +381,7 @@ void TrajectoryFollower::note_feedback(const Vec18& q_meas, double meas_stamp_s,
 bool TrajectoryFollower::evaluate_stage_settle(const Vec18& q_stage,
                                                const Vec18& q_meas,
                                                double now_s,
+                                               const StageBoundary* boundary,
                                                const char** fail_tag,
                                                bool* advance_stable) const {
   if (advance_stable != nullptr) {
@@ -407,12 +408,36 @@ bool TrajectoryFollower::evaluate_stage_settle(const Vec18& q_stage,
     }
     return false;
   }
+  const double tcp_tol =
+      (boundary != nullptr && boundary->position_tol_m > 0.0 &&
+       std::isfinite(boundary->position_tol_m))
+          ? boundary->position_tol_m
+          : settle_.tcp_abs_max_m;
+  const double ori_tol =
+      (boundary != nullptr && boundary->orientation_tol_rad > 0.0 &&
+       std::isfinite(boundary->orientation_tol_rad))
+          ? boundary->orientation_tol_rad
+          : settle_.ori_abs_max_rad;
   const auto frame = ee_frame(package_.left);
-  const Vec3 p_stage = kin_.fk_pos(q_stage, frame);
-  const Vec3 p_meas = kin_.fk_pos(q_meas, frame);
-  if ((p_meas - p_stage).norm() > settle_.tcp_abs_max_m) {
+  const auto pose_stage = kin_.fk(q_stage, frame);
+  const auto pose_meas = kin_.fk(q_meas, frame);
+  const Vec3 p_stage = pose_stage.col(3).head<3>();
+  const Vec3 p_meas = pose_meas.col(3).head<3>();
+  if ((p_meas - p_stage).norm() > tcp_tol) {
     if (fail_tag != nullptr) {
       *fail_tag = "ack_tcp_drift";
+    }
+    return false;
+  }
+  // Relative tip orientation: stage sample vs live feedback. Always enforced
+  // so grasp ACK cannot pass with a twisted wrist inside the position tube.
+  const double ori_err =
+      ori_error_xyzw(rot_to_quat_xyzw(pose_stage.block<3, 3>(0, 0)),
+                     rot_to_quat_xyzw(pose_meas.block<3, 3>(0, 0)))
+          .norm();
+  if (ori_err > ori_tol) {
+    if (fail_tag != nullptr) {
+      *fail_tag = "ack_ori_drift";
     }
     return false;
   }
@@ -911,7 +936,7 @@ FollowerTick TrajectoryFollower::step(const Vec18& q_meas, double dt,
       const bool cmd_near =
           (q_cmd_ - q_stage).cwiseAbs().maxCoeff() <= settle_.q_abs_max_rad;
       const bool pose_ok =
-          evaluate_stage_settle(q_stage, q_meas, age_now, &settle_fail,
+          evaluate_stage_settle(q_stage, q_meas, age_now, b, &settle_fail,
                                 &advance) &&
           cmd_near;
       if (pose_ok && advance) {

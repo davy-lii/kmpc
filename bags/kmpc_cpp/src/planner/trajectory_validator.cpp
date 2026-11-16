@@ -81,8 +81,8 @@ TrajectoryCertificate validate_path(
     poly.push_back(stage.position);
   }
 
-  // Joint hard box + pitch hard wall. A start already outside the pitch cap
-  // keeps its |start| envelope (recovery); the envelope never grows.
+  // Joint hard box + pitch + CoM + TCP in one pass so FK/CoM cache hits the
+  // same q (coverage unchanged).
   out.hard_box_ok = true;
   out.pitch_ok = true;
   const double cap = policy.torso_pitch_max_rad;
@@ -91,6 +91,15 @@ TrajectoryCertificate validate_path(
   out.min_joint_margin_rad = joint_hard_margin_rad(
       samples.front(), policy.q_min, policy.q_max);
   out.min_pitch_margin_rad = pitch_bound - start_abs;
+  out.com_checked = guards != nullptr;
+  out.com_ok = guards != nullptr;
+  out.com_model = guards == nullptr ? "not_checked" : "xy_work_rectangle";
+  if (guards == nullptr) {
+    note(&fault, "com_not_checked");
+  }
+  out.task_path_ok = true;
+  std::vector<Vec3, Eigen::aligned_allocator<Vec3>> tcps;
+  tcps.reserve(samples.size());
   for (const Vec18& q : samples) {
     const double joint_margin =
         joint_hard_margin_rad(q, policy.q_min, policy.q_max);
@@ -106,31 +115,12 @@ TrajectoryCertificate validate_path(
       out.pitch_ok = false;
       note(&fault, "pitch");
     }
-  }
-
-  out.com_checked = guards != nullptr;
-  if (guards == nullptr) {
-    out.com_ok = false;
-    out.com_model = "not_checked";
-    note(&fault, "com_not_checked");
-  } else {
-    out.com_ok = true;
-    out.com_model = "xy_work_rectangle";
-    for (const Vec18& q : samples) {
+    if (guards != nullptr) {
       if (!q.allFinite() || !guards->com_xy_inside(kin.com(q))) {
         out.com_ok = false;
         note(&fault, "com");
-        break;
       }
     }
-  }
-
-  // Task path: per-sample cross-track to the stage polyline with the owning
-  // stage tolerance (LIN only), stage endpoint coverage, and final endpoint.
-  out.task_path_ok = true;
-  std::vector<Vec3, Eigen::aligned_allocator<Vec3>> tcps;
-  tcps.reserve(samples.size());
-  for (const Vec18& q : samples) {
     tcps.push_back(kin.fk_pos(q, frame));
   }
   for (const Vec3& p : tcps) {
@@ -272,7 +262,10 @@ TrajectoryCertificate validate_actual_q_of_t(
         return true;  // skip duplicate endpoint / stalled clock
       }
       TrajectoryTimeSample samp;
-      if (!sample_trajectory_at(package, t, &samp) || !samp.ok) {
+      // q-only: dq/ddq for exec gates come from the send-period finite
+      // differences below — avoid 3× Hermite probes per tick.
+      if (!sample_trajectory_at(package, t, &samp, /*need_derivatives=*/false) ||
+          !samp.ok) {
         note(&fault, "exec_sample_fail");
         return false;
       }

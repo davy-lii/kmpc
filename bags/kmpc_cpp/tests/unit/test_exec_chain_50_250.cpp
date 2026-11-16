@@ -905,3 +905,115 @@ TEST(P0StageSettle, EarlyAckWhileMovingAndTipDriftReject) {
     EXPECT_GE(wait_at - first_near, 4);
   }
 }
+
+// TIP settle must honor StageBoundary task TCP tol (3 mm), not a fixed 10 mm.
+TEST(P0StageSettle, TipTaskTolRejectsEightMmAndAcceptsStable) {
+  const auto config = kmpc::Config::load(
+      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+  kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
+                       "/Light-duty wheeled robot.urdf");
+  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
+  auto policy = kmpc::policy_from_config(config);
+  kmpc::Vec18 q0 = home_q(config);
+  kmpc::Vec18 q_tip = q0;
+  q_tip[4] += 0.02;
+  kmpc::Vec18 q_lift = q_tip;
+  q_lift[5] += 0.05;
+
+  auto make_pkg = [&](uint64_t gen, double pos_tol_m) {
+    kmpc::TrajectoryPackage pkg = make_hold_package(q0, gen);
+    pkg.samples = {q0, q_tip, q_lift};
+    pkg.time_law.s = {0.0, 0.5, 1.0};
+    pkg.time_law.t_s = {0.0, 0.06, 0.16};
+    pkg.time_law.duration_s = 0.16;
+    kmpc::StageBoundary b;
+    b.sample_index = 1;
+    b.stage_id = 7;
+    b.stop_required = true;
+    b.wait_for_external_ack = true;
+    b.position_tol_m = pos_tol_m;
+    b.orientation_tol_rad = 0.05;
+    b.has_orientation = false;
+    pkg.stage_boundaries.push_back(b);
+    return pkg;
+  };
+
+  const auto frame = kmpc::kEeFrameLeft;
+  const kmpc::Vec3 p_tip = kin.fk_pos(q_tip, frame);
+
+  // Build a live pose ~8 mm off tip TCP while keeping joints inside a loose
+  // q gate so the reject is on the task TCP contract, not joint abs.
+  kmpc::Vec18 q_8mm = q_tip;
+  double tcp_err = 0.0;
+  bool found = false;
+  for (int j = kmpc::kSliceLeft.begin; j < kmpc::kSliceLeft.end && !found;
+       ++j) {
+    for (double dq = 0.002; dq <= 0.12; dq += 0.002) {
+      q_8mm = q_tip;
+      q_8mm[j] += dq;
+      tcp_err = (kin.fk_pos(q_8mm, frame) - p_tip).norm();
+      if (tcp_err >= 0.0075 && tcp_err <= 0.012) {
+        found = true;
+        break;
+      }
+    }
+  }
+  ASSERT_TRUE(found) << "tcp_err=" << tcp_err;
+  ASSERT_GE(tcp_err, 0.0075) << "tcp_err=" << tcp_err;
+  ASSERT_LE(tcp_err, 0.015) << "tcp_err=" << tcp_err;
+
+  // 8 mm drift with 3 mm task tol → reject ACK (NeedReplan).
+  {
+    kmpc::TrajectoryFollower f(kin, &guards, policy);
+    f.set_enable_qp_correction(false);
+    kmpc::StageSettleTol tol = f.settle_tol();
+    tol.q_abs_max_rad = 0.20;  // isolate TCP contract
+    f.set_settle_tol(tol);
+    ASSERT_TRUE(f.adopt(make_pkg(11, 0.003), q0, kmpc::Vec18::Zero(), false));
+    kmpc::FollowerTick tick;
+    double t = 1.0;
+    for (int i = 0; i < 80; ++i) {
+      tick = f.step(q_tip, 0.02, t, t);
+      t += 0.02;
+      if (tick.action == kmpc::FollowerAction::WaitExternalAck) {
+        break;
+      }
+    }
+    ASSERT_EQ(tick.action, kmpc::FollowerAction::WaitExternalAck) << tick.reason;
+    for (int i = 0; i < 4; ++i) {
+      tick = f.step(q_tip, 0.02, t, t);
+      t += 0.02;
+    }
+    std::string why;
+    EXPECT_FALSE(f.on_stage_ack(11, 7, true, q_8mm, &why, t, t));
+    EXPECT_EQ(why, "ack_tcp_drift") << why;
+    EXPECT_EQ(f.state(), kmpc::FollowerState::Hold);
+    EXPECT_EQ(f.last().action, kmpc::FollowerAction::NeedReplan);
+  }
+
+  // Same tip, within 3 mm and multi-tick stable → ACK succeeds.
+  {
+    kmpc::TrajectoryFollower f(kin, &guards, policy);
+    f.set_enable_qp_correction(false);
+    ASSERT_TRUE(f.adopt(make_pkg(12, 0.003), q0, kmpc::Vec18::Zero(), false));
+    kmpc::FollowerTick tick;
+    double t = 2.0;
+    for (int i = 0; i < 80; ++i) {
+      tick = f.step(q_tip, 0.02, t, t);
+      t += 0.02;
+      if (tick.action == kmpc::FollowerAction::WaitExternalAck) {
+        break;
+      }
+    }
+    ASSERT_EQ(tick.action, kmpc::FollowerAction::WaitExternalAck) << tick.reason;
+    for (int i = 0; i < 4; ++i) {
+      tick = f.step(q_tip, 0.02, t, t);
+      t += 0.02;
+    }
+    std::string why;
+    ASSERT_TRUE(f.on_stage_ack(12, 7, true, q_tip, &why, t, t)) << why;
+    EXPECT_EQ(why, "ok");
+    EXPECT_EQ(f.state(), kmpc::FollowerState::Active);
+    EXPECT_FALSE(f.timeline_frozen());
+  }
+}
