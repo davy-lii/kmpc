@@ -47,10 +47,10 @@ constexpr double kDenseSampleM = 0.005;
 // Per-sample joint step stays well under the stream QP trust region (the
 // tracker accepts roughly 4 x per-cycle dq cap, ~0.023 rad on arm joints).
 constexpr double kDenseJointStepRad = 0.02;
-// Ceiling for densified samples. Prefer coarsening densify over hard-failing
-// once the SQP knots already exist — a hard `unified_sample_limit` rejects
-// otherwise adoptable plans.
-constexpr int kMaxDenseSamples = 800;
+// Hard densify memory/compute budget. Demand is computed up-front from TCP +
+// joint spacing; never coarsen mid-span to "fit" a soft cap. Beyond this
+// ceiling report resource_sample_limit (not a fake geometry fault).
+constexpr int kMaxDenseSamplesHard = 2400;
 // Same reach envelope as the retired planner (legacy 400 x 5 mm = 2 m).
 constexpr double kReachLimitM = 2.0;
 constexpr double kWPos = 400.0;
@@ -60,17 +60,15 @@ constexpr int kMaxGnIters = 14;
 // quality iters remain — do not polish soft cost forever (§9.3).
 constexpr int kMaxGnItersAfterCert = 3;
 constexpr int kMaxGnFeasIters = 8;
-// Stream-compatibility endgame: the tracker stream QP switches to a 3 mm
-// euclidean arrival tube (per-axis box 3/sqrt(3) mm) for the last chord
-// fraction (line_qp.cpp kQpTubeEndM / kQpTubeEndFrac, not modifiable here).
-// A stage endpoint that only satisfies the task tolerance (e.g. 3 mm
-// euclidean, up to 2.4 mm per axis inside the QP rows) can still sit outside
-// that arrival box and the stream refuses the line mid-approach. Stage
-// endpoint rows/checks therefore use the tighter of both boxes.
-constexpr double kStreamEndTubeM = 0.003;
-constexpr double kStreamEndBoxM =
-    kStreamEndTubeM / 1.7320508075688772;  // ~1.732 mm per axis
-constexpr double kStreamEndRowM = 0.9 * kStreamEndBoxM;
+// V2 production settles on task euclidean tol via TrajectoryFollower, not the
+// retired line_qp per-axis arrival box. Inscribe a per-axis soft/hard row in
+// the task sphere so QP endpoint rows stay consistent with the validator.
+inline double end_axis_tol_m(double task_tol_m) {
+  return task_tol_m / 1.7320508075688772;
+}
+inline double end_row_tol_m(double task_tol_m) {
+  return 0.9 * end_axis_tol_m(task_tol_m);
+}
 
 uint32_t path_id_of(const JointCurve& samples) {
   uint32_t h = 2166136261u;
@@ -245,7 +243,13 @@ class V2Solver {
     out.package.certificate.first_fault = cert.first_fault;
 
     out.ok = cert.passed;
-    out.reason = cert.passed ? "unified_multistage_v2" : cert.first_fault;
+    if (cert.passed) {
+      out.reason = "unified_multistage_v2";
+    } else if (!cert.fault_detail.empty()) {
+      out.reason = std::string(cert.first_fault) + ":" + cert.fault_detail;
+    } else {
+      out.reason = cert.first_fault;
+    }
     out.tcp_worst_m = std::max(cert.worst_tcp_cross_track_m,
                                cert.worst_tcp_endpoint_m);
     out.min_hard_margin_rad = cert.min_joint_margin_rad;
@@ -610,7 +614,7 @@ class V2Solver {
         }
         const bool tight =
             tgt.stage_endpoint
-                ? (axis <= kStreamEndRowM && oe <= 0.5 * tgt.ori_tol)
+                ? (axis <= end_row_tol_m(tgt.tol) && oe <= 0.5 * tgt.ori_tol)
                 : (err <= 0.5 * min_tol());
         if (tight) {
           continue;
@@ -676,12 +680,11 @@ class V2Solver {
           std::fprintf(stderr, "v2gn accept k=%d pos=%.5g axis=%.5g ori=%.5g\n",
                        k, err, (tgt.p - pe).cwiseAbs().maxCoeff(), oe);
         }
-        // Stream arrival box: per-axis, fixed 3 mm tube, not the task tol.
-        const double axis = (tgt.p - pe).cwiseAbs().maxCoeff();
-        if (axis > kStreamEndBoxM) {
+        // Stage endpoint: task euclidean tol (Follower settle contract).
+        if (err > tgt.tol) {
           std::ostringstream os;
           os << std::fixed << std::setprecision(4)
-             << "unified_ik:end_axis=" << axis;
+             << "unified_ik:end_m=" << err;
           *why = os.str();
           return false;
         }
@@ -887,10 +890,8 @@ class V2Solver {
       pos += e * e;
       worst_err = std::max(worst_err, e);
       if (tgt.stage_endpoint) {
-        // Line search must never trade the stream arrival box against the
-        // soft cost: outside the row box the penalty dwarfs every pull.
-        const double axis = epv.cwiseAbs().maxCoeff();
-        const double viol = std::max(0.0, axis - kStreamEndRowM);
+        // Soft cost must not trade away the task endpoint sphere.
+        const double viol = std::max(0.0, e - tgt.tol);
         pos += 1.0e6 * viol * viol;
       }
       if (tgt.ori && tgt.stage_endpoint) {
@@ -1135,7 +1136,7 @@ class V2Solver {
           const auto& pose = poses[static_cast<std::size_t>(k)];
           const Vec3 p = pose.col(3).head<3>();
           const Mat6x18& Js = jacs[static_cast<std::size_t>(k)];
-          const double tol = std::min(0.8 * tgt.tol, kStreamEndRowM);
+          const double tol = end_row_tol_m(tgt.tol);
           for (int r = 0; r < 3; ++r) {
             for (int i = 0; i < na; ++i) {
               C(row + r, (k - 1) * na + i) =
@@ -1219,6 +1220,7 @@ class V2Solver {
           double ea = 0.0;
           double eo_max = 0.0;
           double eo_tol = 1.0;
+          double end_axis_ratio = 0.0;
           for (std::size_t k = 1; k < ks.size(); ++k) {
             const auto pose = kin_.fk(ks[k], frame_);
             const Vec3 ev = targets[k].p - pose.col(3).head<3>();
@@ -1231,6 +1233,9 @@ class V2Solver {
             }
             if (targets[k].stage_endpoint) {
               ea = std::max(ea, ev.cwiseAbs().maxCoeff());
+              const double row = std::max(end_row_tol_m(targets[k].tol), 1e-9);
+              end_axis_ratio =
+                  std::max(end_axis_ratio, ev.cwiseAbs().maxCoeff() / row);
               if (targets[k].ori) {
                 eo_max = std::max(
                     eo_max,
@@ -1242,8 +1247,9 @@ class V2Solver {
               }
             }
           }
+          (void)ea;
           return std::max(std::max(w / std::max(tol_max_f, 1e-9),
-                                   ea / kStreamEndRowM),
+                                   end_axis_ratio),
                           eo_max / eo_tol);
         };
         const double m_cur = feas_metric(*knots);
@@ -1384,8 +1390,7 @@ class V2Solver {
     return on;
   }
 
-  // Worst stage-endpoint per-axis excess over the stream arrival row box.
-  // Zero means every endpoint satisfies the stream QP arrival tube.
+  // Worst stage-endpoint excess over the task euclidean tol.
   double end_violation(const JointCurve& knots,
                        const std::vector<KnotTarget>& targets) const {
     double viol = 0.0;
@@ -1393,11 +1398,9 @@ class V2Solver {
       if (!targets[k].stage_endpoint) {
         continue;
       }
-      const double axis =
-          (targets[k].p - kin_.fk_pos(knots[k], frame_))
-              .cwiseAbs()
-              .maxCoeff();
-      viol = std::max(viol, axis - kStreamEndRowM);
+      const double err =
+          (targets[k].p - kin_.fk_pos(knots[k], frame_)).norm();
+      viol = std::max(viol, err - targets[k].tol);
     }
     return std::max(0.0, viol);
   }
@@ -1474,9 +1477,9 @@ class V2Solver {
   bool densify(const JointCurve& knots, JointCurve* samples,
                std::vector<StageBoundary>* boundaries, std::string* why) const {
     // Joint-linear interpolation only. The solved knots are the plan; these
-    // samples exist so validation sees what execution would interpolate.
-    // Adaptive densify budget: short spans keep ~5 mm; longer knot spans use
-    // up to 8 mm (never widen the task TCP tube / skip CoM / skip admit).
+    // samples are Hermite control points for execution + certification.
+    // Compute every span's true sample demand first, then allocate — never
+    // coarsen a late span because an early span ate the budget.
     const int K = static_cast<int>(knots.size());
     samples->clear();
     boundaries->clear();
@@ -1484,7 +1487,6 @@ class V2Solver {
       *why = "unified_ik";
       return false;
     }
-    samples->reserve(std::min(kMaxDenseSamples, K * 8));
     boundaries->reserve(stages_.size());
     std::vector<Vec3, Eigen::aligned_allocator<Vec3>> knot_tcp(
         static_cast<std::size_t>(K));
@@ -1492,7 +1494,8 @@ class V2Solver {
       knot_tcp[static_cast<std::size_t>(k)] =
           kin_.fk_pos(knots[static_cast<std::size_t>(k)], frame_);
     }
-    samples->push_back(knots.front());
+    std::vector<int> n_span(static_cast<std::size_t>(K - 1), 1);
+    int demand = 1;  // include start knot
     for (int k = 0; k + 1 < K; ++k) {
       const Vec18& qa = knots[static_cast<std::size_t>(k)];
       const Vec18& qb = knots[static_cast<std::size_t>(k + 1)];
@@ -1501,30 +1504,29 @@ class V2Solver {
            knot_tcp[static_cast<std::size_t>(k)])
               .norm();
       const double joint_step = (qb - qa).cwiseAbs().maxCoeff();
-      double sample_m =
+      const double sample_m =
           tcp_dist <= 2.0 * kDenseSampleM
               ? kDenseSampleM
               : std::clamp(tcp_dist / 3.0, kDenseSampleM, 0.008);
-      double joint_step_cap = kDenseJointStepRad;
-      int n = std::max(
+      const int n = std::max(
           {1, static_cast<int>(std::ceil(tcp_dist / sample_m)),
-           static_cast<int>(std::ceil(joint_step / joint_step_cap))});
-      // Remaining budget including this span's endpoint. Prefer coarsening
-      // densify over rejecting a solved plan with unified_sample_limit.
-      const int remaining =
-          kMaxDenseSamples - static_cast<int>(samples->size());
-      if (remaining <= 1) {
-        *why = "unified_sample_limit";
-        return false;
-      }
-      if (n > remaining - 1) {
-        n = std::max(1, remaining - 1);
-        sample_m = std::max(sample_m, tcp_dist / static_cast<double>(n));
-        joint_step_cap =
-            std::max(joint_step_cap, joint_step / static_cast<double>(n));
-        (void)sample_m;
-        (void)joint_step_cap;
-      }
+           static_cast<int>(std::ceil(joint_step / kDenseJointStepRad))});
+      n_span[static_cast<std::size_t>(k)] = n;
+      demand += n;
+    }
+    if (demand > kMaxDenseSamplesHard) {
+      std::ostringstream os;
+      os << "resource_sample_limit:demand=" << demand
+         << ":allow=" << kMaxDenseSamplesHard << ":phase=densify:knots=" << K;
+      *why = os.str();
+      return false;
+    }
+    samples->reserve(static_cast<std::size_t>(demand));
+    samples->push_back(knots.front());
+    for (int k = 0; k + 1 < K; ++k) {
+      const Vec18& qa = knots[static_cast<std::size_t>(k)];
+      const Vec18& qb = knots[static_cast<std::size_t>(k + 1)];
+      const int n = n_span[static_cast<std::size_t>(k)];
       for (int i = 1; i <= n; ++i) {
         const double t = static_cast<double>(i) / static_cast<double>(n);
         samples->push_back((1.0 - t) * qa + t * qb);
@@ -1542,62 +1544,93 @@ class V2Solver {
           boundaries->push_back(b);
         }
       }
-      if (samples->size() > static_cast<std::size_t>(kMaxDenseSamples)) {
-        *why = "unified_sample_limit";
-        return false;
-      }
     }
-    project_waist_monotone(samples, *boundaries);
+    // PCHIP is C1 across knots; corner rounding can leave the LIN tube even
+    // when densified chord samples sit inside. Insert joint-linear midpoints
+    // only where Hermite mid TCP exceeds the stage tol (bounded passes), then
+    // the full package is re-certified by validate_actual_q_of_t.
+    if (!refine_hermite_tcp(samples, boundaries, why)) {
+      return false;
+    }
     return samples->size() >= 2;
   }
 
-  // Per-stage monotone projection on waist J1/J2/J3 (and the pitch sum via
-  // the same-axis pass): the solved boundary knots stay authoritative, only
-  // interior samples move. The GN solve leaves micro dents (~1e-5 rad) on
-  // top of an otherwise monotone waist profile; the committed-sign stream
-  // envelope is tighter than those dents and would refuse the line. This is
-  // NOT a re-posing pass: endpoints are pinned, adjustments are bounded by
-  // the dent depth, and validation re-certifies the projected samples (TCP
-  // cross-track, stage targets, guards) before anything ships.
-  void project_waist_monotone(JointCurve* samples,
-                              const std::vector<StageBoundary>& boundaries)
-      const {
-    if (task_.waist_locked || samples->size() < 3) {
-      return;
+  bool refine_hermite_tcp(JointCurve* samples,
+                          std::vector<StageBoundary>* boundaries,
+                          std::string* why) const {
+    if (samples->size() < 2 || stages_.empty()) {
+      return true;
     }
-    std::size_t lo = 0;
-    std::size_t hi = samples->size() - 1;
-    std::size_t next_b = 0;
-    const std::size_t nseg =
-        boundaries.empty() ? 1 : boundaries.size() + 1;
-    for (std::size_t seg = 0; seg < nseg; ++seg) {
-      if (next_b < boundaries.size()) {
-        hi = boundaries[next_b].sample_index;
-        ++next_b;
-      } else {
-        hi = samples->size() - 1;
-      }
-      if (hi > lo + 1 && hi < samples->size()) {
-        for (int j = 0; j < 3; ++j) {
-          monotone_axis_pass(samples, lo, hi, j);
+    auto stage_of = [&](std::size_t sample_i) -> std::size_t {
+      for (std::size_t s = 0; s < boundaries->size() && s < stages_.size();
+           ++s) {
+        if (sample_i <= (*boundaries)[s].sample_index) {
+          return s;
         }
       }
-      lo = hi;
+      return stages_.size() - 1;
+    };
+    auto seg_dist = [](const Vec3& p, const Vec3& a, const Vec3& b) {
+      const Vec3 ab = b - a;
+      const double ab2 = ab.squaredNorm();
+      if (ab2 < 1e-16) {
+        return (p - b).norm();
+      }
+      const double t = std::clamp((p - a).dot(ab) / ab2, 0.0, 1.0);
+      return (p - (a + t * ab)).norm();
+    };
+    // Peak TCP bow from corner rounding is often off-midpoint; probe quarters.
+    constexpr double kProbeU[] = {0.25, 0.5, 0.75};
+    constexpr int kMaxRefinePasses = 6;
+    for (int pass = 0; pass < kMaxRefinePasses; ++pass) {
+      std::vector<std::size_t> insert_after;
+      insert_after.reserve(samples->size());
+      for (std::size_t i = 0; i + 1 < samples->size(); ++i) {
+        const std::size_t seg = stage_of(i);
+        if (stages_[seg].geo != TaskGeometry::Lin) {
+          continue;
+        }
+        // Tighten vs task tol so the denser 250 Hz certify grid still fits.
+        const double refine_tol = 0.95 * stages_[seg].tol;
+        bool bad = false;
+        for (double u : kProbeU) {
+          const Vec18 q =
+              hermite_joint_at(*samples, static_cast<double>(i) + u);
+          const Vec3 p = kin_.fk_pos(q, frame_);
+          if (seg_dist(p, stages_[seg].a, stages_[seg].b) > refine_tol) {
+            bad = true;
+            break;
+          }
+        }
+        if (bad) {
+          insert_after.push_back(i);
+        }
+      }
+      if (insert_after.empty()) {
+        return true;
+      }
+      for (auto it = insert_after.rbegin(); it != insert_after.rend(); ++it) {
+        const std::size_t i = *it;
+        if (static_cast<int>(samples->size()) >= kMaxDenseSamplesHard) {
+          std::ostringstream os;
+          os << "resource_sample_limit:demand=" << (samples->size() + 1)
+             << ":allow=" << kMaxDenseSamplesHard
+             << ":phase=hermite_refine:knots=" << samples->size();
+          *why = os.str();
+          return false;
+        }
+        const Vec18 mid =
+            0.5 * ((*samples)[i] + (*samples)[i + 1]);
+        samples->insert(samples->begin() + static_cast<std::ptrdiff_t>(i + 1),
+                        mid);
+        for (StageBoundary& b : *boundaries) {
+          if (b.sample_index > i) {
+            ++b.sample_index;
+          }
+        }
+      }
     }
-  }
-
-  static void monotone_axis_pass(JointCurve* samples, std::size_t lo,
-                                 std::size_t hi, int j) {
-    const double v0 = (*samples)[lo][j];
-    const double v1 = (*samples)[hi][j];
-    const double cap_lo = std::min(v0, v1);
-    const double cap_hi = std::max(v0, v1);
-    double run = v0;
-    for (std::size_t i = lo + 1; i < hi; ++i) {
-      double v = std::clamp((*samples)[i][j], cap_lo, cap_hi);
-      run = v1 >= v0 ? std::max(run, v) : std::min(run, v);
-      (*samples)[i][j] = run;
-    }
+    return true;
   }
 
   void fill_body_metrics(FastPlanResult* out) const {

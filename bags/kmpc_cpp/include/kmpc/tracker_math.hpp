@@ -60,8 +60,19 @@ inline bool pitch_abs_ok(double pitch_abs, double hard, double start_abs,
                          (for_gate ? 0.0 : 1e-9);
 }
 
-// Cubic Hermite on joint knots (C1). Tangents are centered finite differences;
-// endpoints use one-sided chords. Progress is continuous in [0, n-1].
+// Monotone cubic Hermite (PCHIP-style) on joint knots. Unit knot spacing.
+// Same-sign slopes use a harmonic mean; sign changes or zero steps force a
+// zero tangent so monotone intervals do not overshoot and flat intervals do
+// not invent motion. One tangent per knot → C1 across nodes. No per-sample
+// hard clamp: speed/accel/jerk stay with the time law + SafetySupervisor.
+inline double pchip_slope(double d0, double d1) {
+  if (d0 == 0.0 || d1 == 0.0 || (d0 > 0.0) != (d1 > 0.0)) {
+    return 0.0;
+  }
+  // Harmonic mean of same-sign one-sided differences (unit h).
+  return 2.0 / (1.0 / d0 + 1.0 / d1);
+}
+
 template <class Samples>
 inline Vec18 hermite_joint_at(const Samples& samples, double prog) {
   const int n = static_cast<int>(samples.size());
@@ -87,13 +98,21 @@ inline Vec18 hermite_joint_at(const Samples& samples, double prog) {
     return samples[static_cast<std::size_t>(k)];
   };
   auto tangent = [&](int k) -> Vec18 {
-    if (k <= 0) {
-      return at(1) - at(0);
+    Vec18 m = Vec18::Zero();
+    for (int j = 0; j < kNDof; ++j) {
+      if (k <= 0) {
+        m[j] = at(1)[j] - at(0)[j];
+        continue;
+      }
+      if (k >= n - 1) {
+        m[j] = at(n - 1)[j] - at(n - 2)[j];
+        continue;
+      }
+      const double d0 = at(k)[j] - at(k - 1)[j];
+      const double d1 = at(k + 1)[j] - at(k)[j];
+      m[j] = pchip_slope(d0, d1);
     }
-    if (k >= n - 1) {
-      return at(n - 1) - at(n - 2);
-    }
-    return 0.5 * (at(k + 1) - at(k - 1));
+    return m;
   };
   const Vec18& p0 = at(i);
   const Vec18& p1 = at(i + 1);
@@ -101,19 +120,8 @@ inline Vec18 hermite_joint_at(const Samples& samples, double prog) {
   const Vec18 m1 = tangent(i + 1);
   const double u2 = u * u;
   const double u3 = u2 * u;
-  Vec18 q = (2.0 * u3 - 3.0 * u2 + 1.0) * p0 + (u3 - 2.0 * u2 + u) * m0 +
-            (-2.0 * u3 + 3.0 * u2) * p1 + (u3 - u2) * m1;
-  // Cubic Hermite can overshoot past the segment endpoints. When knots sit on
-  // a hard-box face (common near J1 58°), that overshoot trips exec_hard_box
-  // even though every densified sample is inside. Clamp to the segment's
-  // per-axis hull so execution stays inside any convex joint box that
-  // contains the knots — does not widen q_min/q_max.
-  for (int j = 0; j < kNDof; ++j) {
-    const double lo = std::min(p0[j], p1[j]);
-    const double hi = std::max(p0[j], p1[j]);
-    q[j] = std::clamp(q[j], lo, hi);
-  }
-  return q;
+  return (2.0 * u3 - 3.0 * u2 + 1.0) * p0 + (u3 - 2.0 * u2 + u) * m0 +
+         (-2.0 * u3 + 3.0 * u2) * p1 + (u3 - u2) * m1;
 }
 // Per-axis chord straighten: never keep a pass that makes any waist pitch
 // axis reverse more than 0.05° and worse than before by 0.02°.

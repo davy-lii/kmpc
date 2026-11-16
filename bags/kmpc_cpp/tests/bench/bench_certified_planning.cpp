@@ -1,7 +1,8 @@
 // Certified planning latency bench. Label host by actual machine arch so Jetson
 // aarch64 runs are not mis-tagged as x86_control_only.
-// Perf bench: default --deadline_ms=10 is a SOFT statistic (certified_before_10ms).
-// Production Worker hard budget is kPlannerBudgetMs (1s), not 10ms reject.
+// Default hard budget is production kPlannerBudgetMs (1s). The 10 ms figure is
+// only a soft statistic (certified_before_10ms_*). Use --hard_deadline_ms to
+// intentionally hard-abort the optimizer early for isolated experiments.
 
 #include <algorithm>
 #include <chrono>
@@ -80,7 +81,11 @@ struct Case {
 int main(int argc, char** argv) {
   int warmup = 3;
   int reps = 60;
-  double deadline_ms = 10.0;
+  // Soft 10 ms statistic only — never the default optimizer abort.
+  double soft_stat_ms = kmpc::kPlannerPerfStatMs;
+  // Production hard budget unless --hard_deadline_ms is set explicitly.
+  double hard_deadline_ms = kmpc::kPlannerBudgetMs;
+  bool hard_deadline_explicit = false;
   for (int i = 1; i + 1 < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--warmup") {
@@ -88,9 +93,16 @@ int main(int argc, char** argv) {
     } else if (a == "--reps") {
       reps = std::max(1, std::atoi(argv[++i]));
     } else if (a == "--deadline_ms") {
-      deadline_ms = std::atof(argv[++i]);
+      // Backward-compatible alias for the soft 10 ms statistic only.
+      soft_stat_ms = std::atof(argv[++i]);
+    } else if (a == "--hard_deadline_ms") {
+      hard_deadline_ms = std::atof(argv[++i]);
+      hard_deadline_explicit = true;
+    } else if (a == "--soft_stat_ms") {
+      soft_stat_ms = std::atof(argv[++i]);
     }
   }
+  (void)hard_deadline_explicit;
 
   const auto config = kmpc::Config::load(
       std::string(KMPC_CONFIG_DIR) + "/joint_limits.yaml",
@@ -134,9 +146,11 @@ int main(int argc, char** argv) {
     std::cout << " (NOT jetson proof)";
   }
   std::cout << " warmup=" << warmup << " reps=" << reps
-            << " deadline_ms=" << deadline_ms
+            << " hard_deadline_ms=" << hard_deadline_ms
+            << " soft_stat_ms=" << soft_stat_ms
             << " weights=" << (weight_why.empty() ? "production_yaml" : weight_why)
             << "\n";
+  std::cout << "note=synthetic_reaches_are_not_field_success_proxy\n";
 
   const Case cases[] = {
       {"reach_5cm_1stage", 1, 0.05},
@@ -146,7 +160,7 @@ int main(int argc, char** argv) {
       {"reach_15cm_3stage", 3, 0.15},
   };
 
-  int certified_before_10 = 0;
+  int certified_before_soft = 0;
   int total_ok = 0;
   int total_deadline_reject = 0;
   int total_reps_all = 0;
@@ -166,7 +180,7 @@ int main(int argc, char** argv) {
 
     PhaseAcc acc;
     int ok_n = 0;
-    int under_10 = 0;
+    int under_soft = 0;
     int deadline_reject = 0;
     int cert_fail = 0;
 
@@ -180,7 +194,7 @@ int main(int argc, char** argv) {
 
       const auto t0 = std::chrono::steady_clock::now();
       const auto res =
-          optimizer.plan(task, state, policy, weights, deadline_ms);
+          optimizer.plan(task, state, policy, weights, hard_deadline_ms);
       const double ms = std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - t0)
                             .count();
@@ -198,8 +212,7 @@ int main(int argc, char** argv) {
 
       const bool deadline_rej =
           res.deadline_hit || res.reason == "deadline" ||
-          (!res.ok && ms > deadline_ms && res.reason.find("deadline") !=
-                                              std::string::npos);
+          (!res.ok && res.reason.find("deadline") != std::string::npos);
       if (deadline_rej) {
         ++deadline_reject;
         ++total_deadline_reject;
@@ -207,19 +220,24 @@ int main(int argc, char** argv) {
       if (res.ok) {
         ++ok_n;
         ++total_ok;
-        if (ms <= 10.0) {
-          ++under_10;
-          ++certified_before_10;
+        if (ms <= soft_stat_ms) {
+          ++under_soft;
+          ++certified_before_soft;
         }
       } else if (!deadline_rej) {
         ++cert_fail;
       }
     }
 
-    const double rate =
+    const double success_rate =
         acc.total.empty()
             ? 0.0
-            : 100.0 * static_cast<double>(under_10) /
+            : 100.0 * static_cast<double>(ok_n) /
+                  static_cast<double>(acc.total.size());
+    const double soft_rate =
+        acc.total.empty()
+            ? 0.0
+            : 100.0 * static_cast<double>(under_soft) /
                   static_cast<double>(acc.total.size());
     const double deadline_rate =
         acc.total.empty()
@@ -228,11 +246,13 @@ int main(int argc, char** argv) {
                   static_cast<double>(acc.total.size());
     std::cout << "case=" << c.name << " stages=" << c.stages
               << " reach_m=" << c.reach_m << " ok=" << ok_n << "/" << reps
+              << " success_rate=" << success_rate << "%"
               << " planning_cpu_ms_p50=" << percentile(acc.total, 0.50)
               << " p95=" << percentile(acc.total, 0.95)
               << " p99=" << percentile(acc.total, 0.99)
-              << " certified_before_10ms_rate=" << rate << "%"
-              << " deadline_reject_rate=" << deadline_rate << "%"
+              << " certified_before_" << soft_stat_ms
+              << "ms_rate=" << soft_rate << "%"
+              << " budget_timeout_rate=" << deadline_rate << "%"
               << " cert_fail=" << cert_fail << "\n";
     std::cout << "  phases_p50 seed=" << percentile(acc.seed, 0.50)
               << " sqp=" << percentile(acc.sqp, 0.50)
@@ -254,17 +274,23 @@ int main(int argc, char** argv) {
               << " report=" << percentile(acc.report, 0.99) << "\n";
   }
 
-  const double overall =
+  const double overall_success =
+      total_reps_all == 0
+          ? 0.0
+          : 100.0 * static_cast<double>(total_ok) /
+                static_cast<double>(total_reps_all);
+  const double overall_soft =
       total_ok == 0 ? 0.0
-                    : 100.0 * static_cast<double>(certified_before_10) /
+                    : 100.0 * static_cast<double>(certified_before_soft) /
                           static_cast<double>(total_ok);
   const double deadline_overall =
       total_reps_all == 0
           ? 0.0
           : 100.0 * static_cast<double>(total_deadline_reject) /
                 static_cast<double>(total_reps_all);
-  std::cout << "overall_certified_before_10ms_rate=" << overall << "% ("
-            << host_tag << ") overall_deadline_reject_rate="
-            << deadline_overall << "%\n";
+  std::cout << "overall_success_rate=" << overall_success << "% ("
+            << host_tag << ") overall_certified_before_" << soft_stat_ms
+            << "ms_rate=" << overall_soft
+            << "% overall_budget_timeout_rate=" << deadline_overall << "%\n";
   return 0;
 }

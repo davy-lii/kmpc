@@ -602,36 +602,19 @@ TEST(LinePath, HermiteCornerVerifiedAndTubeFallback) {
       << bad.reason;
 }
 
-TEST(LinePath, HermiteEndpointsCloseMidBulgeIsCaught) {
-  // Endpoints nearly identical; Hermite mid bulges off the chord.
+TEST(LinePath, HermitePchipFlatIntervalNoPhantomMotion) {
+  // Equal endpoints + PCHIP zero tangents → no invented mid motion.
   kmpc::JointPath samples(3);
   samples[0].setZero();
   samples[1].setZero();
   samples[2].setZero();
   samples[2][4] = 0.30;
   ASSERT_GE(kmpc::measure_path_corners(samples).max_tangent_jump_rad, 1e-4);
-  EXPECT_GT(std::abs(kmpc::hermite_joint_at(samples, 0.5)[4]), 1e-3);
-
-  auto reject_bulge = [](const kmpc::Vec18& q, std::string* why) {
-    if (std::abs(q[4]) > 0.01) {
-      if (why) {
-        *why = "tube";
-      }
-      return false;
-    }
-    return true;
-  };
-  const auto bad = kmpc::try_verified_hermite_smooth(samples, reject_bulge);
-  EXPECT_TRUE(bad.hermite_candidate);
-  EXPECT_FALSE(bad.applied) << bad.reason;
-  EXPECT_FALSE(bad.hermite_verified) << bad.reason;
-  EXPECT_NE(std::string(bad.reason).find("tube"), std::string::npos)
-      << bad.reason;
+  EXPECT_NEAR(kmpc::hermite_joint_at(samples, 0.5)[4], 0.0, 1e-12);
 }
 
-TEST(LinePath, HermiteAntisymmetricQuarterBulgeIsCaught) {
-  // Knots [-0.2, 0, 0, 0.2]: segment [1,2] has endpoints=0 and mid=0, but
-  // quarters ≈ ±0.009375. Mid-only early-exit would miss this.
+TEST(LinePath, HermitePchipFlatInteriorStaysFlat) {
+  // Knots [-0.2, 0, 0, 0.2]: interior flat segment stays identically zero.
   kmpc::JointPath samples(4);
   for (auto& s : samples) {
     s.setZero();
@@ -641,25 +624,9 @@ TEST(LinePath, HermiteAntisymmetricQuarterBulgeIsCaught) {
   samples[2][4] = 0.0;
   samples[3][4] = 0.2;
   ASSERT_GE(kmpc::measure_path_corners(samples).max_tangent_jump_rad, 1e-4);
-  EXPECT_NEAR(kmpc::hermite_joint_at(samples, 1.5)[4], 0.0, 1e-9);
-  EXPECT_NEAR(kmpc::hermite_joint_at(samples, 1.25)[4], 0.009375, 1e-6);
-  EXPECT_NEAR(kmpc::hermite_joint_at(samples, 1.75)[4], -0.009375, 1e-6);
-
-  auto reject_quarter = [](const kmpc::Vec18& q, std::string* why) {
-    if (std::abs(q[4]) > 0.005) {
-      if (why) {
-        *why = "tube";
-      }
-      return false;
-    }
-    return true;
-  };
-  const auto bad = kmpc::try_verified_hermite_smooth(samples, reject_quarter);
-  EXPECT_TRUE(bad.hermite_candidate);
-  EXPECT_FALSE(bad.applied) << bad.reason;
-  EXPECT_FALSE(bad.hermite_verified) << bad.reason;
-  EXPECT_NE(std::string(bad.reason).find("tube"), std::string::npos)
-      << bad.reason;
+  EXPECT_NEAR(kmpc::hermite_joint_at(samples, 1.5)[4], 0.0, 1e-12);
+  EXPECT_NEAR(kmpc::hermite_joint_at(samples, 1.25)[4], 0.0, 1e-12);
+  EXPECT_NEAR(kmpc::hermite_joint_at(samples, 1.75)[4], 0.0, 1e-12);
 }
 
 namespace {
@@ -939,7 +906,7 @@ TEST(LinePath, ArtificialHermiteCornerAdoptAndVerify) {
   EXPECT_EQ(main_tr.line_samples().size(), cornered.size());
 }
 
-TEST(LinePath, HermiteRealFkTubeRejectKeepsLinear) {
+TEST(LinePath, HermitePchipIdenticalKnotsStayOnTube) {
   const auto cfg_all = kmpc::Config::load(
       cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
@@ -958,11 +925,12 @@ TEST(LinePath, HermiteRealFkTubeRejectKeepsLinear) {
   ASSERT_TRUE(plan.on) << plan.reason;
   ASSERT_GE(plan.samples.size(), 3u);
 
-  // Endpoints-close / large outgoing tangent: knots stay near the tube, but
-  // Hermite mid bulges in joint space and FK leaves the Cartesian tube.
+  // Identical first two knots: classic central Hermite invented a mid bulge
+  // that left the FK tube. PCHIP sets a zero tangent on a flat interval and
+  // must stay on the Cartesian tube (no phantom motion).
   kmpc::JointPath knots(3);
   knots[0] = plan.samples.front();
-  knots[1] = plan.samples.front();  // identical → end_span≈0 on segment 0
+  knots[1] = plan.samples.front();
   knots[2] = plan.samples.back();
   const kmpc::Vec3 start_xyz = kin.fk_pos(knots[0], plan.frame);
   ASSERT_TRUE(on_cart_tube(kin, plan.frame, start_xyz, plan.target, knots[0]));
@@ -970,22 +938,9 @@ TEST(LinePath, HermiteRealFkTubeRejectKeepsLinear) {
   ASSERT_TRUE(on_cart_tube(kin, plan.frame, start_xyz, plan.target, knots[2]));
   ASSERT_GE(kmpc::measure_path_corners(knots).max_tangent_jump_rad, 1e-4);
   const auto mid = kmpc::hermite_joint_at(knots, 0.5);
-  EXPECT_FALSE(on_cart_tube(kin, plan.frame, start_xyz, plan.target, mid))
-      << "fixture must make Hermite mid leave the FK tube";
-
-  const double start_pitch_abs =
-      std::abs(knots.front().head<3>().sum());
-  auto check_q = make_prod_hermite_check(
-      kin, worker.guards(), cfg_all.limits, plan.frame, start_xyz, plan.target,
-      cfg_all.params.torso_pitch_max_deg * kmpc::kPi / 180.0, start_pitch_abs);
-  const auto smooth = kmpc::try_verified_hermite_smooth(knots, check_q);
-  EXPECT_TRUE(smooth.hermite_candidate);
-  EXPECT_FALSE(smooth.applied) << smooth.reason;
-  EXPECT_FALSE(smooth.hermite_verified) << smooth.reason;
-  EXPECT_NE(std::string(smooth.reason).find("tube"), std::string::npos)
-      << smooth.reason;
-  // Production policy on verify failure: keep linear (do not promote).
-  EXPECT_FALSE(smooth.applied);
+  EXPECT_TRUE(on_cart_tube(kin, plan.frame, start_xyz, plan.target, mid))
+      << "PCHIP must not invent a mid bulge that leaves the FK tube";
+  EXPECT_LE((mid - knots[0]).cwiseAbs().maxCoeff(), 1e-12);
 }
 
 TEST(LinePath, StaleGenerationPlanMustNotAdopt) {
