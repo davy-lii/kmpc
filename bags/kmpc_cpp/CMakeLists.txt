@@ -187,6 +187,7 @@ if(BUILD_TESTING)
     "${CMAKE_CURRENT_SOURCE_DIR}/ros2")
   kmpc_add_test(test_alarm_resume tests/unit/test_alarm_resume.cpp)
   target_include_directories(test_alarm_resume PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/ros2")
+  kmpc_add_test(test_v2_submit_gate tests/unit/test_v2_submit_gate.cpp)
   add_executable(replay_recent tests/replay/replay_recent.cpp)
   target_link_libraries(replay_recent PRIVATE kmpc_core)
   add_executable(probe_field_line tests/replay/probe_field_line.cpp)
@@ -244,6 +245,21 @@ if(KMPC_BUILD_ROS2)
   endif()
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/real/launch")
     install(DIRECTORY real/launch/ DESTINATION share/${PROJECT_NAME}/launch)
+  endif()
+  if(BUILD_TESTING)
+    add_executable(test_kmpc_node_construct
+      tests/unit/test_kmpc_node_construct.cpp)
+    target_include_directories(test_kmpc_node_construct PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/ros2"
+      "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    # ament_target_dependencies uses keyword signature; keep link plain.
+    # Construct/param audit needs rclcpp only (fixed topics are not params).
+    ament_target_dependencies(test_kmpc_node_construct rclcpp)
+    target_link_libraries(test_kmpc_node_construct
+      kmpc_core GTest::gtest GTest::gtest_main)
+    target_compile_options(test_kmpc_node_construct PRIVATE -Wall -Wextra -Werror)
+    gtest_discover_tests(test_kmpc_node_construct
+      TEST_PREFIX "test_kmpc_node_construct.")
   endif()
   ament_package()
 endif()
