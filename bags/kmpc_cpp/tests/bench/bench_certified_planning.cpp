@@ -1,6 +1,7 @@
 // Certified planning latency bench. Label host by actual machine arch so Jetson
 // aarch64 runs are not mis-tagged as x86_control_only.
-// Uses production quality weights, sealed task identity, and a 10 ms deadline.
+// Perf bench: default --deadline_ms=10 is a SOFT statistic (certified_before_10ms).
+// Production Worker hard budget is kPlannerBudgetMs (1s), not 10ms reject.
 
 #include <algorithm>
 #include <chrono>

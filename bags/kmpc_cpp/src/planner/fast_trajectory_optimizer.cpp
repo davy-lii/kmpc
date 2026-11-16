@@ -38,6 +38,8 @@ namespace {
 // K=32 keeps ~12–25 mm spans on those reaches without relaxing the tube.
 // Short reaches (≤6 cm) intentionally use fewer knots — never coarsen the
 // TCP tube / hard box / pitch / CoM / admit checks to buy latency.
+// Production budget is 1 s (not 10 ms): do NOT thin multi-stage knot spacing
+// for P99 latency; success/certify first, then tune wall time from logs.
 constexpr int kMaxKnots = 32;
 constexpr double kKnotSpacingM = 0.012;
 constexpr double kShortPathM = 0.06;
@@ -45,8 +47,11 @@ constexpr double kDenseSampleM = 0.005;
 // Per-sample joint step stays well under the stream QP trust region (the
 // tracker accepts roughly 4 x per-cycle dq cap, ~0.023 rad on arm joints).
 constexpr double kDenseJointStepRad = 0.02;
-constexpr int kMaxDenseSamples = 400;
-// Same reach envelope as the retired planner (400 samples x 5 mm).
+// Ceiling for densified samples. Prefer coarsening densify over hard-failing
+// once the SQP knots already exist — a hard `unified_sample_limit` rejects
+// otherwise adoptable plans.
+constexpr int kMaxDenseSamples = 800;
+// Same reach envelope as the retired planner (legacy 400 x 5 mm = 2 m).
 constexpr double kReachLimitM = 2.0;
 constexpr double kWPos = 400.0;
 constexpr double kWOri = 40.0;
@@ -247,15 +252,20 @@ class V2Solver {
     out.duration_s = law.duration_s;
     out.software_limited = law.software_limited;
     samples_ = std::move(samples);
-    const double t_rep0 = elapsed_ms();
     fill_body_metrics(&out);
+    // total_ms before finish_report so over_10ms soft metric is accurate.
+    out.total_ms = elapsed_ms();
+    const double t_rep0 = elapsed_ms();
     finish_report(out);
     out.report_ms = elapsed_ms() - t_rep0;
     out.total_ms = elapsed_ms();
     {
       std::ostringstream tail;
       tail << std::fixed << std::setprecision(3)
-           << " report_ms=" << out.report_ms << " total_ms=" << out.total_ms;
+           << " report_ms=" << out.report_ms
+           << " total_ms=" << out.total_ms
+           << " over_10ms="
+           << ((out.total_ms > kPlannerPerfStatMs) ? 1 : 0);
       out.report += tail.str();
     }
     out.package.quality_report = out.report;
@@ -347,18 +357,10 @@ class V2Solver {
       // Prefer ~2 interior spans so mid-chord bow is still checked, without
       // allocating a long-path knot budget for a 5 cm reach.
       spacing = std::max(kKnotSpacingM, path_len / 2.0);
-    } else if (stages_.size() == 1 && path_len > 0.18) {
-      // Medium single-stage (e.g. 24 cm): slightly coarser SQP knots so the
-      // hot path fits 10 ms. Densify stays ≤8 mm and validate_actual_q_of_t
-      // still covers the task tube / CoM / Hermite exec grid — never widened.
-      spacing = std::max(kKnotSpacingM, path_len / 12.0);
-    } else if (stages_.size() >= 2 && path_len <= 0.40) {
-      // Short multi-stage: keep ~10–12 spans total so 2/3-stage P99 can clear
-      // 10 ms without thinning densify/certify coverage.
-      const double target_spans =
-          std::max(8.0, 12.0 - static_cast<double>(stages_.size()));
-      spacing = std::max(kKnotSpacingM, path_len / target_spans);
     }
+    // Intentionally NO medium/multi-stage coarsening for former 10 ms P99:
+    // those ~50–60 mm spans made densify hit sample caps and bow out of the
+    // 3 mm LIN tube (r51 live: unified_sample_limit / tcp_cross_track).
     int total = 0;
     for (int attempt = 0; attempt < 10; ++attempt) {
       spans.clear();
@@ -1499,13 +1501,30 @@ class V2Solver {
            knot_tcp[static_cast<std::size_t>(k)])
               .norm();
       const double joint_step = (qb - qa).cwiseAbs().maxCoeff();
-      const double sample_m =
+      double sample_m =
           tcp_dist <= 2.0 * kDenseSampleM
               ? kDenseSampleM
               : std::clamp(tcp_dist / 3.0, kDenseSampleM, 0.008);
-      const int n = std::max(
+      double joint_step_cap = kDenseJointStepRad;
+      int n = std::max(
           {1, static_cast<int>(std::ceil(tcp_dist / sample_m)),
-           static_cast<int>(std::ceil(joint_step / kDenseJointStepRad))});
+           static_cast<int>(std::ceil(joint_step / joint_step_cap))});
+      // Remaining budget including this span's endpoint. Prefer coarsening
+      // densify over rejecting a solved plan with unified_sample_limit.
+      const int remaining =
+          kMaxDenseSamples - static_cast<int>(samples->size());
+      if (remaining <= 1) {
+        *why = "unified_sample_limit";
+        return false;
+      }
+      if (n > remaining - 1) {
+        n = std::max(1, remaining - 1);
+        sample_m = std::max(sample_m, tcp_dist / static_cast<double>(n));
+        joint_step_cap =
+            std::max(joint_step_cap, joint_step / static_cast<double>(n));
+        (void)sample_m;
+        (void)joint_step_cap;
+      }
       for (int i = 1; i <= n; ++i) {
         const double t = static_cast<double>(i) / static_cast<double>(n);
         samples->push_back((1.0 - t) * qa + t * qb);
@@ -1621,6 +1640,9 @@ class V2Solver {
        << " time_ms=" << out.time_law_ms
        << " opt_ms=" << out.optimize_ms
        << " cert_ms=" << out.certify_ms
+       << " total_ms=" << out.total_ms
+       << " over_10ms="
+       << ((out.total_ms > kPlannerPerfStatMs) ? 1 : 0)
        << " cost=cert_metrics"
        << " height_switch=0"
        << " dur_s=" << out.duration_s

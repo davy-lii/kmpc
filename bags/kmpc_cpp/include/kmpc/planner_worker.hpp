@@ -28,7 +28,7 @@ struct PlannerJob {
   RobotState state;
   MotionConstraintPolicy policy;
   TrajectoryCostWeights weights;
-  double deadline_ms = 10.0;
+  double deadline_ms = kPlannerBudgetMs;
   uint64_t seq = 0;
 };
 

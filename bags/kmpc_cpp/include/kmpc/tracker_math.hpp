@@ -101,8 +101,19 @@ inline Vec18 hermite_joint_at(const Samples& samples, double prog) {
   const Vec18 m1 = tangent(i + 1);
   const double u2 = u * u;
   const double u3 = u2 * u;
-  return (2.0 * u3 - 3.0 * u2 + 1.0) * p0 + (u3 - 2.0 * u2 + u) * m0 +
-         (-2.0 * u3 + 3.0 * u2) * p1 + (u3 - u2) * m1;
+  Vec18 q = (2.0 * u3 - 3.0 * u2 + 1.0) * p0 + (u3 - 2.0 * u2 + u) * m0 +
+            (-2.0 * u3 + 3.0 * u2) * p1 + (u3 - u2) * m1;
+  // Cubic Hermite can overshoot past the segment endpoints. When knots sit on
+  // a hard-box face (common near J1 58°), that overshoot trips exec_hard_box
+  // even though every densified sample is inside. Clamp to the segment's
+  // per-axis hull so execution stays inside any convex joint box that
+  // contains the knots — does not widen q_min/q_max.
+  for (int j = 0; j < kNDof; ++j) {
+    const double lo = std::min(p0[j], p1[j]);
+    const double hi = std::max(p0[j], p1[j]);
+    q[j] = std::clamp(q[j], lo, hi);
+  }
+  return q;
 }
 // Per-axis chord straighten: never keep a pass that makes any waist pitch
 // axis reverse more than 0.05° and worse than before by 0.02°.

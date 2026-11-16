@@ -18,6 +18,11 @@
 
 namespace kmpc {
 
+// Production async plan wall budget (hard abort). 10 ms is NOT a reject gate.
+inline constexpr double kPlannerBudgetMs = 1000.0;
+// Soft perf statistic only — logged as over_10ms; never rejects.
+inline constexpr double kPlannerPerfStatMs = 10.0;
+
 struct FastPlanResult {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
   bool ok = false;

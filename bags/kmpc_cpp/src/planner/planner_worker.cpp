@@ -67,7 +67,8 @@ void PlannerWorker::stop() {
 
 void PlannerWorker::submit_snapshot(const MotionTask& task,
                                     const RobotState& state) {
-  submit_snapshot(task, state, default_policy_, default_weights_, 10.0);
+  submit_snapshot(task, state, default_policy_, default_weights_,
+                  kPlannerBudgetMs);
 }
 
 void PlannerWorker::submit_snapshot(const MotionTask& task,

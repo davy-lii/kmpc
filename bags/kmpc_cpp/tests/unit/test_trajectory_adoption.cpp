@@ -206,6 +206,67 @@ TEST(TrajectoryAdoption, SealedIdentityAdoptAndStaleReject) {
   worker.stop();
 }
 
+TEST(TrajectoryAdoption, ProductionBudgetIsOneSecondNotTenMs) {
+  // Production hard wall is 1s; 10ms is a soft perf statistic only.
+  EXPECT_DOUBLE_EQ(kmpc::kPlannerBudgetMs, 1000.0);
+  EXPECT_DOUBLE_EQ(kmpc::kPlannerPerfStatMs, 10.0);
+  EXPECT_GT(kmpc::kPlannerBudgetMs, kmpc::kPlannerPerfStatMs);
+
+  const auto config = kmpc::Config::load(
+      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+  const std::string urdf =
+      std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf";
+  kmpc::PlannerWorker worker(urdf, config);
+  worker.start();
+  kmpc::Kinematics kin(urdf);
+  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
+  const auto policy = kmpc::policy_from_config(config);
+  const kmpc::Vec18 q0 = config.q_pref;
+  const kmpc::Vec3 p0 = kin.fk_pos(q0, kmpc::kEeFrameRight);
+
+  kmpc::MotionTask task;
+  task.generation = 51;
+  task.q = q0;
+  task.left = false;
+  task.frame = std::string(kmpc::kEeFrameRight);
+  kmpc::TaskStage st;
+  st.geometry = kmpc::TaskGeometry::Lin;
+  st.position = p0 + kmpc::Vec3(0.03, 0.0, 0.0);
+  st.position_tol_m = 0.01;
+  st.stage_id = 1;
+  task.stages.push_back(st);
+  kmpc::seal_motion_task_identity(&task, urdf, false, policy);
+
+  kmpc::RobotState state;
+  state.q = q0;
+  state.fresh = true;
+  // Default overload must use kPlannerBudgetMs (not 10ms).
+  worker.submit_snapshot(task, state);
+
+  kmpc::FastPlanResult plan;
+  bool got = false;
+  // Budget is 1s; allow generous wall for CI load.
+  for (int i = 0; i < 600; ++i) {
+    if (worker.try_take(plan)) {
+      got = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_TRUE(got);
+  // Must not fail solely because of the old 10ms production reject gate.
+  EXPECT_NE(plan.reason, "deadline");
+  EXPECT_FALSE(plan.deadline_hit);
+  if (plan.ok) {
+    kmpc::TrajectoryFollower follower(kin, &guards, policy);
+    std::string why;
+    EXPECT_TRUE(follower.adopt(plan.package, q0, kmpc::Vec18::Zero(), false,
+                               1e-3, 0.5, &why))
+        << why;
+  }
+  worker.stop();
+}
+
 TEST(TrajectoryAdoption, PlannerWorkerLatestGenerationWins) {
   const auto config = kmpc::Config::load(
       cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));

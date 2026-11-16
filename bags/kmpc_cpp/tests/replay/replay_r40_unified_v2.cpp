@@ -11,13 +11,20 @@
 #include <vector>
 
 #include "kmpc/config.hpp"
+#include "kmpc/fast_trajectory_optimizer.hpp"
 #include "kmpc/kinematics.hpp"
 #include "kmpc/motion_evaluator.hpp"
 #include "kmpc/motion_task.hpp"
+#include "kmpc/planner_worker.hpp"
 #include "kmpc/tracker_math.hpp"
 #include "kmpc/trajectory_cost.hpp"
+#include "kmpc/trajectory_follower.hpp"
+#include "kmpc/trajectory_package.hpp"
 #include "kmpc/unified_multistage_planner.hpp"
 #include "kmpc/whole_body_guards.hpp"
+
+#include <chrono>
+#include <thread>
 
 namespace {
 
@@ -283,8 +290,13 @@ void print_result(const Stage& st, const kmpc::FastPlanResult& res,
             << " body_minus_leg_dx_m=" << res.body_minus_leg_dx_m
             << " j1_margin_rad=" << res.min_hard_margin_rad
             << " tcp_worst_m=" << res.tcp_worst_m
+            << " seed_ms=" << res.seed_ik_ms << " sqp_ms=" << res.sqp_ms
+            << " densify_ms=" << res.densify_ms << " time_ms=" << res.time_law_ms
             << " opt_ms=" << res.optimize_ms << " cert_ms=" << res.certify_ms
-            << "\n";
+            << " total_ms=" << res.total_ms
+            << " over_10ms="
+            << ((res.total_ms > kmpc::kPlannerPerfStatMs) ? 1 : 0)
+            << " deadline=" << (res.deadline_hit ? 1 : 0) << "\n";
   if (st.has_historical_drop) {
     std::cout << "  historical_stop_drop_mm=" << st.historical_drop_mm
               << " historical_pose_report=" << st.historical_pose_report << "\n";
@@ -333,7 +345,16 @@ int main(int argc, char** argv) {
   std::cout << "honesty: field_replay=passed only for real 18D field q0; "
                "synthetic q_pref+0.01 is never field_replay\n";
 
+  const std::string urdf =
+      std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf";
+  kmpc::PlannerWorker worker(urdf, config);
+  worker.start();
+  kmpc::TrajectoryFollower follower(kin, &guards, policy);
+  kmpc::FastTrajectoryOptimizer optimizer(kin, &guards);
+
   int field_pass = 0, field_fail = 0, lab = 0;
+  int budget_ok = 0, budget_fail = 0, adopt_ok = 0, adopt_fail = 0;
+  int reject_by_10ms_only = 0;
   for (const auto& st : stages) {
     kmpc::Vec18 q0 = config.q_pref;
     if (st.has_q0) {
@@ -384,6 +405,71 @@ int main(int argc, char** argv) {
       } else {
         ++field_fail;
       }
+      // Production-path check: 10ms is soft; 1s budget must not reject solely
+      // for wall time; certified ok plans must be adoptable.
+      kmpc::RobotState state;
+      state.q = q0;
+      state.dq_known = false;
+      state.fresh = true;
+      kmpc::seal_motion_task_identity(&task, urdf, false, policy);
+      const auto res10 =
+          optimizer.plan(task, state, policy, weights, kmpc::kPlannerPerfStatMs);
+      const auto res1s =
+          optimizer.plan(task, state, policy, weights, kmpc::kPlannerBudgetMs);
+      std::cout << "  budget_cmp 10ms: ok=" << (res10.ok ? 1 : 0)
+                << " reason=" << res10.reason << " total_ms=" << res10.total_ms
+                << " deadline=" << (res10.deadline_hit ? 1 : 0)
+                << " | 1s: ok=" << (res1s.ok ? 1 : 0)
+                << " reason=" << res1s.reason << " total_ms=" << res1s.total_ms
+                << " deadline=" << (res1s.deadline_hit ? 1 : 0)
+                << " over_10ms="
+                << ((res1s.total_ms > kmpc::kPlannerPerfStatMs) ? 1 : 0)
+                << "\n";
+      if (!res10.ok && res10.deadline_hit && res1s.ok && !res1s.deadline_hit) {
+        ++reject_by_10ms_only;
+        std::cout << "  NOTE: old 10ms gate would reject; 1s budget succeeds\n";
+      }
+      if (res1s.ok) {
+        ++budget_ok;
+      } else {
+        ++budget_fail;
+      }
+      worker.clear_pending_and_result();
+      worker.submit_snapshot(task, state, policy, weights,
+                             kmpc::kPlannerBudgetMs);
+      kmpc::FastPlanResult wplan;
+      bool got = false;
+      for (int i = 0; i < 600; ++i) {
+        if (worker.try_take(wplan)) {
+          got = true;
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      }
+      if (!got) {
+        ++adopt_fail;
+        std::cout << "  worker_adopt=timeout\n";
+      } else if (!wplan.ok) {
+        ++adopt_fail;
+        std::cout << "  worker_adopt=fail reason=" << wplan.reason
+                  << " total_ms=" << wplan.total_ms
+                  << " deadline=" << (wplan.deadline_hit ? 1 : 0) << "\n";
+      } else {
+        std::string why;
+        const bool adopted =
+            follower.adopt(wplan.package, q0, kmpc::Vec18::Zero(), false, 1e-3,
+                           0.5, &why);
+        if (adopted) {
+          ++adopt_ok;
+          std::cout << "  worker_adopt=ok total_ms=" << wplan.total_ms
+                    << " over_10ms="
+                    << ((wplan.total_ms > kmpc::kPlannerPerfStatMs) ? 1 : 0)
+                    << "\n";
+        } else {
+          ++adopt_fail;
+          std::cout << "  worker_adopt=reject why=" << why << "\n";
+        }
+      }
     } else {
       ++lab;
       if (st.q0_source.find("synthetic") != std::string::npos) {
@@ -392,8 +478,13 @@ int main(int argc, char** argv) {
       }
     }
   }
+  worker.stop();
   std::cout << "summary field_pass=" << field_pass
-            << " field_fail=" << field_fail << " lab_only=" << lab << "\n";
+            << " field_fail=" << field_fail << " lab_only=" << lab
+            << " budget1s_ok=" << budget_ok << " budget1s_fail=" << budget_fail
+            << " worker_adopt_ok=" << adopt_ok
+            << " worker_adopt_fail=" << adopt_fail
+            << " would_reject_only_at_10ms=" << reject_by_10ms_only << "\n";
   // Tool exit 0 even if a field stage fails plan: the report is the deliverable.
   // Callers that need a hard gate can parse field_replay=failed.
   return 0;

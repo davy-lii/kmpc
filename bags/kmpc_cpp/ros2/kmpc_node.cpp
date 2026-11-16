@@ -1720,7 +1720,7 @@ class KmpcNode : public rclcpp::Node {
         }
         planner_worker_->submit_snapshot(mt, st, v2_policy,
                                          planner_worker_->default_weights(),
-                                         10.0);
+                                         kmpc::kPlannerBudgetMs);
         v2_gate_.note_submitted(req_id, planner_worker_->submitted_seq());
         ++line_plan_builds_;
         {
@@ -1732,10 +1732,11 @@ class KmpcNode : public rclcpp::Node {
         RCLCPP_INFO(
             get_logger(),
             "kmpc v2 submit gen=%llu digest=%llu left=%d stages=%zu reason=%s "
-            "submits=%llu",
+            "budget_ms=%.0f perf_stat_ms=%.0f submits=%llu",
             static_cast<unsigned long long>(mt.generation),
             static_cast<unsigned long long>(digest), is_left ? 1 : 0,
-            mt.stages.size(), gate_dec.reason,
+            mt.stages.size(), gate_dec.reason, kmpc::kPlannerBudgetMs,
+            kmpc::kPlannerPerfStatMs,
             static_cast<unsigned long long>(v2_gate_.counters().submits));
         publish_cmd(q0, kmpc::Vec18::Zero(), 0.0, true);
         return;
@@ -1755,11 +1756,17 @@ class KmpcNode : public rclcpp::Node {
           RCLCPP_ERROR(
               get_logger(),
               "kmpc v2 plan reject gen=%llu reason=%s reject=%s seq=%llu "
+              "seed_ms=%.3f sqp_ms=%.3f densify_ms=%.3f time_ms=%.3f "
+              "cert_ms=%.3f total_ms=%.3f over_10ms=%d deadline=%d "
               "rejects=%llu",
               static_cast<unsigned long long>(mt.generation),
               plan.ok ? "stale_or_mismatch" : plan.reason.c_str(),
               take.reject_reason,
               static_cast<unsigned long long>(plan.submit_seq),
+              plan.seed_ik_ms, plan.sqp_ms, plan.densify_ms, plan.time_law_ms,
+              plan.certify_ms, plan.total_ms,
+              (plan.total_ms > kmpc::kPlannerPerfStatMs) ? 1 : 0,
+              plan.deadline_hit ? 1 : 0,
               static_cast<unsigned long long>(v2_gate_.counters().rejects));
           v2_gate_.note_plan_failed(take.reject_reason);
           follower_->hold_at(q0);
@@ -1778,12 +1785,17 @@ class KmpcNode : public rclcpp::Node {
             (q_meas && q_meas->allFinite()) ? *q_meas : q0;
         if (!follower_->adopt(plan.package, q_meas_adopt, kmpc::Vec18::Zero(),
                               false, 1e-3, 0.5, &why)) {
-          RCLCPP_WARN(get_logger(),
-                      "kmpc v2 adopt rejected gen=%llu why=%s rejects=%llu",
-                      static_cast<unsigned long long>(plan.package.generation),
-                      why.c_str(),
-                      static_cast<unsigned long long>(
-                          v2_gate_.counters().rejects + 1));
+          RCLCPP_WARN(
+              get_logger(),
+              "kmpc v2 adopt rejected gen=%llu why=%s seed_ms=%.3f sqp_ms=%.3f "
+              "densify_ms=%.3f time_ms=%.3f cert_ms=%.3f total_ms=%.3f "
+              "over_10ms=%d rejects=%llu",
+              static_cast<unsigned long long>(plan.package.generation),
+              why.c_str(), plan.seed_ik_ms, plan.sqp_ms, plan.densify_ms,
+              plan.time_law_ms, plan.certify_ms, plan.total_ms,
+              (plan.total_ms > kmpc::kPlannerPerfStatMs) ? 1 : 0,
+              static_cast<unsigned long long>(
+                  v2_gate_.counters().rejects + 1));
           ++line_plan_discards_;
           v2_gate_.note_adopt_failed(why.c_str());
           {
@@ -1851,12 +1863,17 @@ class KmpcNode : public rclcpp::Node {
         RCLCPP_INFO(
             get_logger(),
             "kmpc v2 adopt planner=%s path_id=%u gen=%llu digest=%llu "
-            "samples=%zu dur=%.3f seq=%llu quality=%s adopts=%llu",
+            "samples=%zu dur=%.3f seq=%llu seed_ms=%.3f sqp_ms=%.3f "
+            "densify_ms=%.3f time_ms=%.3f cert_ms=%.3f total_ms=%.3f "
+            "over_10ms=%d deadline=%d quality=%s adopts=%llu",
             plan.package.planner.c_str(), plan.package.path_id,
             static_cast<unsigned long long>(plan.package.generation),
             static_cast<unsigned long long>(v2_gate_.active().digest),
             plan.package.samples.size(), plan.package.time_law.duration_s,
-            static_cast<unsigned long long>(plan.submit_seq),
+            static_cast<unsigned long long>(plan.submit_seq), plan.seed_ik_ms,
+            plan.sqp_ms, plan.densify_ms, plan.time_law_ms, plan.certify_ms,
+            plan.total_ms, (plan.total_ms > kmpc::kPlannerPerfStatMs) ? 1 : 0,
+            plan.deadline_hit ? 1 : 0,
             planner_worker_->quality_load_note().c_str(),
             static_cast<unsigned long long>(v2_gate_.counters().adopts));
       }
