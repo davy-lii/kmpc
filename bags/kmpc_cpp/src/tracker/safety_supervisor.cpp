@@ -42,7 +42,8 @@ void SafetySupervisor::seed(const Vec18& q_safe) {
   t_last_send_s_ = -1.0;
 }
 
-SafetyDecision SafetySupervisor::check(const SafetySupervisorInput& in) {
+SafetyDecision SafetySupervisor::check(const SafetySupervisorInput& in,
+                                       bool commit) {
   SafetyDecision out;
   out.q_send = has_safe_ ? last_safe_ : (has_last_send_ ? q_last_send_ : in.q_cmd);
   out.accept = false;
@@ -52,6 +53,7 @@ SafetyDecision SafetySupervisor::check(const SafetySupervisorInput& in) {
     out.reason = reason;
     out.accept = false;
     out.arrived = false;
+    out.q_send = has_safe_ ? last_safe_ : q_last_send_;
     return out;
   };
 
@@ -83,41 +85,52 @@ SafetyDecision SafetySupervisor::check(const SafetySupervisorInput& in) {
   // Adjacent-send kinematics: ignore caller q_prev.
   const Vec18 q_prev_send = has_last_send_ ? q_last_send_ : in.q_cmd;
   double dt = std::max(in.dt, 1e-4);
-  if (has_last_send_ && in.now_s > 0.0 && t_last_send_s_ > 0.0) {
-    dt = std::max(in.now_s - t_last_send_s_, 1e-4);
+  const double send_s = in.send_timestamp_s > 0.0
+                            ? in.send_timestamp_s : in.now_s;
+  if (has_last_send_ && send_s > 0.0 && t_last_send_s_ > 0.0) {
+    dt = std::max(send_s - t_last_send_s_, 1e-4);
   }
+  out.dt_s = dt;
 
-  Vec18 v_cmd_all = Vec18::Zero();
   Vec18 a_cmd_all = Vec18::Zero();
   for (int j = 0; j < kNDof; ++j) {
+    out.joint = j;
     const double dq_max = std::max(policy_.dq_max[j], 1e-6);
     const double step = std::abs(in.q_cmd[j] - q_prev_send[j]);
     if (step > dq_max * dt + 1e-9) {
+      out.actual = step;
+      out.limit = dq_max * dt + 1e-9;
       return reject("safety_step");
     }
     const double v_prev = has_vel_ ? last_vel_[j] : 0.0;
     const double v_cmd = (in.q_cmd[j] - q_prev_send[j]) / dt;
-    v_cmd_all[j] = v_cmd;
     const double ddq_pol = std::max(policy_.ddq_max[j], 1e-6);
     const double ddq_soft =
         policy_.a_max_calibrated ? ddq_pol : std::max(ddq_pol, dq_max / 0.02);
     const double dv = std::abs(v_cmd - v_prev);
+    out.velocity = v_cmd;
+    out.acceleration = (v_cmd - v_prev) / dt;
     if (dv > 4.0 * ddq_soft * dt + 1e-6) {
+      out.actual = dv;
+      out.limit = 4.0 * ddq_soft * dt + 1e-6;
       return reject("safety_accel");
     }
     a_cmd_all[j] = (v_cmd - v_prev) / dt;
     // Jerk gate only after we have a prior accepted accel, and only with a
     // generous software band (uncalibrated device jerk is not hardware fact).
-    if (has_acc_ && in.mode != SafetyExecMode::Recovering) {
+    if (has_acc_) {
       const double j_pol = std::max(policy_.dddq_max[j], 1e-6);
       const double j_soft =
           policy_.j_max_calibrated ? j_pol : std::max(j_pol, ddq_soft / 0.02);
       if (std::abs(a_cmd_all[j] - last_acc_[j]) > 16.0 * j_soft * dt + 1e-3) {
+        out.actual = std::abs(a_cmd_all[j] - last_acc_[j]);
+        out.limit = 16.0 * j_soft * dt + 1e-3;
         return reject("safety_jerk");
       }
     }
   }
 
+  out.joint = -1;
   if (guards_ != nullptr && !guards_->com_xy_inside(kin_.com(in.q_cmd))) {
     return reject("safety_com");
   }
@@ -168,6 +181,7 @@ SafetyDecision SafetySupervisor::check(const SafetySupervisorInput& in) {
   }
 
   out.accept = true;
+  out.joint = -1;
   out.reason = "ok";
   out.q_send = in.q_cmd;
 
@@ -185,18 +199,31 @@ SafetyDecision SafetySupervisor::check(const SafetySupervisorInput& in) {
     out.arrived = true;
   }
 
-  last_safe_ = in.q_cmd;
+  if (commit) note_sent(in.q_cmd, send_s, in.dt);
+  return out;
+}
+
+void SafetySupervisor::note_sent(const Vec18& q, double send_s,
+                                  double nominal_dt) {
+  if (!q.allFinite()) return;
+  const double dt = (send_s > 0.0 && t_last_send_s_ > 0.0)
+                        ? std::max(send_s - t_last_send_s_, 1e-4)
+                        : std::max(nominal_dt, 1e-4);
+  const Vec18 vel = has_last_send_ ? Vec18((q - q_last_send_) / dt)
+                                  : Vec18::Zero();
+  const Vec18 acc = has_vel_ ? Vec18((vel - last_vel_) / dt)
+                            : Vec18::Zero();
+  last_safe_ = q;
   has_safe_ = true;
   if (has_vel_) {
-    last_acc_ = a_cmd_all;
+    last_acc_ = acc;
     has_acc_ = true;
   }
-  last_vel_ = v_cmd_all;
+  last_vel_ = vel;
   has_vel_ = true;
-  q_last_send_ = in.q_cmd;
+  q_last_send_ = q;
   has_last_send_ = true;
-  t_last_send_s_ = in.now_s > 0.0 ? in.now_s : t_last_send_s_;
-  return out;
+  t_last_send_s_ = send_s > 0.0 ? send_s : t_last_send_s_;
 }
 
 }  // namespace kmpc

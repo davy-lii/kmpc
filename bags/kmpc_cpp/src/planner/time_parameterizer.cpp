@@ -21,21 +21,23 @@ constexpr double kSendDt = 0.004;
 // Scale wall time until the *executed* 250 Hz Hermite send sequence fits 1×.
 bool hermite_send_sequence_ok(const JointCurve& samples,
                               const TimeLawTable& law,
-                              const MotionConstraintPolicy& policy) {
+                              const MotionConstraintPolicy& policy,
+                              const std::vector<StageBoundary>& boundaries) {
   if (samples.size() < 2 || law.t_s.size() < 2 || !(law.duration_s > 0.0)) {
     return true;
   }
   TrajectoryPackage pkg;
   pkg.samples = samples;
   pkg.time_law = law;
+  pkg.stage_boundaries = boundaries;
   const int n =
       std::max(1, static_cast<int>(std::ceil(law.duration_s / kSendDt)));
   std::vector<Vec18, Eigen::aligned_allocator<Vec18>> qs;
   std::vector<double> ts;
   qs.reserve(static_cast<std::size_t>(n) + 2);
   ts.reserve(static_cast<std::size_t>(n) + 2);
-  auto push = [&](double t) -> bool {
-    if (!ts.empty() && t <= ts.back() + 1e-12) {
+  auto push = [&](double t, double send_t) -> bool {
+    if (!ts.empty() && send_t <= ts.back() + 1e-12) {
       return true;
     }
     TrajectoryTimeSample samp;
@@ -43,26 +45,17 @@ bool hermite_send_sequence_ok(const JointCurve& samples,
       return false;
     }
     qs.push_back(samp.q);
-    ts.push_back(samp.t_s);
+    ts.push_back(send_t);
     return true;
   };
-  for (int k = 0; k < n; ++k) {
-    const double t = kSendDt * static_cast<double>(k);
-    if (t >= law.duration_s - 1e-12) {
-      break;
-    }
-    if (!push(t)) {
-      return false;
-    }
-  }
-  if (!push(law.duration_s)) {
-    return false;
+  for (const auto& probe : trajectory_send_probe_grid(pkg, kSendDt)) {
+    if (!push(probe.curve_s, probe.send_s)) return false;
   }
   for (std::size_t i = 1; i < qs.size(); ++i) {
     const double dt = std::max(ts[i] - ts[i - 1], 1e-4);
     for (int j = 0; j < kNDof; ++j) {
       const double dq_max = std::max(policy.dq_max[j], 1e-6);
-      if (std::abs(qs[i][j] - qs[i - 1][j]) > dq_max * dt + 1e-4) {
+      if (std::abs(qs[i][j] - qs[i - 1][j]) > dq_max * dt + 1e-9) {
         return false;
       }
     }
@@ -170,7 +163,7 @@ TimeLawTable TimeParameterizer::compute(
   // Node rates; endpoints stop, stop_required stage boundaries stop.
   std::vector<double> v(n, 0.0);
   for (const StageBoundary& b : stage_boundaries) {
-    if (b.stop_required && b.sample_index < n) {
+    if ((b.stop_required || b.wait_for_external_ack) && b.sample_index < n) {
       v[b.sample_index] = 0.0;
     }
   }
@@ -178,7 +171,7 @@ TimeLawTable TimeParameterizer::compute(
   pinned[0] = true;
   pinned[n - 1] = true;
   for (const StageBoundary& b : stage_boundaries) {
-    if (b.stop_required && b.sample_index < n) {
+    if ((b.stop_required || b.wait_for_external_ack) && b.sample_index < n) {
       pinned[b.sample_index] = true;
     }
   }
@@ -260,7 +253,7 @@ TimeLawTable TimeParameterizer::compute(
   // Stretch time (keep s knots) until Hermite@250Hz send sequence meets 1×
   // dq/ddq/jerk. Never widen policy caps — only slow the motion.
   for (int attempt = 0; attempt < 12; ++attempt) {
-    if (hermite_send_sequence_ok(samples, out, policy)) {
+    if (hermite_send_sequence_ok(samples, out, policy, stage_boundaries)) {
       break;
     }
     constexpr double kStretch = 1.25;

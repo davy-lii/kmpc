@@ -108,15 +108,18 @@ class TrajectoryFollower {
                         std::numeric_limits<double>::quiet_NaN(),
                     double now_s = std::numeric_limits<double>::quiet_NaN());
 
-  // Advance the *execution* timeline by dt (not wall-clock absolute time).
-  // Stage stop / WaitAck freeze exec_t so 250 Hz cannot sample into the next
-  // stage. ACK success resumes from the frozen stage time.
+  // Production supplies external_exec_t_s from the sender-owned timeline;
+  // dt is the observer/feedback interval, not a second execution clock.
+  // Offline callers omitting external time retain dt stepping. Stage STOP/ACK
+  // freezes exec_t; release resumes from that same curve time.
   // meas_stamp_s: feedback source time for age/velocity; NaN → estimate from
   // successive step() calls (tests). now_s used only for freshness.
   FollowerTick step(const Vec18& q_meas, double dt,
                     double meas_stamp_s =
                         std::numeric_limits<double>::quiet_NaN(),
-                    double now_s = std::numeric_limits<double>::quiet_NaN());
+                    double now_s = std::numeric_limits<double>::quiet_NaN(),
+                    double external_exec_t_s =
+                        std::numeric_limits<double>::quiet_NaN());
 
   FollowerState state() const { return state_; }
   bool has_package() const { return has_package_; }
@@ -145,9 +148,9 @@ class TrajectoryFollower {
                          const char** fail_tag) const;
   bool command_feasible(const Vec18& q_cmd, const Vec18& q_prev, double dt,
                         double pitch_excess_ceiling,
-                        const char** fail_tag) const;
+                        const char** fail_tag, bool enforce_step = true) const;
   Vec18 step_cap(double dt) const;
-  const StageBoundary* stage_at_progress(double s) const;
+  const StageBoundary* stage_at_progress(double s);
   const StageBoundary* next_unreleased_barrier() const;
   void fill_barrier_fields(FollowerTick* tick) const;
   void note_feedback(const Vec18& q_meas, double meas_stamp_s, double dt);
@@ -170,7 +173,9 @@ class TrajectoryFollower {
   int brake_ticks_ = 0;
   double tcp_tube_m_ = 0.02;
   double track_err_m_ = 0.03;
-  bool enable_qp_ = true;
+  // Normal execution follows certified q(t). The old feedback offset QP is
+  // opt-in for offline experiments only; it has no send-rate a/j contract.
+  bool enable_qp_ = false;
   uint32_t wait_stage_id_ = 0;
   double wait_ack_elapsed_s_ = 0.0;
   double ack_timeout_s_ = 5.0;

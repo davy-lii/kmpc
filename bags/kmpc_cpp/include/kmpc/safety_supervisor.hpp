@@ -1,6 +1,6 @@
 #pragma once
 // 250 Hz final gate before send for unified_multistage_v2.
-// Hard box, pitch, step/accel/jerk from *accepted sends*, CoM, freshness,
+// Hard box, pitch, step/accel/jerk from *actual published sends*, CoM, freshness,
 // TCP tube, package generation, tracking error. No direction_envelope_accept.
 // Rejects unsafe cmds; never silent-clamps geometry; never fakes arrived.
 // Step/accel/jerk use internal q_last_send — never trust caller q_prev.
@@ -35,6 +35,8 @@ struct SafetySupervisorInput {
   double cmd_timestamp_s = 0.0;
   double meas_timestamp_s = 0.0;  // real joint_states receive/source time
   double now_s = 0.0;
+  // Monotonic clock for sending; ROS time above is only for freshness.
+  double send_timestamp_s = 0.0;
   bool has_meas = false;  // must be true with finite q_meas + timestamp
   uint64_t expected_generation = 0;
   uint32_t expected_path_id = 0;
@@ -52,6 +54,12 @@ struct SafetyDecision {
   bool arrived = false;  // true only when claim is geometrically true
   const char* reason = "not_checked";
   Vec18 q_send = Vec18::Zero();  // last safe hold when rejected
+  int joint = -1;
+  double dt_s = 0.0;
+  double actual = 0.0;
+  double limit = 0.0;
+  double velocity = 0.0;
+  double acceleration = 0.0;
 };
 
 class SafetySupervisor {
@@ -67,8 +75,13 @@ class SafetySupervisor {
   void set_track_err_m(double m) { track_err_m_ = std::max(m, 1e-4); }
   void set_follow_err_rad(double r) { follow_err_rad_ = std::max(r, 1e-6); }
 
-  // Updates q_last_send_ only when accept=true. Reject never mutates geometry.
-  SafetyDecision check(const SafetySupervisorInput& in);
+  // Offline default commits accepted checks. Production validates without commit
+  // and records the actual output with note_sent(), including fault holds.
+  SafetyDecision check(const SafetySupervisorInput& in, bool commit = true);
+  // Production calls this only after publish succeeds, for EVERY output,
+  // including holds. A rejected candidate must never enter send history.
+  void note_sent(const Vec18& q, double send_timestamp_s,
+                 double nominal_dt = 0.004);
 
   const Vec18& last_safe() const { return last_safe_; }
   const Vec18& q_last_send() const { return q_last_send_; }

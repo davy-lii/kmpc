@@ -31,6 +31,7 @@
 #include <kmpc_msgs/msg/motion_stage.hpp>
 #include <kmpc_msgs/msg/stage_ack.hpp>
 #include "kmpc/trajectory_package.hpp"
+#include "kmpc/v2_execution_state.hpp"
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <std_msgs/msg/bool.hpp>
@@ -244,12 +245,6 @@ class KmpcNode : public rclcpp::Node {
         cfg_.params.com_xmax, cfg_.params.com_margin);
     safety_ = std::make_unique<kmpc::SafetyFilter>(
         cfg_.limits, cfg_.params.dt, cfg_.params.q_limit_margin);
-    const auto motion_policy = kmpc::policy_from_config(cfg_);
-    follower_ = std::make_unique<kmpc::TrajectoryFollower>(
-        *kin_, &tracker_->guards(), motion_policy);
-    safety_supervisor_ = std::make_unique<kmpc::SafetySupervisor>(
-        *kin_, stream_guards_.get(), motion_policy);
-    safety_supervisor_->seed(cfg_.q_pref);
     interpolator_.set_joint_box(
         cfg_.limits.q_min, cfg_.limits.q_max, cfg_.params.q_limit_margin);
     joint_tracker_ = std::make_unique<kmpc::ros2io::JointSpaceTracker>(
@@ -272,6 +267,14 @@ class KmpcNode : public rclcpp::Node {
     hold_deadband_ = double_param("hold_deadband", 0.01);
     dq_scale_ = std::clamp(double_param("dq_scale", 1.0), 0.0, 1.0);
     line_dq_scale_ = std::clamp(double_param("line_dq_scale", 0.60), 0.0, 1.0);
+    const auto motion_policy = kmpc::policy_from_config(
+        cfg_, std::min(dq_scale_, line_dq_scale_));
+    follower_ = std::make_unique<kmpc::TrajectoryFollower>(
+        *kin_, &tracker_->guards(), motion_policy);
+    safety_supervisor_ = std::make_unique<kmpc::SafetySupervisor>(
+        *stream_kin_, stream_guards_.get(), motion_policy);
+    safety_supervisor_->seed(cfg_.q_pref);
+
     {
       const std::string mode_text = str_or(
           "line_pace_mode",
@@ -853,8 +856,43 @@ class KmpcNode : public rclcpp::Node {
     return fault;
   }
 
-  // Precondition: stream_mu_ held. Copy only; caller publishes unlocked.
+  static double steady_seconds() {
+    return std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+
+  // Precondition: stream_mu_ held. A fault survives every 50 Hz slot update.
+  void latch_v2_fault(const char* reason, const kmpc::Vec18& q_hold) {
+    if (!v2_exec_.faulted()) ++v2_safety_rejects_;
+    v2_exec_.latch_fault(reason);
+    stream_enter_hold(q_hold);
+    stream_v2_ = false;
+    publish_v2_slot_inactive();
+  }
+
+  // Precondition: stream_mu_ held, including publish and history commit.
+  uint64_t publish_stream_recorded(const kmpc::Vec18& q) {
+    const uint64_t seq = publish_stream(q);
+    if (seq != 0) {
+      // Same sampling clock as check(); mixing a post-publish clock with
+      // pre-check timestamps creates artificial accel even at constant speed.
+      safety_supervisor_->note_sent(q, stream_send_stamp_s_, interp_dt_);
+      v2_publish_lag_ms_ = (steady_seconds() - stream_send_stamp_s_) * 1000.0;
+    } else if (stream_v2_) {
+      v2_exec_.discard_unsent_progress(stream_exec_before_tick_, steady_seconds());
+      latch_v2_fault("safety_publish_failed", safety_supervisor_->last_safe());
+    }
+    return seq;
+  }
+
+  // Precondition: stream_mu_ held. Caller publishes before releasing the lock.
   bool stream_take_tick(kmpc::Vec18* q_out) {
+    stream_send_stamp_s_ = steady_seconds();
+    stream_exec_before_tick_ = v2_exec_.exec_s();
+    if (!stream_v2_ || stream_hold_ || !arbiter_->enabled() || stream_mute_ ||
+        alarm_block_ || feedback_block_) {
+      v2_exec_.pause(stream_send_stamp_s_);
+    }
     if (!arbiter_->enabled()) {
       if (interpolator_.ready()) {
         interpolator_.reset(interpolator_.q_ref());
@@ -881,17 +919,10 @@ class KmpcNode : public rclcpp::Node {
           v2_slots_[static_cast<std::size_t>(
               v2_pub_idx_.load(std::memory_order_acquire))];
       if (!slot.active || slot.protect_stop) {
-        stream_enter_hold(safety_supervisor_->last_safe().allFinite()
-                              ? safety_supervisor_->last_safe()
-                              : (interpolator_.ready() ? interpolator_.q_ref()
-                                                       : stream_v2_q_follow_));
-        stream_v2_ = false;
+        latch_v2_fault("safety_inactive_slot", safety_supervisor_->last_safe());
         *q_out = stream_q_hold_;
       } else if (!v2_meas_valid_) {
-        stream_enter_hold(safety_supervisor_->last_safe().allFinite()
-                              ? safety_supervisor_->last_safe()
-                              : interpolator_.q_ref());
-        stream_v2_ = false;
+        latch_v2_fault("safety_no_real_meas", safety_supervisor_->last_safe());
         *q_out = stream_q_hold_;
         RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 1000,
                               "kmpc v2 safety reject reason=safety_no_real_meas");
@@ -899,40 +930,37 @@ class KmpcNode : public rclcpp::Node {
         const double now_s = now().seconds();
         kmpc::Vec18 q_cmd;
         kmpc::Vec18 q_plan;
+        const double exec_t = v2_exec_.advance(
+            stream_send_stamp_s_, slot.timeline_frozen,
+            slot.barrier_pending && !slot.barrier_released, slot.barrier_t_s);
         if (slot.timeline_frozen) {
           // Stage barrier / WaitAck: do not advance into the next stage.
           q_plan = slot.freeze_q.allFinite() ? slot.freeze_q : slot.q_follow_hint;
-          q_cmd = q_plan + slot.q_offset;
+          q_cmd = q_plan;
         } else {
-          // Extrapolate from last 50 Hz exec_t, then clamp to any unreleased
-          // TIP/STOP barrier so 250 Hz cannot cross before ACK/settle.
-          const double t_raw = std::max(
-              0.0, slot.exec_t_s + (now_s - slot.exec_t_wall_s));
+          // Sample the single sender clock, clamped to the next unreleased
+          // TIP/STOP barrier. 50 Hz never replaces the clock or adds offsets.
+          const double t_raw = exec_t;
           const double t_s = kmpc::clamp_exec_t_to_unreleased_barrier(
               t_raw, slot.barrier_pending, slot.barrier_released,
               slot.barrier_t_s);
           kmpc::TrajectoryTimeSample samp;
           if (!kmpc::sample_trajectory_at(slot.package, t_s, &samp) ||
               !samp.ok) {
-            stream_enter_hold(safety_supervisor_->last_safe());
-            stream_v2_ = false;
-            publish_v2_slot_inactive();
+            latch_v2_fault("safety_sample_failed", safety_supervisor_->last_safe());
             *q_out = stream_q_hold_;
             return true;
           }
           q_plan = samp.q;
-          q_cmd = samp.q + slot.q_offset;
+          q_cmd = samp.q;
           // At an unreleased STOP/ACK barrier time, prefer the certified
           // barrier sample (no wall-clock jump past the tip).
           if (slot.barrier_pending && !slot.barrier_released &&
               slot.barrier_q.allFinite() &&
               t_s + 1e-12 >= slot.barrier_t_s) {
             q_plan = slot.barrier_q;
-            q_cmd = slot.barrier_q + slot.q_offset;
+            q_cmd = slot.barrier_q;
           }
-        }
-        if (slot.recovering) {
-          q_cmd = slot.q_recovery_cmd.allFinite() ? slot.q_recovery_cmd : q_cmd;
         }
         kmpc::SafetySupervisorInput in;
         in.q_cmd = q_cmd;
@@ -946,26 +974,32 @@ class KmpcNode : public rclcpp::Node {
         in.cmd_timestamp_s = now_s;
         in.meas_timestamp_s = v2_meas_stamp_s_;
         in.now_s = now_s;
+        in.send_timestamp_s = stream_send_stamp_s_;
         in.expected_generation = slot.generation;
         in.expected_path_id = slot.path_id;
         in.expected_task_digest = slot.task_digest;
         in.claim_arrived = slot.claim_time_done;
-        in.mode = slot.recovering ? kmpc::SafetyExecMode::Recovering
-                                  : kmpc::SafetyExecMode::Normal;
-        in.pitch_excess_ceiling = slot.pitch_excess_ceiling;
+        const double last_excess = std::max(
+            0.0, std::abs(safety_supervisor_->q_last_send().head<3>().sum()) -
+                     final_gate_limits_.torso_pitch_max_rad);
+        in.mode = last_excess > 0.0 ? kmpc::SafetyExecMode::Recovering
+                                   : kmpc::SafetyExecMode::Normal;
+        in.pitch_excess_ceiling = last_excess;
         in.package = &slot.package;
-        const kmpc::SafetyDecision dec = safety_supervisor_->check(in);
+        const kmpc::SafetyDecision dec = safety_supervisor_->check(in, false);
         if (!dec.accept) {
           RCLCPP_ERROR_THROTTLE(
               get_logger(), *get_clock(), 1000,
-              "kmpc v2 safety reject reason=%s gen=%llu path_id=%u",
-              dec.reason,
-              static_cast<unsigned long long>(slot.generation),
-              slot.path_id);
-          stream_enter_hold(dec.q_send.allFinite() ? dec.q_send
-                                                   : interpolator_.q_ref());
-          stream_v2_ = false;
-          publish_v2_slot_inactive();
+              "kmpc v2 safety reject reason=%s gen=%llu path_id=%u "
+              "joint=%d dt=%.9f actual=%.9g limit=%.9g v=%.9g a=%.9g "
+              "exec_t=%.9f q_cmd=%.9g q_last=%.9g",
+              dec.reason, static_cast<unsigned long long>(slot.generation),
+              slot.path_id, dec.joint, dec.dt_s, dec.actual, dec.limit,
+              dec.velocity, dec.acceleration, exec_t,
+              dec.joint >= 0 ? q_cmd[dec.joint] : 0.0,
+              dec.joint >= 0 ? safety_supervisor_->q_last_send()[dec.joint] : 0.0);
+          latch_v2_fault(dec.reason, dec.q_send.allFinite() ? dec.q_send
+                                                          : interpolator_.q_ref());
           *q_out = stream_q_hold_;
         } else {
           *q_out = dec.q_send;
@@ -1112,6 +1146,7 @@ class KmpcNode : public rclcpp::Node {
       uint64_t gen = 0;
       uint32_t line_gen = 0;
       uint64_t tick_snap = 0;
+      uint64_t seq = 0;
       {
         std::lock_guard<std::mutex> lock(stream_mu_);
         send = stream_take_tick(&q);
@@ -1120,9 +1155,9 @@ class KmpcNode : public rclcpp::Node {
         // Snapshot tick with the accepted q under the same lock — do not reload
         // stream_tick_id_ after unlock (50 Hz may have advanced it).
         tick_snap = stream_segment_tick_;
+        if (send) seq = publish_stream_recorded(q);
       }
-      if (send) {
-        const uint64_t seq = publish_stream(q);
+      if (send && seq != 0) {
         if (layer_diag_on_) {
           push_stream_diag(kmpc::ros2io::LayerDiagLayer::FinalSend, q, gen, line_gen,
                            "sent", seq, true, 0.0, 1.0, 0, false, tick_snap,
@@ -1700,10 +1735,23 @@ class KmpcNode : public rclcpp::Node {
                          : std::string(kmpc::kEeFrameRight);
       mt.q = q0;
       // Seal immutable identity from real URDF bytes + limits before digest.
-      const auto v2_policy = kmpc::policy_from_config(cfg_);
+      const auto v2_policy = kmpc::policy_from_config(
+          cfg_, std::min(dq_scale_, line_dq_scale_));
       const uint64_t digest = kmpc::seal_motion_task_identity(
           &mt, line_urdf_source_, line_urdf_xml_, v2_policy);
       const kmpc::V2TaskId req_id{mt.generation, digest};
+      bool exec_faulted = false;
+      {
+        std::lock_guard<std::mutex> lock(stream_mu_);
+        exec_faulted = v2_exec_.fault_matches(mt.generation, digest);
+        if (exec_faulted) q0 = stream_q_hold_;
+      }
+      if (exec_faulted) {
+        if (follower_->has_package()) follower_->hold_at(q0);
+        publish_arrived(false);
+        publish_cmd(q0, kmpc::Vec18::Zero(), 0.0, true);
+        return;
+      }
       const bool explicit_req = v2_request_plan_;
       v2_request_plan_ = false;
       const auto gate_dec = v2_gate_.on_tick(req_id, follower_->has_package(),
@@ -1823,13 +1871,14 @@ class KmpcNode : public rclcpp::Node {
           stream_v2_claim_arrived_ = false;
           stream_goal_gen_ = plan.package.generation;
           stream_line_gen_ = static_cast<int>(plan.package.path_id);
-          safety_supervisor_->seed(q_meas_adopt);
+          // Send history is independent of path identity. Pending hold sends
+          // already brought its velocity/acceleration to zero.
+          v2_exec_.adopt(plan.package.generation, v2_gate_.active().digest,
+                         plan.package.path_id, steady_seconds());
+          v2_observer_stamp_s_ = steady_seconds();
           V2ExecSlot slot;
           slot.active = true;
           slot.package = plan.package;
-          slot.t0_s = v2_follow_t0_;
-          slot.exec_t_s = 0.0;
-          slot.exec_t_wall_s = v2_follow_t0_;
           slot.timeline_frozen = false;
           slot.freeze_q = q_meas_adopt;
           // Seed next unreleased barrier so 250 Hz clamps before first 50 Hz
@@ -1885,7 +1934,14 @@ class KmpcNode : public rclcpp::Node {
         publish_cmd(q0, kmpc::Vec18::Zero(), 0.0, true);
         return;
       }
-      const double dt = std::max(cfg_.params.dt, 1e-3);
+      const double observer_now = steady_seconds();
+      const double dt = std::max(observer_now - v2_observer_stamp_s_, 1e-4);
+      v2_observer_stamp_s_ = observer_now;
+      double sender_exec_t = 0.0;
+      {
+        std::lock_guard<std::mutex> lock(stream_mu_);
+        sender_exec_t = v2_exec_.exec_s();
+      }
       const kmpc::Vec18 q_meas_step =
           (q_meas && q_meas->allFinite()) ? *q_meas : q0;
       const double meas_stamp =
@@ -1894,7 +1950,7 @@ class KmpcNode : public rclcpp::Node {
                                 : v2_meas_stamp_s_)
                          : std::numeric_limits<double>::quiet_NaN();
       const kmpc::FollowerTick tick =
-          follower_->step(q_meas_step, dt, meas_stamp, now().seconds());
+          follower_->step(q_meas_step, dt, meas_stamp, now().seconds(), sender_exec_t);
       kmpc::Vec18 q_cmd = tick.q_follow;
       kmpc::Vec18 dq = tick.q_follow - q0;
       if (tick.action == kmpc::FollowerAction::ProtectStop) {
@@ -1932,6 +1988,9 @@ class KmpcNode : public rclcpp::Node {
       }
       {
         std::lock_guard<std::mutex> lock(stream_mu_);
+        // A safety fault may arrive while the observer computes its tick.
+        // Never publish an active slot over that newer fault.
+        if (v2_exec_.fault_matches(mt.generation, digest)) return;
         stream_hold_ = false;
         stream_fixed_ = false;
         stream_line_ = false;
@@ -1948,9 +2007,6 @@ class KmpcNode : public rclcpp::Node {
         V2ExecSlot slot;
         slot.active = true;
         slot.package = follower_->package();
-        slot.t0_s = v2_follow_t0_;
-        slot.exec_t_s = tick.exec_t_s;
-        slot.exec_t_wall_s = now().seconds();
         slot.timeline_frozen = tick.timeline_frozen;
         slot.barrier_pending = tick.barrier_pending;
         slot.barrier_released = tick.barrier_released;
@@ -1964,13 +2020,9 @@ class KmpcNode : public rclcpp::Node {
         slot.generation = tick.generation;
         slot.path_id = tick.path_id;
         slot.task_digest = v2_gate_.active().digest;
-        slot.q_offset = tick.q_offset;
         slot.q_follow_hint = tick.q_follow;
         slot.claim_time_done =
             (tick.action == kmpc::FollowerAction::Arrived);
-        slot.recovering = (tick.state == kmpc::FollowerState::Recovering);
-        slot.pitch_excess_ceiling = tick.pitch_excess_ceiling;
-        slot.q_recovery_cmd = tick.q_follow;
         publish_v2_slot(slot);
       }
       // Arrived only after 250 Hz safety accepted the claim for this gen/path.
@@ -2938,14 +2990,15 @@ class KmpcNode : public rclcpp::Node {
     bool send = false;
     uint64_t gen = 0;
     uint32_t line_gen = 0;
+    uint64_t seq = 0;
     {
       std::lock_guard<std::mutex> lock(stream_mu_);
       send = stream_take_tick(&q);
       gen = stream_goal_gen_;
       line_gen = stream_line_gen_ < 0 ? 0u : static_cast<uint32_t>(stream_line_gen_);
+      if (send) seq = publish_stream_recorded(q);
     }
-    if (send) {
-      const uint64_t seq = publish_stream(q);
+    if (send && seq != 0) {
       if (layer_diag_on_) {
         push_stream_diag(kmpc::ros2io::LayerDiagLayer::FinalSend, q, gen, line_gen,
                          "sent", seq, true);
@@ -3029,6 +3082,7 @@ class KmpcNode : public rclcpp::Node {
     int nbrk = 0;
     {
       std::lock_guard<std::mutex> lock(stream_mu_);
+      held = held || (use_v2_chain_ && stream_hold_);
       sfix = stream_fixed_;
       nbrk = stream_hold_ ? kmpc::kNDof : interpolator_.n_axis_brake();
     }
@@ -3223,6 +3277,15 @@ class KmpcNode : public rclcpp::Node {
           " qp_fail_pitch_deg=" + std::to_string(fail.pitch_deg) +
           " qp_fail_ee_err_m=" + std::to_string(fail.ee_err_m);
     }
+    {
+      std::lock_guard<std::mutex> lock(stream_mu_);
+      status.data += " v2_safety_fault=" + std::to_string(v2_exec_.faulted()) +
+          " v2_safety_reason=" + (v2_exec_.faulted() ? std::string(v2_exec_.reason()) : "none") +
+          " v2_safety_rejects=" + std::to_string(v2_safety_rejects_) +
+          " v2_exec_t=" + std::to_string(v2_exec_.exec_s()) +
+          " v2_publish_lag_ms=" + std::to_string(v2_publish_lag_ms_) +
+          " v2_feedback_qp=0";
+    }
     dbg_status_->publish(status);
     status_pub_->publish(status);
   }
@@ -3240,15 +3303,9 @@ class KmpcNode : public rclcpp::Node {
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
     bool active = false;
     bool protect_stop = false;
-    bool recovering = false;
     bool claim_time_done = false;
     bool timeline_frozen = false;
     kmpc::TrajectoryPackage package{};
-    double t0_s = 0.0;
-    // Effective execution time at publish, plus wall stamp for 250 Hz fill-in
-    // between 50 Hz ticks. When frozen, 250 Hz must hold freeze_q.
-    double exec_t_s = 0.0;
-    double exec_t_wall_s = 0.0;
     // Next unreleased StageBoundary — 250 Hz clamps before sampling so a TIP
     // between two 50 Hz ticks cannot produce LIFT commands.
     bool barrier_pending = false;
@@ -3261,11 +3318,8 @@ class KmpcNode : public rclcpp::Node {
     uint64_t generation = 0;
     uint32_t path_id = 0;
     uint64_t task_digest = 0;
-    kmpc::Vec18 q_offset = kmpc::Vec18::Zero();
     kmpc::Vec18 q_follow_hint = kmpc::Vec18::Zero();
-    kmpc::Vec18 q_recovery_cmd = kmpc::Vec18::Zero();
     kmpc::Vec18 freeze_q = kmpc::Vec18::Zero();
-    double pitch_excess_ceiling = 0.0;
   };
 
   struct V2SafetyArrived {
@@ -3350,6 +3404,12 @@ class KmpcNode : public rclcpp::Node {
   bool v2_request_plan_ = false;
   kmpc::V2SubmitGate v2_gate_{};
   double v2_follow_t0_ = 0.0;
+  kmpc::V2ExecutionState v2_exec_;
+  uint64_t v2_safety_rejects_ = 0;
+  double v2_observer_stamp_s_ = 0.0;
+  double stream_send_stamp_s_ = 0.0;
+  double stream_exec_before_tick_ = 0.0;
+  double v2_publish_lag_ms_ = 0.0;
   bool stream_v2_ = false;
   bool stream_v2_claim_arrived_ = false;
   V2SafetyArrived v2_safety_arrived_{};

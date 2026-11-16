@@ -103,6 +103,15 @@ uint64_t seal_motion_task_identity(MotionTask* task, const std::string& urdf,
                                    const MotionConstraintPolicy& policy);
 
 // Wall time along the certified time law at a densified sample index.
+// Sending and curve time differ while waiting for ACK. The shared probe
+// includes two rest sends at every stop and resumes from that frozen curve time.
+struct TrajectorySendProbe {
+  double send_s;
+  double curve_s;
+};
+std::vector<TrajectorySendProbe> trajectory_send_probe_grid(
+    const TrajectoryPackage& package, double send_dt = 0.004);
+
 double time_at_sample_index(const TrajectoryPackage& package,
                             std::size_t sample_index);
 

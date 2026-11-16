@@ -183,11 +183,58 @@ double time_at_sample_index(const TrajectoryPackage& package,
       if (s1 - s0 <= 1e-12) {
         return t1;
       }
+      if (law.ds_dt.size() == law.s.size()) {
+        // Sparse time tables need the inverse of the executed cubic s(t),
+        // not a linear inverse that would stop at the wrong joint sample.
+        double lo = t0, hi = t1;
+        for (int k = 0; k < 48; ++k) {
+          const double mid = 0.5 * (lo + hi);
+          TrajectoryTimeSample sample;
+          if (!sample_trajectory_at(package, mid, &sample, false) || !sample.ok)
+            return t1;
+          if (sample.s < s_tgt) lo = mid;
+          else hi = mid;
+        }
+        return 0.5 * (lo + hi);
+      }
       const double a = (s_tgt - s0) / (s1 - s0);
       return t0 + a * (t1 - t0);
     }
   }
   return law.t_s.back();
+}
+
+std::vector<TrajectorySendProbe> trajectory_send_probe_grid(
+    const TrajectoryPackage& package, double send_dt) {
+  std::vector<TrajectorySendProbe> out;
+  const double duration = package.time_law.duration_s;
+  if (!(send_dt > 0.0) || !std::isfinite(duration) || duration < 0.0) return out;
+  std::vector<double> stops;
+  for (const auto& b : package.stage_boundaries) {
+    if ((b.stop_required || b.wait_for_external_ack) &&
+        b.sample_index > 0 && b.sample_index < package.samples.size()) {
+      stops.push_back(time_at_sample_index(package, b.sample_index));
+    }
+  }
+  stops.push_back(duration);
+  std::sort(stops.begin(), stops.end());
+  stops.erase(std::unique(stops.begin(), stops.end()), stops.end());
+  double sending = -3.0 * send_dt;
+  auto push = [&](double curve) {
+    sending += send_dt;
+    out.push_back({sending, curve});
+  };
+  push(0.0); push(0.0); push(0.0);
+  double start = 0.0;
+  for (double end : stops) {
+    end = std::clamp(end, start, duration);
+    const int ticks = static_cast<int>(std::ceil((end - start) / send_dt));
+    for (int i = 1; i <= ticks; ++i)
+      push(std::min(end, start + i * send_dt));
+    push(end); push(end);
+    start = end;
+  }
+  return out;
 }
 
 AdmitDecision admit_package_start(
@@ -265,8 +312,20 @@ bool sample_trajectory_at(const TrajectoryPackage& package, double t_s,
     if (t1 - t0 <= 1e-12) {
       return s1;
     }
-    const double a = (tt - t0) / (t1 - t0);
-    return s0 + a * (s1 - s0);
+    const double h = t1 - t0;
+    const double a = std::clamp((tt - t0) / h, 0.0, 1.0);
+    if (law.ds_dt.size() <= i1) return s0 + a * (s1 - s0);
+    // Honour planned endpoint/STOP/ACK rates. Linear interpolation ignored
+    // ds_dt=0 and turned every stop into an abrupt velocity discontinuity.
+    const double secant = (s1 - s0) / h;
+    if (!(secant > 0.0)) return s0;
+    double m0 = std::clamp(law.ds_dt[i], 0.0, 3.0 * secant);
+    double m1 = std::clamp(law.ds_dt[i1], 0.0, 3.0 * secant);
+    const double norm = std::hypot(m0 / secant, m1 / secant);
+    if (norm > 3.0) { m0 *= 3.0 / norm; m1 *= 3.0 / norm; }
+    const double a2 = a * a, a3 = a2 * a;
+    return std::clamp((2*a3 - 3*a2 + 1)*s0 + (a3 - 2*a2 + a)*h*m0 +
+                      (-2*a3 + 3*a2)*s1 + (a3 - a2)*h*m1, s0, s1);
   };
 
   const double s = s_at_t(t);

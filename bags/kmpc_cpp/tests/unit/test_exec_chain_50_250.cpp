@@ -9,9 +9,12 @@
 #include <gtest/gtest.h>
 
 #include "kmpc/config.hpp"
+#include "kmpc/fast_trajectory_optimizer.hpp"
+#include "kmpc/trajectory_cost.hpp"
 #include "kmpc/constraint_policy.hpp"
 #include "kmpc/kinematics.hpp"
 #include "kmpc/motion_task.hpp"
+#include "kmpc/line_contract.hpp"
 #include "kmpc/safety_supervisor.hpp"
 #include "kmpc/time_parameterizer.hpp"
 #include "kmpc/tracker_math.hpp"
@@ -19,6 +22,7 @@
 #include "kmpc/trajectory_package.hpp"
 #include "kmpc/trajectory_validator.hpp"
 #include "kmpc/whole_body_guards.hpp"
+#include "kmpc/v2_execution_state.hpp"
 
 namespace {
 
@@ -1016,4 +1020,383 @@ TEST(P0StageSettle, TipTaskTolRejectsEightMmAndAcceptsStable) {
     EXPECT_EQ(f.state(), kmpc::FollowerState::Active);
     EXPECT_FALSE(f.timeline_frozen());
   }
+}
+
+// Regression for r53: the observer may jitter or disappear; only the sender
+// advances q(t). These tests exercise the production clock and follower API.
+TEST(R53Execution, ObserverJitterCannotReanchorSenderAndPauseNeverCatchesUp) {
+  kmpc::V2ExecutionState exec;
+  exec.adopt(7, 42, 9, 10.0);
+  double wall = 10.0;
+  for (int i = 1; i <= 100; ++i) {
+    wall += 0.004;
+    EXPECT_NEAR(exec.advance(wall, false, false, 0.0), 0.004 * i, 1e-10);
+  }
+  exec.pause(wall + 2.0);
+  EXPECT_NEAR(exec.advance(wall + 2.004, false, false, 0.0), 0.404, 1e-10);
+  EXPECT_NEAR(exec.advance(wall + 2.008, false, true, 0.406), 0.406, 1e-10);
+  for (int i = 1; i <= 200; ++i)
+    EXPECT_DOUBLE_EQ(exec.advance(wall + 2.008 + i * 0.004,
+                                  true, true, 0.406), 0.406);
+  EXPECT_NEAR(exec.advance(wall + 2.812, false, false, 0.0), 0.410, 1e-10);
+  exec.latch_fault("safety_jerk");
+  for (int i = 0; i < 200; ++i) {
+    EXPECT_TRUE(exec.fault_matches(7, 42));
+    EXPECT_NEAR(exec.advance(wall + 3.0 + i * 0.02,
+                            false, false, 0.0), 0.410, 1e-10);
+  }
+  EXPECT_FALSE(exec.fault_matches(8, 42));
+  exec.adopt(8, 43, 10, wall + 8.0);
+  EXPECT_FALSE(exec.faulted());
+  EXPECT_DOUBLE_EQ(exec.exec_s(), 0.0);
+}
+
+TEST(R53Execution, SenderTimedFollowerNeverAddsFeedbackOffset) {
+  const auto config = kmpc::Config::load(
+      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+  kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
+                       "/Light-duty wheeled robot.urdf");
+  const auto policy = kmpc::policy_from_config(config);
+  const auto q0 = home_q(config);
+  auto pkg = make_hold_package(q0, 7);
+  pkg.samples.back()[kmpc::kSliceLeft.begin + 5] += 0.02;
+  pkg.time_law.t_s = {0.0, 4.0};
+  pkg.time_law.duration_s = 4.0;
+  kmpc::TrajectoryFollower follower(kin, nullptr, policy);
+  // Even an old caller opting into the legacy QP cannot alter production q(t).
+  follower.set_enable_qp_correction(true);
+  ASSERT_TRUE(follower.adopt(pkg, q0, kmpc::Vec18::Zero(), false));
+  kmpc::SafetySupervisor supervisor(kin, nullptr, policy);
+  supervisor.seed(q0);
+  kmpc::V2ExecutionState exec;
+  exec.adopt(7, 42, 1, 10.0);
+  double next_observer = 0.0;
+  int observer_count = 0;
+  double prev_observer_t = 0.0;
+  for (int i = 0; i < 600; ++i) {
+    const double wall = 10.0 + i * 0.004;
+    const double t = exec.advance(wall, false, false, 0.0);
+    kmpc::TrajectoryTimeSample sample;
+    ASSERT_TRUE(kmpc::sample_trajectory_at(pkg, t, &sample));
+    kmpc::Vec18 measured = sample.q;
+    measured[kmpc::kSliceLeft.begin + 5] -= 0.002;
+    if (t + 1e-9 >= next_observer) {
+      const auto tick = follower.step(measured, std::max(0.02, t - prev_observer_t),
+                                     wall, wall, t);
+      ASSERT_EQ(tick.action, kmpc::FollowerAction::Continue) << tick.reason;
+      EXPECT_FALSE(tick.qp_used);
+      EXPECT_DOUBLE_EQ(tick.q_offset.norm(), 0.0);
+      EXPECT_NEAR((tick.q_follow - sample.q).norm(), 0.0, 1e-12);
+      EXPECT_DOUBLE_EQ(tick.exec_t_s, t);
+      prev_observer_t = t;
+      const double intervals[] = {0.012, 0.028, 0.016, 0.024, 0.06};
+      next_observer = t + intervals[observer_count++ % 5];
+    }
+    kmpc::SafetySupervisorInput in;
+    in.q_cmd = sample.q;
+    in.q_plan = sample.q;
+    in.q_meas = measured;
+    in.has_meas = true;
+    in.now_s = wall + 1000.0;
+    in.meas_timestamp_s = in.now_s;
+    in.send_timestamp_s = wall;
+    const auto decision = supervisor.check(in, false);
+    ASSERT_TRUE(decision.accept) << decision.reason << " tick=" << i;
+    // Validation alone cannot change the last actual send.
+    supervisor.note_sent(decision.q_send, wall);
+  }
+}
+
+TEST(R53Execution, HoldsAreRecordedAndUnsentCandidatesNeverEnterHistory) {
+  const auto config = kmpc::Config::load(
+      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+  kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
+                       "/Light-duty wheeled robot.urdf");
+  const auto policy = kmpc::policy_from_config(config);
+  const auto q0 = home_q(config);
+  kmpc::SafetySupervisor supervisor(kin, nullptr, policy);
+  supervisor.seed(q0);
+  supervisor.note_sent(q0, 10.0);
+  kmpc::SafetySupervisorInput in;
+  in.q_cmd = q0;
+  in.q_cmd[4] += policy.dq_max[4] * 0.004 * 0.1;
+  in.q_meas = q0;
+  in.has_meas = true;
+  in.now_s = in.meas_timestamp_s = 100.0;
+  in.send_timestamp_s = 10.004;
+  ASSERT_TRUE(supervisor.check(in, false).accept);
+  EXPECT_DOUBLE_EQ((supervisor.q_last_send() - q0).norm(), 0.0);
+  supervisor.note_sent(in.q_cmd, 10.004);
+  const auto hold = in.q_cmd;
+  for (int i = 2; i <= 20; ++i) supervisor.note_sent(hold, 10.0 + i * 0.004);
+  in.send_timestamp_s = 10.084;
+  in.q_cmd = hold;
+  in.q_cmd[4] += policy.dq_max[4] * 0.004 * 2.0;
+  const auto rejected = supervisor.check(in, false);
+  EXPECT_FALSE(rejected.accept);
+  EXPECT_STREQ(rejected.reason, "safety_step");
+  EXPECT_EQ(rejected.joint, 4);
+  EXPECT_NEAR(rejected.dt_s, 0.004, 1e-12);
+  EXPECT_GT(rejected.actual, rejected.limit);
+  EXPECT_DOUBLE_EQ((supervisor.q_last_send() - hold).norm(), 0.0);
+}
+
+TEST(R53Execution, ShortFirstObserverAllowsAdmittedMeasurementDifference) {
+  const auto config = kmpc::Config::load(
+      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+  kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
+                       "/Light-duty wheeled robot.urdf");
+  const auto q0 = home_q(config);
+  auto pkg = make_hold_package(q0, 7);
+  kmpc::Vec18 measured = q0;
+  measured[4] += 0.0005;
+  kmpc::TrajectoryFollower follower(kin, nullptr, kmpc::policy_from_config(config));
+  ASSERT_TRUE(follower.adopt(pkg, measured, kmpc::Vec18::Zero(), false));
+  const auto tick = follower.step(measured, 0.0001, 10.0, 10.0, 0.0);
+  EXPECT_EQ(tick.action, kmpc::FollowerAction::Continue) << tick.reason;
+  EXPECT_NEAR((tick.q_follow - q0).norm(), 0.0, 1e-12);
+}
+
+TEST(R53Execution, PassThroughStageCannotHideLaterAckBarrier) {
+  const auto config = kmpc::Config::load(
+      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+  kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
+                       "/Light-duty wheeled robot.urdf");
+  const auto q0 = home_q(config);
+  auto pkg = make_hold_package(q0, 7);
+  pkg.samples = {q0, q0, q0, q0};
+  pkg.time_law.s = {0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0};
+  pkg.time_law.t_s = {0.0, 0.2, 0.4, 0.6};
+  pkg.time_law.ds_dt = {0.0, 0.0, 0.0, 0.0};
+  pkg.time_law.duration_s = 0.6;
+  kmpc::StageBoundary pass, ack, end;
+  pass.sample_index = 1; pass.stage_id = 1;
+  ack.sample_index = 2; ack.stage_id = 2; ack.wait_for_external_ack = true;
+  end.sample_index = 3; end.stage_id = 3; end.stop_required = true;
+  pkg.stage_boundaries = {pass, ack, end};
+  kmpc::TrajectoryFollower follower(kin, nullptr, kmpc::policy_from_config(config));
+  ASSERT_TRUE(follower.adopt(pkg, q0, kmpc::Vec18::Zero(), false));
+  auto tick = follower.step(q0, 0.02, 10.2, 10.2, 0.2);
+  EXPECT_TRUE(tick.barrier_pending);
+  EXPECT_EQ(tick.barrier_stage_id, 2u);
+  for (int i = 0; i < 15 && !follower.waiting_ack(); ++i)
+    tick = follower.step(q0, 0.02, 10.4 + i * 0.02, 10.4 + i * 0.02, 0.4);
+  ASSERT_TRUE(follower.waiting_ack()) << tick.reason;
+  EXPECT_DOUBLE_EQ(tick.exec_t_s, 0.4);
+  std::string why;
+  EXPECT_FALSE(follower.on_stage_ack(6, 2, true, q0, &why));
+  ASSERT_TRUE(follower.on_stage_ack(7, 2, true, q0, &why,
+                                     10.7, 10.7)) << why;
+  tick = follower.step(q0, 0.02, 10.72, 10.72, 0.404);
+  EXPECT_NEAR(tick.exec_t_s, 0.404, 1e-12);
+  EXPECT_EQ(tick.barrier_stage_id, 3u);
+}
+
+TEST(R53Execution, CertifiedPitchRecoveryUsesCurveNotMeasuredStaircase) {
+  const auto config = kmpc::Config::load(
+      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+  kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
+                       "/Light-duty wheeled robot.urdf");
+  const auto policy = kmpc::policy_from_config(config);
+  auto q0 = home_q(config);
+  q0[1] += -policy.torso_pitch_max_rad - 0.000254 - q0.head<3>().sum();
+  auto pkg = make_hold_package(q0, 7);
+  pkg.samples.back()[1] += 0.0005;
+  pkg.time_law.t_s = {0.0, 2.0};
+  pkg.time_law.duration_s = 2.0;
+  kmpc::TrajectoryFollower follower(kin, nullptr, policy);
+  ASSERT_TRUE(follower.adopt(pkg, q0, kmpc::Vec18::Zero(), false));
+  kmpc::SafetySupervisor supervisor(kin, nullptr, policy);
+  supervisor.seed(q0);
+  for (int i = 0; i <= 500; ++i) {
+    const double t = i * 0.004;
+    kmpc::TrajectoryTimeSample sample;
+    ASSERT_TRUE(kmpc::sample_trajectory_at(pkg, t, &sample));
+    if (i % 5 == 0) {
+      const auto tick = follower.step(q0, 0.02, 10.0 + t, 10.0 + t, t);
+      EXPECT_NEAR((tick.q_follow - sample.q).norm(), 0.0, 1e-12);
+      EXPECT_NE(tick.state, kmpc::FollowerState::Recovering);
+    }
+    kmpc::SafetySupervisorInput in;
+    in.q_cmd = sample.q; in.q_plan = sample.q;
+    in.q_meas = q0; in.has_meas = true;
+    in.now_s = in.meas_timestamp_s = 1000.0 + t;
+    in.send_timestamp_s = 10.0 + t;
+    in.mode = kmpc::SafetyExecMode::Recovering;
+    in.pitch_excess_ceiling = follower.pitch_excess_of(supervisor.q_last_send());
+    const auto d = supervisor.check(in, false);
+    ASSERT_TRUE(d.accept) << d.reason << " i=" << i;
+    supervisor.note_sent(d.q_send, in.send_timestamp_s);
+  }
+}
+
+TEST(R53Execution, FieldLeftTwoStagesPassNominalSendingWithLaggedFeedback) {
+  const auto config = kmpc::Config::load(
+      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+  kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
+                       "/Light-duty wheeled robot.urdf");
+  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
+  // Measured q at t=35.6358 in 20261116T071131Z; radians, URDF 18-axis order.
+  kmpc::Vec18 q0;
+  q0 << 0.6981290376366417, -0.8726553049333495, -0.17453825152161312,
+      -0.026161562968393396, -0.0017102986968056998, 0.5153259652775903,
+      -0.13651973611635804, -2.126579257692943, -1.2752244744218761,
+      -0.24291496577261937, 0.01394496394212196, -0.0017104484996170166,
+      0.51532591534332, 0.1365200956431052, -2.126578658481698,
+      1.2752249537908726, -0.2429148459303703, 0.013944844099872905;
+  const auto policy = kmpc::policy_from_config(config, 0.3);
+  auto weights = kmpc::load_trajectory_quality_weights(
+      cfg("trajectory_quality.yaml"), config.limits.dq_max, nullptr);
+  kmpc::MotionTask task;
+  task.generation = 1794813127691249189ULL;
+  task.q = q0; task.left = true; task.frame = std::string(kmpc::kEeFrameLeft);
+  for (int i = 0; i < 2; ++i) {
+    kmpc::TaskStage stage;
+    stage.stage_id = i + 1;
+    stage.position = kmpc::Vec3(0.456071795, 0.272798503, i == 0 ? 0.715 : 0.565);
+    stage.has_orientation = true;
+    stage.quat = kmpc::tool_to_flange_quat_xyzw(
+        kmpc::Vec4(0.778376915, 0.229195584, -0.312912199, 0.493644324));
+    stage.stop = i == 0 ? kmpc::StageStop::Continuous
+                        : kmpc::StageStop::StopRequired;
+    task.stages.push_back(stage);
+  }
+  kmpc::RobotState state; state.q = q0; state.fresh = true;
+  const auto plan = kmpc::FastTrajectoryOptimizer(kin, &guards).plan(
+      task, state, policy, weights, kmpc::kPlannerBudgetMs);
+  ASSERT_TRUE(plan.ok) << plan.reason << " " << plan.report;
+  const auto& pkg = plan.package;
+  std::size_t stage_start = 0;
+  for (const auto& b : pkg.stage_boundaries) {
+    if (b.sample_index <= stage_start) continue;
+    kmpc::JointCurve segment(pkg.samples.begin() + stage_start,
+                             pkg.samples.begin() + b.sample_index + 1);
+    const auto direction = kmpc::check_path_direction_strict(segment);
+    EXPECT_TRUE(direction.ok) << "stage=" << b.stage_id << " " << direction.reason;
+    stage_start = b.sample_index;
+  }
+  kmpc::TrajectoryFollower follower(kin, &guards, policy);
+  ASSERT_TRUE(follower.adopt(pkg, q0, kmpc::Vec18::Zero(), false));
+  kmpc::SafetySupervisor supervisor(kin, &guards, policy);
+  supervisor.seed(q0);
+  kmpc::Vec18 measured = q0, previous_send = q0;
+  double max_waist = 0.0, max_arm = 0.0;
+  bool arrived = false;
+  const int ticks = static_cast<int>(std::ceil(pkg.time_law.duration_s / 0.004)) + 100;
+  double exec_t = 0.0;
+  for (int i = 0; i < ticks; ++i) {
+    exec_t = std::min(i * 0.004, pkg.time_law.duration_s);
+    kmpc::TrajectoryTimeSample sample;
+    ASSERT_TRUE(kmpc::sample_trajectory_at(pkg, exec_t, &sample));
+    if (i % 5 == 0) {
+      const auto tick = follower.step(measured, 0.02, 100.0 + i * 0.004,
+                                     100.0 + i * 0.004, exec_t);
+      ASSERT_NE(tick.action, kmpc::FollowerAction::Brake) << tick.reason;
+      ASSERT_NE(tick.action, kmpc::FollowerAction::NeedReplan) << tick.reason;
+      EXPECT_FALSE(tick.qp_used);
+      EXPECT_NEAR(tick.q_offset.norm(), 0.0, 1e-12);
+      arrived = arrived || tick.action == kmpc::FollowerAction::Arrived;
+    }
+    kmpc::SafetySupervisorInput in;
+    in.q_cmd = sample.q; in.q_plan = sample.q; in.q_meas = measured;
+    in.has_meas = true; in.now_s = in.meas_timestamp_s = 100.0 + i * 0.004;
+    in.send_timestamp_s = 10.0 + i * 0.004;
+    in.package = &pkg; in.expected_generation = pkg.generation;
+    in.expected_path_id = pkg.path_id; in.expected_task_digest = pkg.task_digest;
+    const auto d = supervisor.check(in, false);
+    ASSERT_TRUE(d.accept) << d.reason << " i=" << i << " joint=" << d.joint
+                          << " actual=" << d.actual << " limit=" << d.limit;
+    supervisor.note_sent(d.q_send, in.send_timestamp_s);
+    max_waist = std::max(max_waist, (d.q_send - q0).head<3>().cwiseAbs().maxCoeff());
+    max_arm = std::max(max_arm, (d.q_send - q0).segment<7>(kmpc::kSliceLeft.begin).cwiseAbs().maxCoeff());
+    // One send-cycle plant delay; not a hardware replay or motor model.
+    measured = previous_send;
+    previous_send = d.q_send;
+  }
+  EXPECT_TRUE(arrived);
+  EXPECT_GT(max_waist, 1e-4);
+  EXPECT_GT(max_arm, 1e-4);
+  const double tcp_error = (kin.fk_pos(previous_send, kmpc::kEeFrameLeft) -
+                            task.stages.back().position).norm();
+  EXPECT_LE(tcp_error, task.stages.back().position_tol_m);
+  std::printf("R53_FIELD nominal_send=PASS duration_s=%.3f waist_exc_rad=%.6f "
+              "arm_exc_rad=%.6f final_tcp_m=%.6f\n",
+              pkg.time_law.duration_s, max_waist, max_arm, tcp_error);
+}
+
+TEST(R53Execution, NonAlignedAckStopAndRestartShareTheCertifiedSendGrid) {
+  const auto config = kmpc::Config::load(
+      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+  kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
+                       "/Light-duty wheeled robot.urdf");
+  const auto policy = kmpc::policy_from_config(config, 0.3);
+  const auto q0 = home_q(config);
+  auto pkg = make_hold_package(q0, 7);
+  auto q1 = q0, q2 = q0;
+  q1[11] += 0.03; q2[11] += 0.06;
+  pkg.samples = {q0, q1, q2};
+  kmpc::StageBoundary ack;
+  ack.sample_index = 1; ack.stage_id = 1;
+  ack.wait_for_external_ack = true;  // ACK alone must force an actual zero rate.
+  pkg.stage_boundaries = {ack};
+  pkg.time_law = kmpc::TimeParameterizer().compute(pkg.samples, policy,
+                                                  pkg.stage_boundaries);
+  // Deliberately place the barrier between 4 ms ticks, while slowing only.
+  for (auto& t : pkg.time_law.t_s) t *= 1.003;
+  pkg.time_law.duration_s *= 1.003;
+  for (auto& v : pkg.time_law.ds_dt) v /= 1.003;
+  EXPECT_DOUBLE_EQ(pkg.time_law.ds_dt[1], 0.0);
+  const double barrier = kmpc::time_at_sample_index(pkg, 1);
+  kmpc::TrajectoryTimeSample at_barrier;
+  ASSERT_TRUE(kmpc::sample_trajectory_at(pkg, barrier, &at_barrier));
+  // The public diagnostic dq uses a coarse 1 ms finite difference. Probe
+  // q(t) near the knot directly to test the actual zero derivative limit.
+  kmpc::TrajectoryTimeSample before, after;
+  constexpr double h = 1e-7;
+  ASSERT_TRUE(kmpc::sample_trajectory_at(pkg, barrier - h, &before));
+  ASSERT_TRUE(kmpc::sample_trajectory_at(pkg, barrier + h, &after));
+  EXPECT_LT(((after.q - before.q) / (2.0 * h)).norm(), 1e-5);
+  kmpc::SafetySupervisor supervisor(kin, nullptr, policy);
+  supervisor.seed(q0);
+  int held_at_barrier = 0;
+  kmpc::Vec18 measured = q0;
+  for (const auto& probe : kmpc::trajectory_send_probe_grid(pkg)) {
+    kmpc::TrajectoryTimeSample sample;
+    ASSERT_TRUE(kmpc::sample_trajectory_at(pkg, probe.curve_s, &sample));
+    if (std::abs(probe.curve_s - barrier) < 1e-12) ++held_at_barrier;
+    kmpc::SafetySupervisorInput in;
+    in.q_cmd = sample.q; in.q_plan = sample.q; in.q_meas = measured;
+    in.has_meas = true; in.send_timestamp_s = 10.0 + probe.send_s;
+    in.now_s = in.meas_timestamp_s = 100.0 + probe.send_s;
+    const auto d = supervisor.check(in, false);
+    ASSERT_TRUE(d.accept) << d.reason << " at curve=" << probe.curve_s;
+    supervisor.note_sent(d.q_send, in.send_timestamp_s);
+    measured = d.q_send;
+  }
+  EXPECT_GE(held_at_barrier, 3);
+}
+
+TEST(R53Execution, UnpublishedCommandCannotConsumePathTime) {
+  kmpc::V2ExecutionState exec;
+  exec.adopt(7, 42, 1, 10.0);
+  const auto before = exec.exec_s();
+  EXPECT_GT(exec.advance(10.004, false, false, 0.0), before);
+  exec.discard_unsent_progress(before, 10.005);
+  exec.latch_fault("safety_publish_failed");
+  EXPECT_DOUBLE_EQ(exec.exec_s(), before);
+  EXPECT_DOUBLE_EQ(exec.advance(11.0, false, false, 0.0), before);
+}
+
+TEST(R53Execution, SparseStopTimeInvertsTheExecutedCubic) {
+  kmpc::TrajectoryPackage pkg;
+  pkg.samples = {kmpc::Vec18::Zero(), kmpc::Vec18::Zero(), kmpc::Vec18::Zero()};
+  pkg.time_law.s = {0.0, 1.0};
+  pkg.time_law.t_s = {0.0, 2.0};
+  pkg.time_law.ds_dt = {0.0, 0.5};
+  pkg.time_law.duration_s = 2.0;
+  const double at_middle_sample = kmpc::time_at_sample_index(pkg, 1);
+  EXPECT_GT(at_middle_sample, 1.0);
+  kmpc::TrajectoryTimeSample sample;
+  ASSERT_TRUE(kmpc::sample_trajectory_at(pkg, at_middle_sample, &sample));
+  EXPECT_NEAR(sample.s, 0.5, 1e-12);
 }

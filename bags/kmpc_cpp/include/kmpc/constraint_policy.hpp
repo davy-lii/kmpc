@@ -46,14 +46,15 @@ struct MotionConstraintPolicy {
   std::string com_model = "xy_work_rectangle";
 };
 
-inline MotionConstraintPolicy policy_from_config(const Config& cfg) {
+inline MotionConstraintPolicy policy_from_config(const Config& cfg,
+                                                   double velocity_scale = 1.0) {
   MotionConstraintPolicy policy;
   policy.q_min = cfg.limits.q_min;
   policy.q_max = cfg.limits.q_max;
-  policy.dq_max = cfg.limits.dq_max;
+  policy.dq_max = cfg.limits.dq_max * std::clamp(velocity_scale, 0.0, 1.0);
   // Conservative stand-in until device a/j are calibrated.
   for (int j = 0; j < kNDof; ++j) {
-    const double dq = std::max(cfg.limits.dq_max[j], 1e-3);
+    const double dq = std::max(policy.dq_max[j], 1e-3);
     policy.ddq_max[j] = 8.0 * dq;
     policy.dddq_max[j] = 40.0 * dq;
   }

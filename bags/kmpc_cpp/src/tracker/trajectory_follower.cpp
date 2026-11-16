@@ -284,20 +284,16 @@ FollowerTick TrajectoryFollower::make_hold(const Vec18& q,
   return tick;
 }
 
-const StageBoundary* TrajectoryFollower::stage_at_progress(double s) const {
-  if (!has_package_ || package_.samples.size() < 2) {
-    return nullptr;
-  }
+const StageBoundary* TrajectoryFollower::stage_at_progress(double s) {
+  if (!has_package_ || package_.samples.size() < 2) return nullptr;
   const double u = s * static_cast<double>(package_.samples.size() - 1);
-  for (std::size_t i = stage_cursor_; i < package_.stage_boundaries.size();
-       ++i) {
-    const StageBoundary& b = package_.stage_boundaries[i];
-    if (b.sample_index == 0) {
-      continue;
-    }
-    if (static_cast<double>(b.sample_index) <= u + 1e-9) {
+  while (stage_cursor_ < package_.stage_boundaries.size()) {
+    const auto& b = package_.stage_boundaries[stage_cursor_];
+    if (static_cast<double>(b.sample_index) > u + 1e-9) return nullptr;
+    if (b.sample_index != 0 && (b.stop_required || b.wait_for_external_ack))
       return &b;
-    }
+    // A pass-through stage is consumed, not returned forever in front of TIP.
+    ++stage_cursor_;
   }
   return nullptr;
 }
@@ -461,7 +457,7 @@ bool TrajectoryFollower::evaluate_stage_settle(const Vec18& q_stage,
 
 bool TrajectoryFollower::command_feasible(
     const Vec18& q_cmd, const Vec18& q_prev, double dt,
-    double pitch_excess_ceiling, const char** fail_tag) const {
+    double pitch_excess_ceiling, const char** fail_tag, bool enforce_step) const {
   if (!q_cmd.allFinite()) {
     if (fail_tag != nullptr) {
       *fail_tag = "nonfinite";
@@ -476,7 +472,7 @@ bool TrajectoryFollower::command_feasible(
   }
   const Vec18 cap = step_cap(dt);
   for (int j = 0; j < kNDof; ++j) {
-    if (std::abs(q_cmd[j] - q_prev[j]) > cap[j] + 1e-9) {
+    if (enforce_step && std::abs(q_cmd[j] - q_prev[j]) > cap[j] + 1e-9) {
       if (fail_tag != nullptr) {
         *fail_tag = "step_limit";
       }
@@ -785,8 +781,11 @@ FollowerTick TrajectoryFollower::brake_tick(const Vec18& q_meas, double dt) {
 }
 
 FollowerTick TrajectoryFollower::step(const Vec18& q_meas, double dt,
-                                      double meas_stamp_s, double now_s) {
+                                      double meas_stamp_s, double now_s,
+                                      double external_exec_t_s) {
   const double dtp = std::max(dt, 1e-4);
+  const bool sender_timed = std::isfinite(external_exec_t_s);
+  const double previous_exec_t = exec_t_;
   if (!q_meas.allFinite()) {
     state_ = FollowerState::Hold;
     dq_meas_valid_ = false;
@@ -814,7 +813,12 @@ FollowerTick TrajectoryFollower::step(const Vec18& q_meas, double dt,
     brake_ticks_ = 0;
   }
 
-  if (state_ == FollowerState::Active &&
+  // Production executes the certified recovery envelope in q(t), never the
+  // legacy 50 Hz measured-pose recovery staircase. Feedback remains monitored.
+  if (sender_timed && has_package_ && state_ == FollowerState::Recovering) {
+    state_ = FollowerState::Active;
+  }
+  if (!sender_timed && state_ == FollowerState::Active &&
       pitch_excess_of(q_meas) > kExcessEps) {
     state_ = FollowerState::Recovering;
     recovery_excess0_ = pitch_excess_of(q_meas);
@@ -885,7 +889,9 @@ FollowerTick TrajectoryFollower::step(const Vec18& q_meas, double dt,
 
   // Advance execution time only while the timeline is not frozen at a barrier.
   if (!timeline_frozen_) {
-    exec_t_ += dtp;
+    exec_t_ = std::isfinite(external_exec_t_s)
+                  ? std::max(exec_t_, external_exec_t_s)
+                  : exec_t_ + dtp;
   }
 
   FollowerTick tick;
@@ -1024,7 +1030,7 @@ FollowerTick TrajectoryFollower::step(const Vec18& q_meas, double dt,
   Vec18 q_ref = q_plan;
   const char* fail = nullptr;
   bool qp_used = false;
-  if (enable_qp_) {
+  if (enable_qp_ && !sender_timed) {
     const Vec3 p_plan = kin_.fk_pos(q_plan, ee_frame(package_.left));
     const Vec3 p_meas = kin_.fk_pos(q_meas, ee_frame(package_.left));
     const double err = (p_meas - p_plan).norm();
@@ -1047,7 +1053,12 @@ FollowerTick TrajectoryFollower::step(const Vec18& q_meas, double dt,
     }
   }
 
-  if (!command_feasible(q_ref, q_cmd_, dtp, 0.0, &fail)) {
+  const double follow_dt = sender_timed
+                               ? std::max(dtp, exec_t_ - previous_exec_t) : dtp;
+  const double certified_start_excess = sender_timed
+                               ? pitch_excess_of(package_.start_q) : 0.0;
+  if (!command_feasible(q_ref, q_cmd_, follow_dt, certified_start_excess, &fail,
+                        !sender_timed)) {
     state_ = FollowerState::Braking;
     brake_ticks_ = 0;
     tick.state = FollowerState::Braking;

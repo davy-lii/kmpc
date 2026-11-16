@@ -338,8 +338,8 @@ TrajectoryCertificate validate_actual_q_of_t(
     std::vector<double> ts;
     qs.reserve(static_cast<std::size_t>(n_check) + 2);
     ts.reserve(static_cast<std::size_t>(n_check) + 2);
-    auto push_sample = [&](double t) -> bool {
-      if (!ts.empty() && t <= ts.back() + 1e-12) {
+    auto push_sample = [&](double t, double send_t) -> bool {
+      if (!ts.empty() && send_t <= ts.back() + 1e-12) {
         return true;  // skip duplicate endpoint / stalled clock
       }
       TrajectoryTimeSample samp;
@@ -389,21 +389,16 @@ TrajectoryCertificate validate_actual_q_of_t(
         }
       }
       qs.push_back(samp.q);
-      ts.push_back(samp.t_s);
+      ts.push_back(send_t);
       return true;
     };
-    for (int k = 0; k < n_check; ++k) {
-      const double t = kSendDt * static_cast<double>(k);
-      if (t >= law.duration_s - 1e-12) {
-        break;
-      }
-      if (!push_sample(t)) {
+    // Shared with the time parameterizer: internal STOP/ACK hold and
+    // restart have the same derivative contract as package start/end.
+    for (const auto& probe : trajectory_send_probe_grid(package, kSendDt)) {
+      if (!push_sample(probe.curve_s, probe.send_s)) {
         exec_ok = false;
         break;
       }
-    }
-    if (exec_ok && !push_sample(law.duration_s)) {
-      exec_ok = false;
     }
     // Match SafetySupervisor 250 Hz boxes exactly (incl. software_limited
     // effective accel/jerk). Never use a looser offline margin than online.
@@ -413,7 +408,7 @@ TrajectoryCertificate validate_actual_q_of_t(
         for (int j = 0; j < kNDof; ++j) {
           const double dq_max = std::max(policy.dq_max[j], 1e-6);
           const double step = qs[i][j] - qs[i - 1][j];
-          if (std::abs(step) > dq_max * dt + 1e-4) {
+          if (std::abs(step) > dq_max * dt + 1e-9) {
             exec_ok = false;
             note(&fault, "exec_step");
             break;
