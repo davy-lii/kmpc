@@ -20,9 +20,7 @@ inline const std::vector<std::string>& string_params_read_by_str_or() {
       "robot_description",
       "joint_map_file",
       "joint_limits_file",
-      "q_pref_file",
       "kmpc_params_file",
-      "q_pref_station",
       "line_pace_mode",
       "line_brake_profile",
       "line_qp_follow_mode",
@@ -60,9 +58,7 @@ void declare_kmpc_node_params(NodeT& node) {
   node.template declare_parameter<std::string>("robot_description", "");
   node.template declare_parameter<std::string>("joint_map_file", "");
   node.template declare_parameter<std::string>("joint_limits_file", "");
-  node.template declare_parameter<std::string>("q_pref_file", "");
   node.template declare_parameter<std::string>("kmpc_params_file", "");
-  node.template declare_parameter<std::string>("q_pref_station", "default");
   node.declare_parameter("auto_enable", false);
   node.declare_parameter("demo_wave_waist", false);
   node.declare_parameter("demo_wave_amp", 0.5);
@@ -89,6 +85,9 @@ void declare_kmpc_node_params(NodeT& node) {
                                                "new_unified");
   node.template declare_parameter<std::string>("planner",
                                                "unified_multistage_v2");
+  // Legacy PoseArray/cascade two-point only. Typed MotionSequence is untouched.
+  node.template declare_parameter<std::string>("legacy_prep_geometry", "ptp");
+  node.template declare_parameter<std::string>("legacy_tip_geometry", "lin");
   node.declare_parameter("line_pose_pref_enable", false);
   node.declare_parameter("line_pitch_straighten_enable", true);
   node.declare_parameter("line_qp_pitch_monotonic_enable", true);

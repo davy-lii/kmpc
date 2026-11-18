@@ -15,14 +15,14 @@ int main(int argc,char**argv) {
   if(argc<3) {std::cerr<<"replay_recent cases.tsv results.csv [limit] [chain]\n";return 2;}
   const int limit=argc>3?std::stoi(argv[3]):100000;
   const bool chain=argc>4 && std::string(argv[4])=="chain";
-  Config cfg=Config::load(std::string(KMPC_CONFIG_DIR)+"/joint_limits.yaml",std::string(KMPC_CONFIG_DIR)+"/q_pref.yaml",std::string(KMPC_CONFIG_DIR)+"/kmpc_params.yaml");
+  Config cfg=Config::load(std::string(KMPC_CONFIG_DIR)+"/joint_limits.yaml", std::string(KMPC_CONFIG_DIR)+"/kmpc_params.yaml");
   Kinematics kin(std::string(KMPC_URDF_DIR)+"/Light-duty wheeled robot.urdf");
   if(std::string(argv[1])=="--fixture") {
     std::ofstream fixture(argv[2]);
-    const auto pose=kin.fk(cfg.q_pref,kEeFrameLeft);
+    const auto pose=kin.fk(kmpc::test_fixture_q0(),kEeFrameLeft);
     const Vec4 quat=rot_to_quat_xyzw(pose.block<3,3>(0,0));
     fixture<<std::setprecision(16)<<"{\"q\":[";
-    for(int i=0;i<18;++i) fixture<<(i?",":"")<<cfg.q_pref[i];
+    for(int i=0;i<18;++i) fixture<<(i?",":"")<<kmpc::test_fixture_q0()[i];
     fixture<<"],\"position\":[";
     for(int i=0;i<3;++i) fixture<<(i?",":"")<<pose(i,3);
     fixture<<"],\"flange_quat\":[";
@@ -32,7 +32,7 @@ int main(int argc,char**argv) {
 
   std::ifstream in(argv[1]);std::ofstream out(argv[2]);
   out<<"record,index,left,tip,arrived,refused,reason,ticks,length_m,lateral_mm,end_mm,ori_deg,step_ratio,waist_extra_deg,build_ms,solve_p95_ms,solve_p99_ms,first_step_ratio,cascade,forced,qp_solves\n";
-  std::string row,record;Vec18 continued=cfg.q_pref;bool previous_ok=false;int count=0,arrivals=0,refusals=0;
+  std::string row,record;Vec18 continued=kmpc::test_fixture_q0();bool previous_ok=false;int count=0,arrivals=0,refusals=0;
   while(std::getline(in,row) && count<limit) {
     Case c;std::istringstream ss(row);ss>>c.record>>c.index>>c.left>>c.time;
     for(int j=0;j<18;++j)ss>>c.q[j];for(int j=0;j<3;++j)ss>>c.xyz[j];for(int j=0;j<4;++j)ss>>c.quat[j];
@@ -54,7 +54,7 @@ int main(int argc,char**argv) {
     std::vector<double> times;
     for(;ticks<2000;++ticks) {
       const auto start=std::chrono::steady_clock::now();
-      auto step=tracker.compute(q,cfg.q_pref,c.left?&c.xyz:nullptr,c.left?nullptr:&c.xyz,c.left?&c.quat:nullptr,c.left?nullptr:&c.quat);
+      auto step=tracker.compute(q,kmpc::test_fixture_q0(),c.left?&c.xyz:nullptr,c.left?nullptr:&c.xyz,c.left?&c.quat:nullptr,c.left?nullptr:&c.quat);
       const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
       if(ticks)times.push_back(ms);else build_ms=ms;
       if(tracker.line_refused())break;

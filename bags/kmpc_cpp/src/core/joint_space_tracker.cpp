@@ -5,10 +5,16 @@ namespace kmpc {
 JointSpaceTracker::JointSpaceTracker(Kinematics& kin, const Config& cfg)
     : kin_(kin),
       constraints_(cfg.limits, cfg.params.dt),
-      guards_(cfg.params, cfg.q_pref[kIdxYaw]),
+      guards_(cfg.params, 0.0),
       w_(Vec18::Constant(cfg.params.w_joint)),
       r_default_(Vec18::Constant(cfg.params.r_arm)),
       s_(Vec18::Constant(cfg.params.s_joint)) {}
+
+void JointSpaceTracker::begin_task(const Vec18& q_start) {
+  if (q_start.allFinite()) {
+    guards_.set_yaw_pref(q_start[kIdxYaw]);
+  }
+}
 
 void JointSpaceTracker::reset() {
   dq_prev_.setZero();

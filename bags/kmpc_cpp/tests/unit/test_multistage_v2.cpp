@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include "kmpc/config.hpp"
+#include "kmpc/test_fixture.hpp"
 #include "kmpc/kinematics.hpp"
 #include "kmpc/motion_task.hpp"
 #include "kmpc/trajectory_cost.hpp"
@@ -60,13 +61,13 @@ kmpc::MotionTask without_inventing_lift(const kmpc::MotionTask& known) {
 
 TEST(MultistageV2, OneTwoThreeStagesWhenAllKnown) {
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
-  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
+  kmpc::WholeBodyGuards guards(config.params, kmpc::test_fixture_q0()[kmpc::kIdxYaw]);
   const auto policy = kmpc::policy_from_config(config);
   const auto weights = kmpc::default_cost_weights(config.limits.dq_max);
-  const kmpc::Vec18 q0 = config.q_pref;
+  const kmpc::Vec18 q0 = kmpc::test_fixture_q0();
   const kmpc::Vec3 p0 = kin.fk_pos(q0, kmpc::kEeFrameLeft);
 
   const std::vector<std::vector<kmpc::Vec3>> cases = {
@@ -96,13 +97,13 @@ TEST(MultistageV2, OneTwoThreeStagesWhenAllKnown) {
 
 TEST(MultistageV2, RejectInventingLiftWhenOnlyPreTipKnown) {
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
-  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
+  kmpc::WholeBodyGuards guards(config.params, kmpc::test_fixture_q0()[kmpc::kIdxYaw]);
   const auto policy = kmpc::policy_from_config(config);
   const auto weights = kmpc::default_cost_weights(config.limits.dq_max);
-  const kmpc::Vec18 q0 = config.q_pref;
+  const kmpc::Vec18 q0 = kmpc::test_fixture_q0();
   const kmpc::Vec3 p0 = kin.fk_pos(q0, kmpc::kEeFrameRight);
 
   // Field often sent PRE+TIP as poses=2, then LIFT later. Do not invent LIFT.

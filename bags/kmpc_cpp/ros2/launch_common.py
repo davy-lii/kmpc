@@ -31,7 +31,6 @@ def python_share_paths():
         'params': os.path.join(pkg, 'config', 'kmpc_params.yaml'),
         'joint_map': os.path.join(pkg, 'config', 'joint_map.yaml'),
         'limits': os.path.join(pkg, 'config', 'joint_limits.yaml'),
-        'q_pref': os.path.join(pkg, 'config', 'q_pref.yaml'),
         'sim_seed': os.path.join(pkg, 'config', 'sim_initial_joints.yaml'),
         'rviz': os.path.join(pkg, 'rviz', 'kmpc_sim.rviz'),
     }
@@ -42,7 +41,6 @@ def kmpc_node_action(robot_desc, paths, extra_params=None):
         'robot_description': robot_desc,
         'joint_map_file': paths['joint_map'],
         'joint_limits_file': paths['limits'],
-        'q_pref_file': paths['q_pref'],
         'kmpc_params_file': paths['params'],
         'auto_enable': ParameterValue(
             LaunchConfiguration('auto_enable'), value_type=bool),
@@ -169,8 +167,6 @@ def _sim_setup(context, *args, **kwargs):
                         name='pose_gui',
                         output='screen',
                         parameters=[{
-                            'q_pref_file': paths['q_pref'],
-                            'q_pref_station': 'default',
                             'joint_limits_file': paths['limits'],
                         }],
                     ),
@@ -188,8 +184,6 @@ def _sim_setup(context, *args, **kwargs):
                         name='calibrate_then_grasp',
                         output='screen',
                         parameters=[{
-                            'q_pref_file': paths['q_pref'],
-                            'q_pref_station': 'default',
                             'start_delay_sec': 0.5,
                             'autostart': True,
                         }],

@@ -43,8 +43,7 @@ void PlannerWorker::start() {
   } else {
     kin_ = std::make_unique<Kinematics>(urdf_path_);
   }
-  guards_ = std::make_unique<WholeBodyGuards>(config_.params,
-                                              config_.q_pref[kIdxYaw]);
+  guards_ = std::make_unique<WholeBodyGuards>(config_.params, 0.0);
   optimizer_ = std::make_unique<FastTrajectoryOptimizer>(*kin_, guards_.get());
   thread_ = std::thread([this] { loop(); });
 }
@@ -133,6 +132,9 @@ void PlannerWorker::loop() {
     FastPlanResult result;
     if (optimizer_ != nullptr) {
       MotionTask task = job.task;
+      if (guards_ && job.state.q.allFinite()) {
+        guards_->set_yaw_pref(job.state.q[kIdxYaw]);
+      }
       // q/dq come from the measured snapshot; they are not part of task identity.
       task.q = job.state.q;
       task.dq = job.state.dq;

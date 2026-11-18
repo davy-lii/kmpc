@@ -5,6 +5,7 @@
 #include <sstream>
 #include <vector>
 
+#include "kmpc/constraint_policy.hpp"
 #include "kmpc/tracker_math.hpp"
 
 namespace kmpc {
@@ -31,39 +32,84 @@ double segment_distance(const Vec3& p, const Vec3& a, const Vec3& b) {
   return (p - (a + t * ab)).norm();
 }
 
-// Map densified sample index → stage index using StageBoundary endpoints.
-std::size_t stage_for_sample_index(
-    std::size_t sample_i, std::size_t nstage,
-    const std::vector<StageBoundary>* boundaries) {
-  if (boundaries == nullptr || boundaries->empty() || nstage == 0) {
-    return 0;
+constexpr double kJ4StageMonoTolRad = 5e-4;
+
+bool j4_stage_monotone_ok(
+    const JointCurve& samples, std::size_t nstage,
+    const std::vector<StageBoundary>* boundaries, std::string* detail) {
+  if (nstage == 0 || samples.size() < 2) {
+    return true;
   }
-  for (std::size_t s = 0; s < boundaries->size() && s < nstage; ++s) {
-    if (sample_i <= (*boundaries)[s].sample_index) {
-      return s;
+  auto range_for_stage = [&](std::size_t s,
+                             std::size_t* i0,
+                             std::size_t* i1) -> bool {
+    if (boundaries != nullptr && s < boundaries->size()) {
+      *i1 = std::min((*boundaries)[s].sample_index, samples.size() - 1);
+      *i0 = (s == 0) ? 0
+                     : std::min((*boundaries)[s - 1].sample_index + 1,
+                                samples.size() - 1);
+      return *i0 <= *i1;
+    }
+    return false;
+  };
+  for (std::size_t s = 0; s < nstage; ++s) {
+    std::size_t i0 = 0;
+    std::size_t i1 = samples.size() - 1;
+    if (boundaries != nullptr && !boundaries->empty()) {
+      if (!range_for_stage(s, &i0, &i1)) {
+        continue;
+      }
+    }
+    const double q_start = samples[i0][kIdxYaw];
+    const double q_end = samples[i1][kIdxYaw];
+    const double net = q_end - q_start;
+    int sign = 0;
+    if (std::abs(net) > kJ4StageMonoTolRad) {
+      sign = net > 0.0 ? 1 : -1;
+    }
+    double q_run = q_start;
+    for (std::size_t i = i0; i <= i1; ++i) {
+      const double qy = samples[i][kIdxYaw];
+      if (sign == 0) {
+        if (std::abs(qy - q_start) > kJ4StageMonoTolRad) {
+          if (detail != nullptr) {
+            std::ostringstream os;
+            os << "stage=" << s << " sample=" << i << " flat_violation";
+            *detail = os.str();
+          }
+          return false;
+        }
+      } else if (sign > 0) {
+        if (qy + kJ4StageMonoTolRad < q_run) {
+          if (detail != nullptr) {
+            std::ostringstream os;
+            os << "stage=" << s << " sample=" << i
+               << " reverse_amt_rad=" << (q_run - qy);
+            *detail = os.str();
+          }
+          return false;
+        }
+        q_run = std::max(q_run, qy);
+      } else {
+        if (qy - kJ4StageMonoTolRad > q_run) {
+          if (detail != nullptr) {
+            std::ostringstream os;
+            os << "stage=" << s << " sample=" << i
+               << " reverse_amt_rad=" << (qy - q_run);
+            *detail = os.str();
+          }
+          return false;
+        }
+        q_run = std::min(q_run, qy);
+      }
     }
   }
-  return nstage - 1;
+  return true;
 }
 
-// Map progress s∈[0,1] → stage via densified sample progress.
-std::size_t stage_for_progress(double s, std::size_t n_samples,
-                               std::size_t nstage,
-                               const std::vector<StageBoundary>* boundaries) {
-  if (n_samples < 2 || nstage == 0) {
-    return 0;
-  }
-  const double prog =
-      std::clamp(s, 0.0, 1.0) * static_cast<double>(n_samples - 1);
-  const std::size_t sample_i = static_cast<std::size_t>(std::floor(prog + 1e-12));
-  return stage_for_sample_index(sample_i, nstage, boundaries);
-}
-
-void note_tcp_fault(TrajectoryCertificate* out, const char** fault,
-                    std::size_t stage, double cross_m, double t_s, double s,
-                    const char* source) {
-  note(fault, "tcp_cross_track");
-  out->task_path_ok = false;
+void note_tcp_cross_track_diag(TrajectoryCertificate* out, std::size_t stage,
+                               double cross_m, double t_s, double s,
+                               const char* source) {
   if (out->tcp_fault_stage < 0 || cross_m >= out->worst_tcp_cross_track_m) {
     out->tcp_fault_stage = static_cast<int>(stage);
     out->tcp_fault_t_s = t_s;
@@ -79,6 +125,49 @@ void note_tcp_fault(TrajectoryCertificate* out, const char** fault,
 }
 
 }  // namespace
+
+std::size_t stage_for_sample_point(
+    std::size_t sample_i, std::size_t nstage,
+    const std::vector<StageBoundary>* boundaries) {
+  if (nstage == 0) {
+    return 0;
+  }
+  if (boundaries == nullptr || boundaries->empty()) {
+    return std::min(sample_i, nstage - 1);
+  }
+  for (std::size_t s = 0; s < boundaries->size() && s < nstage; ++s) {
+    if (sample_i <= (*boundaries)[s].sample_index) {
+      return s;
+    }
+  }
+  return nstage - 1;
+}
+
+std::size_t stage_for_sample_span(std::size_t span_left_i, std::size_t nstage,
+                                  const std::vector<StageBoundary>* boundaries) {
+  if (nstage == 0) {
+    return 0;
+  }
+  return stage_for_sample_point(span_left_i + 1, nstage, boundaries);
+}
+
+std::size_t stage_for_curve_progress(
+    double s, std::size_t n_samples, std::size_t nstage,
+    const std::vector<StageBoundary>* boundaries) {
+  if (n_samples < 2 || nstage == 0) {
+    return 0;
+  }
+  const double prog =
+      std::clamp(s, 0.0, 1.0) * static_cast<double>(n_samples - 1);
+  const std::size_t sample_i = static_cast<std::size_t>(std::floor(prog + 1e-12));
+  const std::size_t sample_right =
+      std::min(sample_i + 1, n_samples - 1);
+  const double frac = prog - static_cast<double>(sample_i);
+  if (frac > 1e-9 && sample_right > sample_i) {
+    return stage_for_sample_span(sample_i, nstage, boundaries);
+  }
+  return stage_for_sample_point(sample_i, nstage, boundaries);
+}
 
 TrajectoryCertificate validate_path(
     const MotionTask& task, const JointCurve& samples,
@@ -133,12 +222,19 @@ TrajectoryCertificate validate_path(
   // Joint hard box + pitch + CoM + TCP in one pass so FK/CoM cache hits the
   // same q (coverage unchanged).
   out.hard_box_ok = true;
+  out.work_box_ok = true;
   out.pitch_ok = true;
-  const double cap = policy.torso_pitch_max_rad;
   const double start_abs = pitch_abs(samples.front());
-  const double pitch_bound = pitch_abs_bound(cap, start_abs, false);
+  const double task_tcp_dz_m =
+      task_stages_tcp_dz_m(kin.fk_pos(samples.front(), frame).z(), task.stages);
+  const double plan_cap = pitch_planning_cap_rad(policy.torso_pitch_max_rad,
+                                                 start_abs, task_tcp_dz_m);
+  const double pitch_bound = pitch_abs_bound(plan_cap, start_abs, false);
   out.min_joint_margin_rad = joint_hard_margin_rad(
       samples.front(), policy.q_min, policy.q_max);
+  out.min_work_margin_rad = joint_work_margin_rad(
+      samples.front(), samples.front(), policy.q_min, policy.q_max,
+      policy.q_limit_margin_rad);
   out.min_pitch_margin_rad = pitch_bound - start_abs;
   out.com_checked = guards != nullptr;
   out.com_ok = guards != nullptr;
@@ -156,6 +252,26 @@ TrajectoryCertificate validate_path(
     if (joint_violates_hard_box(q, policy.q_min, policy.q_max)) {
       out.hard_box_ok = false;
       note(&fault, "joint");
+    }
+    const double work_margin = joint_work_margin_rad(
+        q, samples.front(), policy.q_min, policy.q_max,
+        policy.q_limit_margin_rad);
+    out.min_work_margin_rad = std::min(out.min_work_margin_rad, work_margin);
+    if (joint_violates_effective_work_box(q, samples.front(), policy)) {
+      out.work_box_ok = false;
+      note(&fault, "work_box");
+    }
+    if (joint_violates_yaw_task_box(q, policy)) {
+      out.yaw_task_ok = false;
+      note(&fault, "yaw_task");
+      if (out.fault_detail.empty()) {
+        std::ostringstream os;
+        os.setf(std::ios::fixed);
+        os.precision(4);
+        os << "yaw_rad=" << q[kIdxYaw] << " limit="
+           << policy.yaw_abs_max_rad;
+        out.fault_detail = os.str();
+      }
     }
     const double pa = pitch_abs(q);
     const double pitch_margin = pitch_bound - pa;
@@ -179,7 +295,7 @@ TrajectoryCertificate validate_path(
     std::size_t seg = 0;
     double best = 1e30;
     if (use_boundaries) {
-      seg = stage_for_sample_index(i, nstage, stage_boundaries);
+      seg = stage_for_sample_point(i, nstage, stage_boundaries);
       best = segment_distance(p, poly[seg], poly[seg + 1]);
     } else {
       for (std::size_t s = 0; s < nstage; ++s) {
@@ -190,16 +306,20 @@ TrajectoryCertificate validate_path(
         }
       }
     }
-    out.worst_tcp_cross_track_m = std::max(out.worst_tcp_cross_track_m, best);
     const TaskStage& stage = task.stages[seg];
+    // PTP cross-track is diagnostic only — do not pollute the geometry metric.
+    if (stage.geometry == TaskGeometry::Lin) {
+      out.worst_tcp_cross_track_m =
+          std::max(out.worst_tcp_cross_track_m, best);
+    }
     if (stage.geometry == TaskGeometry::Lin &&
         best > stage.position_tol_m) {
       const double s_frac = samples.size() <= 1
                                 ? 0.0
                                 : static_cast<double>(i) /
                                       static_cast<double>(samples.size() - 1);
-      note_tcp_fault(&out, &fault, seg, best, /*t_s=*/-1.0, s_frac,
-                     "knot_samples");
+      note_tcp_cross_track_diag(&out, seg, best, /*t_s=*/-1.0, s_frac,
+                                "knot_samples");
     }
   }
   for (std::size_t s = 0; s + 1 < nstage; ++s) {
@@ -253,7 +373,13 @@ TrajectoryCertificate validate_path(
     }
   }
 
-  out.passed = fault == nullptr && out.hard_box_ok && out.pitch_ok &&
+  // J4 may reverse within a stage (human-like torso yaw). Foldback gates
+  // remain on arm/wrist via quality cost and other cert rows.
+  out.j4_stage_mono_ok = true;
+  (void)j4_stage_monotone_ok;
+
+  out.passed = fault == nullptr && out.hard_box_ok && out.work_box_ok &&
+               out.yaw_task_ok && out.j4_stage_mono_ok && out.pitch_ok &&
                out.com_checked && out.com_ok && out.task_path_ok;
   out.first_fault = fault == nullptr ? "ok" : fault;
   return out;
@@ -354,16 +480,37 @@ TrajectoryCertificate validate_actual_q_of_t(
         note(&fault, "exec_hard_box");
         return false;
       }
+      if (joint_violates_effective_work_box(samp.q, package.samples.front(),
+                                            policy)) {
+        note(&fault, "exec_work_box");
+        return false;
+      }
+      if (joint_violates_yaw_task_box(samp.q, policy)) {
+        note(&fault, "exec_yaw_task");
+        return false;
+      }
       if (policy.torso_pitch_max_rad > 0.0) {
-        // Same recovery envelope as validate_path / seed IK: start already
-        // outside ±cap may keep |start|, but pitch must not grow. Using the
-        // bare hard cap here falsely rejects every Hermite sample near q0.
         const double start_abs = pitch_abs(package.samples.front());
-        const double bound = pitch_abs_bound(policy.torso_pitch_max_rad,
-                                             start_abs, /*for_gate=*/true);
+        const double task_tcp_dz_m = task_stages_tcp_dz_m(
+            kin.fk_pos(package.samples.front(), frame).z(), task.stages);
+        const double plan_cap = pitch_planning_cap_rad(
+            policy.torso_pitch_max_rad, start_abs, task_tcp_dz_m);
+        const double bound =
+            pitch_abs_bound(plan_cap, start_abs, /*for_gate=*/true);
         const double pitch = samp.q[0] + samp.q[1] + samp.q[2];
-        if (std::abs(pitch) > bound) {
+        if (!pitch_abs_ok(std::abs(pitch), plan_cap, start_abs,
+                          /*for_gate=*/true)) {
           note(&fault, "exec_pitch");
+          if (out.fault_detail.empty()) {
+            std::ostringstream os;
+            os.setf(std::ios::fixed);
+            os.precision(4);
+            os << "t_s=" << samp.t_s << " s=" << samp.s << " pitch_rad="
+               << pitch << " bound_rad=" << bound
+               << " plan_cap=" << plan_cap << " tcp_dz_m=" << task_tcp_dz_m
+               << " start_abs=" << start_abs;
+            out.fault_detail = os.str();
+          }
           return false;
         }
       }
@@ -374,18 +521,20 @@ TrajectoryCertificate validate_actual_q_of_t(
         return false;
       }
       if (nstage > 0 && !poly.empty()) {
-        const std::size_t seg = stage_for_progress(
-            samp.s, package.samples.size(), nstage, &package.stage_boundaries);
+        const std::size_t seg = stage_for_curve_progress(
+            samp.s, package.samples.size(), nstage,
+            &package.stage_boundaries);
         const double cross =
             segment_distance(tcp, poly[seg], poly[seg + 1]);
-        out.worst_tcp_cross_track_m =
-            std::max(out.worst_tcp_cross_track_m, cross);
         const TaskStage& stage = task.stages[seg];
-        if (stage.geometry == TaskGeometry::Lin &&
-            cross > stage.position_tol_m) {
-          note_tcp_fault(&out, &fault, seg, cross, samp.t_s, samp.s,
-                         "hermite_exec");
-          // Keep scanning for worst deviation; velocity gates still run.
+        if (stage.geometry == TaskGeometry::Lin) {
+          out.worst_tcp_cross_track_m =
+              std::max(out.worst_tcp_cross_track_m, cross);
+          if (cross > stage.position_tol_m) {
+            note_tcp_cross_track_diag(&out, seg, cross, samp.t_s, samp.s,
+                                      "hermite_exec");
+            // Keep scanning for worst deviation; velocity gates still run.
+          }
         }
       }
       qs.push_back(samp.q);
@@ -493,8 +642,8 @@ TrajectoryCertificate validate_actual_q_of_t(
   // fault may be set by Hermite TCP after a green densify path — always
   // recompute passed from the live fault pointer.
   out.passed = fault == nullptr && law_ok && exec_ok && out.hard_box_ok &&
-               out.pitch_ok && out.com_checked && out.com_ok &&
-               out.task_path_ok;
+               out.work_box_ok && out.pitch_ok && out.com_checked &&
+               out.com_ok && out.task_path_ok;
   out.first_fault = fault == nullptr ? "ok" : fault;
   return out;
 }

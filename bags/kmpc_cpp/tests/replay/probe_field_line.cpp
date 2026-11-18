@@ -116,10 +116,7 @@ int main(int argc, char** argv) {
   const bool has_tip = parse_array(raw, "tip_xyz", &tipv) && tipv.size() == 3 &&
                        parse_array(raw, "tip_quat", &tquatv) && tquatv.size() == 4;
 
-  Config cfg = Config::load(
-      std::string(KMPC_CONFIG_DIR) + "/joint_limits.yaml",
-      std::string(KMPC_CONFIG_DIR) + "/q_pref.yaml",
-      std::string(KMPC_CONFIG_DIR) + "/kmpc_params.yaml");
+  Config cfg = Config::load(std::string(KMPC_CONFIG_DIR) + "/joint_limits.yaml", std::string(KMPC_CONFIG_DIR) + "/kmpc_params.yaml");
   Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
   CartesianTracker tracker(kin, cfg);
   tracker.set_line_pace(dq, accel);
@@ -175,10 +172,10 @@ int main(int argc, char** argv) {
     out << "  \"elbow_end_deg\":" << rad_to_deg(b[j4]) << ",\n";
     out << "  \"elbow_net_deg\":" << rad_to_deg(b[j4] - a[j4]) << ",\n";
     out << "  \"elbow_pref_end_err_deg\":"
-        << rad_to_deg(std::abs(b[j4] - cfg.q_pref[j4])) << ",\n";
+        << rad_to_deg(std::abs(b[j4] - kmpc::test_fixture_q0()[j4])) << ",\n";
     double peak = 0.0, travel = 0.0;
     for (std::size_t i = 0; i < plan.samples.size(); ++i) {
-      peak = std::max(peak, std::abs(plan.samples[i][j4] - cfg.q_pref[j4]));
+      peak = std::max(peak, std::abs(plan.samples[i][j4] - kmpc::test_fixture_q0()[j4]));
       if (i) travel += std::abs(plan.samples[i][j4] - plan.samples[i - 1][j4]);
     }
     out << "  \"elbow_peak_pref_err_deg\":" << rad_to_deg(peak) << ",\n";

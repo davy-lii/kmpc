@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "kmpc/config.hpp"
+#include "kmpc/test_fixture.hpp"
 #include "kmpc/fast_trajectory_optimizer.hpp"
 #include "kmpc/kinematics.hpp"
 #include "kmpc/motion_evaluator.hpp"
@@ -326,13 +327,10 @@ int main(int argc, char** argv) {
       (argc > 1)
           ? argv[1]
           : (std::string(KMPC_REPLAY_DIR) + "/fixtures/r40_manifest.json");
-  const auto config = kmpc::Config::load(
-      std::string(KMPC_CONFIG_DIR) + "/joint_limits.yaml",
-      std::string(KMPC_CONFIG_DIR) + "/q_pref.yaml",
-      std::string(KMPC_CONFIG_DIR) + "/kmpc_params.yaml");
+  const auto config = kmpc::Config::load(std::string(KMPC_CONFIG_DIR) + "/joint_limits.yaml", std::string(KMPC_CONFIG_DIR) + "/kmpc_params.yaml");
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
-  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
+  kmpc::WholeBodyGuards guards(config.params, kmpc::test_fixture_q0()[kmpc::kIdxYaw]);
   const auto policy = kmpc::policy_from_config(config);
 
   const auto stages = load_manifest(fixture);
@@ -356,11 +354,11 @@ int main(int argc, char** argv) {
   int budget_ok = 0, budget_fail = 0, adopt_ok = 0, adopt_fail = 0;
   int reject_by_10ms_only = 0;
   for (const auto& st : stages) {
-    kmpc::Vec18 q0 = config.q_pref;
+    kmpc::Vec18 q0 = kmpc::test_fixture_q0();
     if (st.has_q0) {
       q0 = st.q0;
     } else if (st.q0_source.find("synthetic") != std::string::npos) {
-      q0 = config.q_pref;
+      q0 = kmpc::test_fixture_q0();
       q0[0] = policy.q_max[0] - 0.01;
     }
     const std::string frame =

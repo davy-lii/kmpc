@@ -22,7 +22,6 @@ setup(
         (_share('config'), [
             'config/kmpc_params.yaml',
             'config/joint_limits.yaml',
-            'config/q_pref.yaml',
             'config/joint_map.yaml',
             'config/sim_initial_joints.yaml',
         ]),

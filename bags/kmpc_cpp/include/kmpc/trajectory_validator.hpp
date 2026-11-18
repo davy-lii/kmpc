@@ -20,6 +20,9 @@ enum class PathCoverage {
 struct TrajectoryCertificate {
   bool passed = false;
   bool hard_box_ok = false;
+  bool work_box_ok = false;
+  bool yaw_task_ok = true;
+  bool j4_stage_mono_ok = true;
   bool pitch_ok = false;
   bool com_checked = false;
   bool com_ok = false;
@@ -27,6 +30,7 @@ struct TrajectoryCertificate {
   bool continuous_certified = false;
   PathCoverage coverage = PathCoverage::DiscreteSamples;
   double min_joint_margin_rad = 0.0;
+  double min_work_margin_rad = 0.0;
   double min_pitch_margin_rad = 0.0;
   double worst_tcp_cross_track_m = 0.0;
   double worst_tcp_endpoint_m = 0.0;
@@ -65,5 +69,21 @@ TrajectoryCertificate validate_actual_q_of_t(
     const TrajectoryPackage& package, const MotionTask& task,
     const MotionConstraintPolicy& policy, const Kinematics& kin,
     const WholeBodyGuards* guards);
+
+// Sample index → stage for a densified point (endpoint at boundary b stays
+// with the ending stage).
+std::size_t stage_for_sample_point(
+    std::size_t sample_i, std::size_t nstage,
+    const std::vector<StageBoundary>* boundaries);
+
+// Span between sample i and i+1 belongs to the stage of the right endpoint.
+std::size_t stage_for_sample_span(
+    std::size_t span_left_i, std::size_t nstage,
+    const std::vector<StageBoundary>* boundaries);
+
+// Continuous progress r∈[0,1] on densified samples → owning stage.
+std::size_t stage_for_curve_progress(
+    double s, std::size_t n_samples, std::size_t nstage,
+    const std::vector<StageBoundary>* boundaries);
 
 }  // namespace kmpc

@@ -17,6 +17,7 @@ class JointSpaceTracker {
   JointSpaceTracker(Kinematics& kin, const Config& cfg);
 
   void reset();
+  void begin_task(const Vec18& q_start);
 
   Vec18 compute(const Vec18& q0, const Vec18& q_des, const Vec18* r);
 

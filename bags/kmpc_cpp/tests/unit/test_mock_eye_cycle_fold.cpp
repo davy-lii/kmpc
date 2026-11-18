@@ -12,6 +12,7 @@
 
 #include "kmpc/cartesian_tracker.hpp"
 #include "kmpc/config.hpp"
+#include "kmpc/test_fixture.hpp"
 #include "kmpc/kinematics.hpp"
 #include "kmpc/line_contract.hpp"
 #include "kmpc/tracker_math.hpp"
@@ -363,7 +364,7 @@ TEST(MockEyeCycle, WaistPitchNoFoldOnGraspPlaceCycle) {
   const double left7[] = {-0.0980, 29.5260, 7.8220, -121.8440, 73.0653, -13.9180,
                           0.7991};
   const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
 
   std::cout << "version_note=8842e7e_plus_mock_eye_business_offsets\n";
@@ -383,14 +384,14 @@ TEST(MockEyeCycle, WaistPitchNoFoldOnGraspPlaceCycle) {
     tip_prep_m(eye, left, grasp, &tip, &prep);
     const kmpc::Vec4 quat = flange_quat(eye);
     const std::string tag = std::string(tag_prefix);
-    rows.push_back(play_segment(t, &qq, cfg_all.q_pref, (*ggen)++, left, prep, quat, &tip,
+    rows.push_back(play_segment(t, &qq, kmpc::test_fixture_q0(), (*ggen)++, left, prep, quat, &tip,
                                 (tag + "_approach").c_str()));
     if (!rows.back().arrived) return;
-    rows.push_back(play_segment(t, &qq, cfg_all.q_pref, (*ggen)++, left, tip, quat, nullptr,
+    rows.push_back(play_segment(t, &qq, kmpc::test_fixture_q0(), (*ggen)++, left, tip, quat, nullptr,
                                 (tag + "_insert").c_str()));
     if (!rows.back().arrived) return;
     diagnose_reverse_validate(kin, cfg_all, t, qq, prep, quat, left);
-    rows.push_back(play_segment(t, &qq, cfg_all.q_pref, (*ggen)++, left, prep, quat, nullptr,
+    rows.push_back(play_segment(t, &qq, kmpc::test_fixture_q0(), (*ggen)++, left, prep, quat, nullptr,
                                 (tag + "_retreat").c_str()));
   };
   uint64_t gL = 1;

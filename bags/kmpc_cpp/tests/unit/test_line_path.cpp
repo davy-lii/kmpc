@@ -9,6 +9,7 @@
 
 #include "kmpc/cartesian_tracker.hpp"
 #include "kmpc/config.hpp"
+#include "kmpc/test_fixture.hpp"
 #include "kmpc/constraint_policy.hpp"
 #include "kmpc/fast_trajectory_optimizer.hpp"
 #include "kmpc/kinematics.hpp"
@@ -138,9 +139,21 @@ TEST(LinePath, AxisTurnbackIncreaseBlowsSumStraighten) {
   EXPECT_FALSE(kmpc::straighten_axis_turnback_regressed(flat, tiny_back));
 }
 
+TEST(LinePath, PitchPlanningCapLeavesMarginOnDescent) {
+  const double hard = 32.0 * kmpc::kPi / 180.0;
+  const double start = 0.3491;
+  const double cap = kmpc::pitch_planning_cap_rad(hard, start, -0.4948);
+  EXPECT_LT(cap, hard - 1.5 * kmpc::kPi / 180.0);
+  EXPECT_GE(cap, start);
+  const double hard30 = 30.0 * kmpc::kPi / 180.0;
+  const double cap30 =
+      kmpc::pitch_planning_cap_rad(hard30, start, -0.4948);
+  EXPECT_NEAR(cap30, hard30 - 2.0 * kmpc::kPi / 180.0, 1e-9);
+}
+
 TEST(LinePath, PitchBoxAndAdmitAreShared) {
   const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   EXPECT_DOUBLE_EQ(cfg_all.params.torso_pitch_max_deg, 32.0);
   EXPECT_DOUBLE_EQ(kmpc::kStartPitchAdmitRad, 0.005);
   // r33→r34: recovery first-chord EE retreat budget (meters).
@@ -161,7 +174,7 @@ TEST(LinePath, PitchBoxAndAdmitAreShared) {
 // Field float crumbs must be projected by QP — gates do not widen by admit.
 TEST(LinePath, StreamPitchGateMatchesHardRoundDomain) {
   const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
   const double limit = cfg_all.params.torso_pitch_max_deg * kmpc::kPi / 180.0;
   ASSERT_GT(limit, 0.0);
@@ -190,7 +203,7 @@ TEST(LinePath, StreamPitchGateMatchesHardRoundDomain) {
   const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
   const kmpc::Vec3 goal = p0 + kmpc::Vec3(0.05, 0.0, 0.0);
   ASSERT_TRUE(tracker.rearm_line(1));
-  tracker.compute(q, cfg_all.q_pref, &goal, nullptr, &quat, nullptr);
+  tracker.compute(q, kmpc::test_fixture_q0(), &goal, nullptr, &quat, nullptr);
   ASSERT_TRUE(tracker.line_active()) << tracker.line_reason();
   ASSERT_GE(tracker.line_sample_count(), 2u);
 
@@ -245,10 +258,10 @@ TEST(LinePath, SlerpTakesShortArc) {
 
 TEST(LinePath, ShortMoveStaysOnLineThenHolds) {
   const kmpc::Config cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
   kmpc::CartesianTracker tracker(kin, cfg_all);
-  const kmpc::Vec18 q0 = cfg_all.q_pref;
+  const kmpc::Vec18 q0 = kmpc::test_fixture_q0();
   const kmpc::Vec3 p0 = kin.fk_pos(q0, kmpc::kEeFrameLeft);
   const kmpc::Vec3 goal = p0 + kmpc::Vec3(0.0, 0.06, 0.0);
   const Eigen::Matrix4d posed = kin.fk(q0, kmpc::kEeFrameLeft);
@@ -316,7 +329,7 @@ TEST(LinePath, ShortMoveStaysOnLineThenHolds) {
 
 TEST(LinePath, DriftDoesNotBendThePath) {
   const kmpc::Config cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
   kmpc::CartesianTracker a(kin, cfg_all);
   kmpc::CartesianTracker b(kin, cfg_all);
@@ -335,20 +348,20 @@ TEST(LinePath, DriftDoesNotBendThePath) {
   const kmpc::Vec3 goal(0.4984, -0.2867, 0.8100);
   const kmpc::Vec4 quat=kmpc::tool_to_flange_quat_xyzw(kmpc::Vec4(-0.7853, 0.2042, 0.3285, 0.4834));
   for (int k = 0; k < 5; ++k) {
-    const auto step = a.compute(q, cfg_all.q_pref, nullptr, &goal, nullptr, &quat);
-    b.compute(q, cfg_all.q_pref, nullptr, &goal, nullptr, &quat);
+    const auto step = a.compute(q, kmpc::test_fixture_q0(), nullptr, &goal, nullptr, &quat);
+    b.compute(q, kmpc::test_fixture_q0(), nullptr, &goal, nullptr, &quat);
     q += step.dq;
   }
   kmpc::Vec18 drifted = q;
   drifted[10] += 0.08;
-  a.compute(q, cfg_all.q_pref, nullptr, &goal, nullptr, &quat);
-  b.compute(drifted, cfg_all.q_pref, nullptr, &goal, nullptr, &quat);
+  a.compute(q, kmpc::test_fixture_q0(), nullptr, &goal, nullptr, &quat);
+  b.compute(drifted, kmpc::test_fixture_q0(), nullptr, &goal, nullptr, &quat);
   EXPECT_LT((a.line_cmd() - b.line_cmd()).norm(), 1e-9);
 }
 
 TEST(LinePath, LoggedPrepAtScaleStaysOnLine) {
   const kmpc::Config cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
   kmpc::CartesianTracker tracker(kin, cfg_all);
   // Match robot03 NewUnified: Mode B follows the built joint path. Legacy Mode A
@@ -375,7 +388,7 @@ TEST(LinePath, LoggedPrepAtScaleStaysOnLine) {
   const kmpc::Vec18 cap = tracker.effective_dq_max() * cfg_all.params.dt * 0.3;
   for (int k = 0; k < 800 && !arrived; ++k) {
     const kmpc::Vec18 from = q;
-    const auto step = tracker.compute(q, cfg_all.q_pref, nullptr, &goal, nullptr, &quat);
+    const auto step = tracker.compute(q, kmpc::test_fixture_q0(), nullptr, &goal, nullptr, &quat);
     ASSERT_FALSE(tracker.line_refused())
         << "tick=" << k << " reason=" << tracker.line_reason()
         << " cand=" << tracker.line_candidate()
@@ -402,7 +415,7 @@ TEST(LinePath, LoggedPrepAtScaleStaysOnLine) {
   EXPECT_LT((kin.fk_pos(q, kmpc::kEeFrameRight) - goal).norm(), 0.003);
   EXPECT_EQ(tracker.line_candidate(), "unified_multistage_v2");
   EXPECT_NE(tracker.line_pose_report().find("planner=unified_multistage"), std::string::npos);
-  const auto held = tracker.compute(q, cfg_all.q_pref, nullptr, &goal, nullptr, &quat);
+  const auto held = tracker.compute(q, kmpc::test_fixture_q0(), nullptr, &goal, nullptr, &quat);
   EXPECT_LT(held.dq.cwiseAbs().maxCoeff(), 1e-9);
   EXPECT_TRUE(tracker.line_holding());
 }
@@ -422,8 +435,8 @@ void walk_line(
   arrived = false;
   refused = false;
   for (int k = 0; k < 900 && !arrived; ++k) {
-    const auto step = left ? tracker.compute(q, cfg_all.q_pref, &goal, nullptr, &quat, nullptr)
-                           : tracker.compute(q, cfg_all.q_pref, nullptr, &goal, nullptr, &quat);
+    const auto step = left ? tracker.compute(q, kmpc::test_fixture_q0(), &goal, nullptr, &quat, nullptr)
+                           : tracker.compute(q, kmpc::test_fixture_q0(), nullptr, &goal, nullptr, &quat);
     refused = tracker.line_refused();
     if(refused) std::cerr << "REFUSED " << tracker.line_reason() << " build_ms=" << tracker.line_build_ms() << "\n";
     if (refused) {
@@ -450,7 +463,7 @@ double extra_deg(const std::vector<kmpc::Vec18>& path, int joint) {
 
 TEST(LinePath, LoggedGraspAndPlaceDoNotFold) {
   const kmpc::Config cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
 
   const auto load = [](const double raw[18]) {
@@ -538,9 +551,9 @@ TEST(LinePath, LoggedGraspAndPlaceDoNotFold) {
 }
 
 struct LineFixture : testing::Test {
-  kmpc::Config config=kmpc::Config::load(cfg("joint_limits.yaml"),cfg("q_pref.yaml"),cfg("kmpc_params.yaml"));
+  kmpc::Config config=kmpc::Config::load(cfg("joint_limits.yaml"),cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin{std::string(KMPC_URDF_DIR)+"/Light-duty wheeled robot.urdf"};
-  kmpc::Vec18 q=config.q_pref;
+  kmpc::Vec18 q=kmpc::test_fixture_q0();
   kmpc::Vec3 goal=kin.fk_pos(q,kmpc::kEeFrameLeft)+kmpc::Vec3(0,.06,0);
   kmpc::Vec4 quat=kmpc::rot_to_quat_xyzw(kin.fk(q,kmpc::kEeFrameLeft).block<3,3>(0,0));
 };
@@ -548,12 +561,12 @@ TEST_F(LineFixture, FreezeAndAbortBoundariesAreLatched) {
   for(double jump:{.049,.050,.051}) {
     kmpc::CartesianTracker tracker(kin,config);
     ASSERT_TRUE(tracker.rearm_line(1));
-    auto step=tracker.compute(q,config.q_pref,&goal,nullptr,&quat,nullptr);
+    auto step=tracker.compute(q,kmpc::test_fixture_q0(),&goal,nullptr,&quat,nullptr);
     ASSERT_FALSE(tracker.line_refused())<<tracker.line_reason();
     ASSERT_TRUE(tracker.line_frozen());
     const auto at=q+step.dq;const int gen=tracker.line_gen();
     kmpc::Vec3 changed=goal+kmpc::Vec3(jump,0,0);
-    auto changed_step=tracker.compute(at,config.q_pref,&changed,nullptr,&quat,nullptr);
+    auto changed_step=tracker.compute(at,kmpc::test_fixture_q0(),&changed,nullptr,&quat,nullptr);
     EXPECT_EQ(gen,tracker.line_gen());
     if(jump<.05) {
       EXPECT_FALSE(tracker.line_refused());
@@ -562,46 +575,46 @@ TEST_F(LineFixture, FreezeAndAbortBoundariesAreLatched) {
       EXPECT_EQ(changed_step.dq.norm(),0);
       const int solves=tracker.line_qp_solves();
       for(int i=0;i<5;++i) {
-        auto held=tracker.compute(at,config.q_pref,&goal,nullptr,&quat,nullptr);
+        auto held=tracker.compute(at,kmpc::test_fixture_q0(),&goal,nullptr,&quat,nullptr);
         EXPECT_EQ(held.dq.norm(),0);EXPECT_FALSE(tracker.last_arrived());
       }
       EXPECT_EQ(solves,tracker.line_qp_solves());
       EXPECT_FALSE(tracker.rearm_line(1));
       ASSERT_TRUE(tracker.rearm_line(2));
-      tracker.compute(at,config.q_pref,&goal,nullptr,&quat,nullptr);
+      tracker.compute(at,kmpc::test_fixture_q0(),&goal,nullptr,&quat,nullptr);
       EXPECT_FALSE(tracker.line_abort_latched());EXPECT_FALSE(tracker.line_refused())<<tracker.line_reason();
     }
   }
 }
 TEST_F(LineFixture, OrientationFreezeAndAbort) {
   kmpc::CartesianTracker tracker(kin,config);tracker.rearm_line(1);
-  auto step=tracker.compute(q,config.q_pref,&goal,nullptr,&quat,nullptr);q+=step.dq;
+  auto step=tracker.compute(q,kmpc::test_fixture_q0(),&goal,nullptr,&quat,nullptr);q+=step.dq;
   ASSERT_TRUE(tracker.line_frozen());const int gen=tracker.line_gen();
   Eigen::Quaterniond original(quat[3],quat[0],quat[1],quat[2]);
   auto rotated=[&](double deg) {Eigen::Quaterniond v=Eigen::AngleAxisd(deg*kmpc::kPi/180,kmpc::Vec3::UnitZ())*original;return kmpc::Vec4(v.x(),v.y(),v.z(),v.w());};
-  auto small=rotated(2);tracker.compute(q,config.q_pref,&goal,nullptr,&small,nullptr);
+  auto small=rotated(2);tracker.compute(q,kmpc::test_fixture_q0(),&goal,nullptr,&small,nullptr);
   EXPECT_EQ(gen,tracker.line_gen());EXPECT_FALSE(tracker.line_refused());
-  auto large=rotated(16);tracker.compute(q,config.q_pref,&goal,nullptr,&large,nullptr);
+  auto large=rotated(16);tracker.compute(q,kmpc::test_fixture_q0(),&goal,nullptr,&large,nullptr);
   EXPECT_TRUE(tracker.line_abort_latched());EXPECT_EQ(tracker.line_reason(),"frozen_orientation_jump");
 }
 TEST_F(LineFixture, CascadeUsesActualPoseAndRejectsUnknownFrame) {
   kmpc::LineTarget tip;tip.xyz=goal+kmpc::Vec3(0,.015,0);tip.quat_xyzw=quat;tip.ori_on=true;
   kmpc::CartesianTracker tracker(kin,config);tracker.rearm_line(1,tip);
-  tracker.compute(q,config.q_pref,&goal,nullptr,&quat,nullptr);
+  tracker.compute(q,kmpc::test_fixture_q0(),&goal,nullptr,&quat,nullptr);
   ASSERT_FALSE(tracker.line_refused())<<tracker.line_reason();
   EXPECT_TRUE(tracker.line_cascade_checked());EXPECT_TRUE(tracker.line_cascade_passed());
   tip.frame="camera_link";tracker.rearm_line(2,tip);
-  auto step=tracker.compute(q,config.q_pref,&goal,nullptr,&quat,nullptr);
+  auto step=tracker.compute(q,kmpc::test_fixture_q0(),&goal,nullptr,&quat,nullptr);
   EXPECT_TRUE(tracker.line_refused());EXPECT_EQ(step.dq.norm(),0);
   EXPECT_EQ(tracker.line_reason(),"invalid_cascade_target");
   tip.frame="base_link";tip.xyz=kmpc::Vec3(9,9,9);tracker.rearm_line(3,tip);
-  tracker.compute(q,config.q_pref,&goal,nullptr,&quat,nullptr);
+  tracker.compute(q,kmpc::test_fixture_q0(),&goal,nullptr,&quat,nullptr);
   EXPECT_TRUE(tracker.line_refused());EXPECT_TRUE(tracker.line_cascade_checked());
   EXPECT_FALSE(tracker.line_cascade_passed());EXPECT_EQ(tracker.line_reason(),"cascade_unreachable");
 }
 TEST_F(LineFixture, SamplesAndInterpolationMeetThreeMillimeters) {
   kmpc::CartesianTracker tracker(kin,config);tracker.rearm_line(1);
-  tracker.compute(q,config.q_pref,&goal,nullptr,&quat,nullptr);
+  tracker.compute(q,kmpc::test_fixture_q0(),&goal,nullptr,&quat,nullptr);
   ASSERT_FALSE(tracker.line_refused())<<tracker.line_reason();
   EXPECT_FALSE(tracker.line_cascade_checked());
   const auto& samples=tracker.line_samples();ASSERT_GE(samples.size(),2u);
@@ -613,15 +626,15 @@ TEST_F(LineFixture, SamplesAndInterpolationMeetThreeMillimeters) {
     EXPECT_LE((kin.fk_pos(mid,kmpc::kEeFrameLeft)-((1-t)*start+t*goal)).norm(),.003);
   }
   kmpc::Vec3 far=start+kmpc::Vec3(2.001,0,0);tracker.rearm_line(2);
-  tracker.compute(q,config.q_pref,&far,nullptr,&quat,nullptr);
+  tracker.compute(q,kmpc::test_fixture_q0(),&far,nullptr,&quat,nullptr);
   EXPECT_EQ(tracker.line_reason(),"sample_limit");EXPECT_TRUE(tracker.line_refused());
 }
 TEST_F(LineFixture, ReplanStartsAtTheProvidedStreamReference) {
   kmpc::CartesianTracker tracker(kin,config);tracker.rearm_line(1);
-  tracker.compute(q,config.q_pref,&goal,nullptr,&quat,nullptr);
+  tracker.compute(q,kmpc::test_fixture_q0(),&goal,nullptr,&quat,nullptr);
   const auto mid=(.5*(q+tracker.line_cmd())).eval();
   tracker.rearm_line(2);tracker.set_line_reference(mid);
-  tracker.compute(q,config.q_pref,&goal,nullptr,&quat,nullptr);
+  tracker.compute(q,kmpc::test_fixture_q0(),&goal,nullptr,&quat,nullptr);
   ASSERT_FALSE(tracker.line_refused())<<tracker.line_reason();
   ASSERT_FALSE(tracker.line_samples().empty());EXPECT_LT((tracker.line_samples().front()-mid).norm(),1e-12);
   EXPECT_TRUE(((tracker.line_cmd()-mid).cwiseAbs().array()<=config.limits.dq_max.array()*config.params.dt+1e-6).all());
@@ -631,7 +644,7 @@ TEST_F(LineFixture, ArrivalRequiresMeasuredEndpoint) {
   kmpc::CartesianTracker tracker(kin,config);tracker.rearm_line(1);
   const auto seed=q;
   for(int i=0;i<1500 && !tracker.last_arrived();++i) {
-    auto step=tracker.compute(q,config.q_pref,&goal,nullptr,&quat,nullptr);q+=step.dq;
+    auto step=tracker.compute(q,kmpc::test_fixture_q0(),&goal,nullptr,&quat,nullptr);q+=step.dq;
     ASSERT_FALSE(tracker.line_refused())<<tracker.line_reason();
   }
   ASSERT_TRUE(tracker.line_holding());
@@ -641,7 +654,7 @@ TEST_F(LineFixture, ArrivalRequiresMeasuredEndpoint) {
 
 // Recorded robot03 placement, 2026-11-04 09:17 (nearest 50 Hz feedback).
 TEST(LinePath, Robot03PlacementAllowsConstrainedWaistInSuccessor) {
-  const auto cfg_all = kmpc::Config::load(cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+  const auto cfg_all = kmpc::Config::load(cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
   const double raw[18] = {0.3490765030,-0.3490645188,0.0000119842,-0.0261495787,
     -2.7666263299,-0.9360718783,1.8643084504,-1.8100975694,-2.2360289068,-0.0828512611,-0.2502804704,
@@ -653,14 +666,14 @@ TEST(LinePath, Robot03PlacementAllowsConstrainedWaistInSuccessor) {
   kmpc::LineTarget tip; tip.xyz=kmpc::Vec3(0.485839,0.343452,0.520); tip.quat_xyzw=quat; tip.ori_on=true;
   kmpc::CartesianTracker tracker(kin,cfg_all); tracker.rearm_line(1,tip);
   tracker.set_line_pace(0.3,0.8);
-  q+=tracker.compute(q,cfg_all.q_pref,&goal,nullptr,&quat,nullptr).dq;
+  q+=tracker.compute(q,kmpc::test_fixture_q0(),&goal,nullptr,&quat,nullptr).dq;
   ASSERT_FALSE(tracker.line_refused()) << tracker.line_reason();
   EXPECT_TRUE(tracker.line_cascade_passed());
   // PRE and the known tip are one joint plan.
   EXPECT_TRUE(tracker.line_cascade_full_body());
   for (const auto& p : {goal, tip.xyz}) {
     kmpc::CartesianTracker single(kin,cfg_all); single.rearm_line(1);
-    single.compute(q,cfg_all.q_pref,&p,nullptr,&quat,nullptr);
+    single.compute(q,kmpc::test_fixture_q0(),&p,nullptr,&quat,nullptr);
     EXPECT_FALSE(single.line_refused()) << p.transpose() << " " << single.line_reason();
   }
   tracker.set_line_pace(0.3,0.8);
@@ -668,7 +681,7 @@ TEST(LinePath, Robot03PlacementAllowsConstrainedWaistInSuccessor) {
     if((p-tip.xyz).norm()<1e-9) { ASSERT_TRUE(tracker.rearm_line(2)); }
     bool arrived=false;
     for(int i=0;i<3000;++i) {
-      const auto step=tracker.compute(q,cfg_all.q_pref,&p,nullptr,&quat,nullptr);
+      const auto step=tracker.compute(q,kmpc::test_fixture_q0(),&p,nullptr,&quat,nullptr);
       ASSERT_FALSE(tracker.line_refused()) << tracker.line_reason();
       q+=step.dq;
       EXPECT_LE(std::abs(q.head<3>().sum()),cfg_all.params.torso_pitch_max_deg*kmpc::kPi/180+1e-6);
@@ -680,18 +693,18 @@ TEST(LinePath, Robot03PlacementAllowsConstrainedWaistInSuccessor) {
   kmpc::CartesianTracker locked(kin,cfg_all);
   kmpc::UpperCommand upper; upper.waist_locked=true;
   locked.set_upper_commands(upper);locked.rearm_line(1,tip);
-  locked.compute(initial,cfg_all.q_pref,&goal,nullptr,&quat,nullptr);
+  locked.compute(initial,kmpc::test_fixture_q0(),&goal,nullptr,&quat,nullptr);
   EXPECT_TRUE(locked.line_refused());
   EXPECT_FALSE(locked.line_cascade_full_body());
 }
 
 TEST(LinePath, ReverseLastLineRestoresQa) {
   const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
   kmpc::CartesianTracker tracker(kin, cfg_all);
   tracker.set_line_pace(0.6, 0.0);
-  kmpc::Vec18 q = cfg_all.q_pref;
+  kmpc::Vec18 q = kmpc::test_fixture_q0();
   const kmpc::Vec18 qA = q;
   const kmpc::Vec3 pA = kin.fk_pos(q, kmpc::kEeFrameLeft);
   const auto posed = kin.fk(q, kmpc::kEeFrameLeft);
@@ -701,7 +714,7 @@ TEST(LinePath, ReverseLastLineRestoresQa) {
   ASSERT_TRUE(tracker.rearm_line(1));
   bool forward_ok = false;
   for (int i = 0; i < 800; ++i) {
-    const auto step = tracker.compute(q, cfg_all.q_pref, &pB, nullptr, &quat, nullptr);
+    const auto step = tracker.compute(q, kmpc::test_fixture_q0(), &pB, nullptr, &quat, nullptr);
     ASSERT_FALSE(tracker.line_refused()) << tracker.line_reason();
     q += step.dq;
     if (tracker.last_arrived()) {
@@ -716,7 +729,7 @@ TEST(LinePath, ReverseLastLineRestoresQa) {
   ASSERT_GE(forward_samples.size(), 2u);
 
   ASSERT_TRUE(tracker.rearm_line(2));
-  const auto step0 = tracker.compute(q, cfg_all.q_pref, &pA, nullptr, &quat, nullptr);
+  const auto step0 = tracker.compute(q, kmpc::test_fixture_q0(), &pA, nullptr, &quat, nullptr);
   ASSERT_FALSE(tracker.line_refused()) << tracker.line_reason();
   EXPECT_EQ(tracker.line_candidate(), "unified_multistage_v2")
       << tracker.line_candidate() << " " << tracker.reverse_line_decision();
@@ -741,7 +754,7 @@ TEST(LinePath, ReverseLastLineRestoresQa) {
   bool back_ok = false;
   std::string refuse_reason;
   for (int i = 0; i < 2000; ++i) {
-    const auto step = tracker.compute(q, cfg_all.q_pref, &pA, nullptr, &quat, nullptr);
+    const auto step = tracker.compute(q, kmpc::test_fixture_q0(), &pA, nullptr, &quat, nullptr);
     if (tracker.line_refused()) {
       refuse_reason = tracker.line_reason();
       break;
@@ -774,25 +787,25 @@ TEST(LinePath, ReverseLastLineRestoresQa) {
 
 TEST(LinePath, ReverseRejectsQbMismatch) {
   const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
   kmpc::CartesianTracker tracker(kin, cfg_all);
   tracker.set_line_pace(0.6, 0.0);
-  kmpc::Vec18 q = cfg_all.q_pref;
+  kmpc::Vec18 q = kmpc::test_fixture_q0();
   const kmpc::Vec3 pA = kin.fk_pos(q, kmpc::kEeFrameLeft);
   const auto posed = kin.fk(q, kmpc::kEeFrameLeft);
   const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
   const kmpc::Vec3 pB = pA + kmpc::Vec3(0.07, 0.0, 0.0);
   ASSERT_TRUE(tracker.rearm_line(1));
   for (int i = 0; i < 800 && !tracker.last_arrived(); ++i) {
-    q += tracker.compute(q, cfg_all.q_pref, &pB, nullptr, &quat, nullptr).dq;
+    q += tracker.compute(q, kmpc::test_fixture_q0(), &pB, nullptr, &quat, nullptr).dq;
   }
   ASSERT_TRUE(tracker.last_arrived());
   tracker.maybe_commit_last_line_cache(q);
   ASSERT_TRUE(tracker.last_line_cache().valid);
   q[4] += 10.0 * kmpc::kPi / 180.0;  // spoil qB
   ASSERT_TRUE(tracker.rearm_line(2));
-  tracker.compute(q, cfg_all.q_pref, &pA, nullptr, &quat, nullptr);
+  tracker.compute(q, kmpc::test_fixture_q0(), &pA, nullptr, &quat, nullptr);
   EXPECT_EQ(tracker.line_candidate(), "unified_multistage_v2");
   EXPECT_NE(tracker.line_candidate(), "reverse_cache");
   EXPECT_EQ(tracker.reverse_line_decision(), "not_a_selector");
@@ -800,22 +813,22 @@ TEST(LinePath, ReverseRejectsQbMismatch) {
 
 TEST(LinePath, LineDiagRingDefaultOffBounded) {
   const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
   kmpc::CartesianTracker tracker(kin, cfg_all);
-  kmpc::Vec18 q = cfg_all.q_pref;
+  kmpc::Vec18 q = kmpc::test_fixture_q0();
   const kmpc::Vec3 p0 = kin.fk_pos(q, kmpc::kEeFrameLeft);
   const auto posed = kin.fk(q, kmpc::kEeFrameLeft);
   const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
   const kmpc::Vec3 goal = p0 + kmpc::Vec3(0.05, 0.0, 0.0);
   ASSERT_TRUE(tracker.rearm_line(1));
-  tracker.compute(q, cfg_all.q_pref, &goal, nullptr, &quat, nullptr);
+  tracker.compute(q, kmpc::test_fixture_q0(), &goal, nullptr, &quat, nullptr);
   EXPECT_EQ(tracker.line_diag_size(), 0u);
 
   tracker.set_line_diag_enable(true);
   ASSERT_TRUE(tracker.rearm_line(2));
   for (int i = 0; i < 40; ++i) {
-    q += tracker.compute(q, cfg_all.q_pref, &goal, nullptr, &quat, nullptr).dq;
+    q += tracker.compute(q, kmpc::test_fixture_q0(), &goal, nullptr, &quat, nullptr).dq;
   }
   EXPECT_GT(tracker.line_diag_size(), 0u);
   const auto snap = tracker.line_diag_snapshot();
@@ -841,7 +854,7 @@ TEST(LinePath, LineDiagRingDefaultOffBounded) {
 // 循环走：手留在 3 mm 管子里，俯仰不回头，进度不过终点再退。
 TEST(LinePath, LoggedFixedPointsNoPitchReversalOrOvershoot) {
   const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
   const double home_raw[18] = {
       0.69813170, -0.87264718, -0.17453293, -0.02630211,
@@ -922,7 +935,7 @@ TEST(LinePath, LoggedFixedPointsNoPitchReversalOrOvershoot) {
       return;
     }
     const kmpc::Vec3 p0 = kin.fk_pos(q, kmpc::kEeFrameRight);
-    const auto first = tracker.compute(q, cfg_all.q_pref, nullptr, &goal, nullptr, &quat);
+    const auto first = tracker.compute(q, kmpc::test_fixture_q0(), nullptr, &goal, nullptr, &quat);
     if (tracker.line_refused()) {
       ADD_FAILURE() << name << " " << tracker.line_reason();
       return;
@@ -940,7 +953,7 @@ TEST(LinePath, LoggedFixedPointsNoPitchReversalOrOvershoot) {
     bool arrived = tracker.last_arrived();
     double worst_lat = lateral(kin.fk_pos(q, kmpc::kEeFrameRight), p0, goal);
     for (int i = 0; i < 4000 && !arrived; ++i) {
-      const auto step = tracker.compute(q, cfg_all.q_pref, nullptr, &goal, nullptr, &quat);
+      const auto step = tracker.compute(q, kmpc::test_fixture_q0(), nullptr, &goal, nullptr, &quat);
       if (tracker.line_refused()) {
         ADD_FAILURE() << name << " tick " << i << " " << tracker.line_reason();
         return;
@@ -1036,7 +1049,7 @@ TEST(LinePath, LoggedFixedPointsNoPitchReversalOrOvershoot) {
 // reversal seen at startup without requiring a live robot or ROS hardware.
 TEST(LinePath, R18FirstPreparationPitchDoesNotTurnBack) {
   const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
   const double raw[18] = {
       0.69823689566079, -0.8726313364835387, -0.17452626729670775,
@@ -1058,7 +1071,7 @@ TEST(LinePath, R18FirstPreparationPitchDoesNotTurnBack) {
   ASSERT_TRUE(tracker.rearm_line(1,tip));
   std::vector<kmpc::Vec18> commanded{q};
   for(int i=0;i<2000;++i) {
-    const auto step=tracker.compute(q,cfg_all.q_pref,&prep,nullptr,&quat,nullptr);
+    const auto step=tracker.compute(q,kmpc::test_fixture_q0(),&prep,nullptr,&quat,nullptr);
     ASSERT_FALSE(tracker.line_refused()) << tracker.line_reason() << " at " << i;
     q+=step.dq;
     commanded.push_back(q);
@@ -1078,9 +1091,9 @@ TEST(LinePath, R18FirstPreparationPitchDoesNotTurnBack) {
 // tail QP command, then either arrive or refuse after the bounded wait.
 TEST(LinePath, TailWaitsForFeedbackThenArrivesOrRefuses) {
   const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
-  const kmpc::Vec18 start=cfg_all.q_pref;
+  const kmpc::Vec18 start=kmpc::test_fixture_q0();
   const kmpc::Vec3 target=kin.fk_pos(start,kmpc::kEeFrameLeft)+
       kmpc::Vec3(0.10,0.0,0.0);
   for(const bool catch_up : {true,false}) {
@@ -1094,7 +1107,7 @@ TEST(LinePath, TailWaitsForFeedbackThenArrivesOrRefuses) {
     int wait_ticks=0;
     for(int tick=0;tick<2000;++tick) {
       tracker.set_line_reference(command);
-      const auto step=tracker.compute(measured,cfg_all.q_pref,&target,nullptr,nullptr,nullptr);
+      const auto step=tracker.compute(measured,kmpc::test_fixture_q0(),&target,nullptr,nullptr,nullptr);
       (void)step;
       if(tracker.line_refused()) break;
       const kmpc::Vec18 next=tracker.line_cmd();
@@ -1129,7 +1142,7 @@ TEST(LinePath, TailWaitsForFeedbackThenArrivesOrRefuses) {
 
 TEST(LinePath, P0IsolationSwitchDefaults) {
   const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
   kmpc::CartesianTracker tracker(kin, cfg_all);
   EXPECT_TRUE(tracker.line_pitch_straighten_enabled());
@@ -1140,7 +1153,7 @@ TEST(LinePath, P0IsolationSwitchDefaults) {
 
   tracker.set_reverse_last_line_enable(false);
   EXPECT_FALSE(tracker.reverse_last_line_enabled());
-  kmpc::Vec18 q = cfg_all.q_pref;
+  kmpc::Vec18 q = kmpc::test_fixture_q0();
   const kmpc::Vec3 p0 = kin.fk_pos(q, kmpc::kEeFrameLeft);
   const auto posed = kin.fk(q, kmpc::kEeFrameLeft);
   const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
@@ -1150,7 +1163,7 @@ TEST(LinePath, P0IsolationSwitchDefaults) {
   bool arrived = false;
   for (int i = 0; i < 2000; ++i) {
     const auto step =
-        tracker.compute(q, cfg_all.q_pref, &goal, nullptr, &quat, nullptr);
+        tracker.compute(q, kmpc::test_fixture_q0(), &goal, nullptr, &quat, nullptr);
     ASSERT_FALSE(tracker.line_refused()) << tracker.line_reason();
     q += step.dq;
     if (tracker.last_arrived()) {
@@ -1178,7 +1191,7 @@ TEST(LinePath, PaceModeParseAndBrakeValidation) {
       kmpc::CartesianTracker::LinePaceMode::R10bFirstOrder);
 
   const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
   kmpc::CartesianTracker tracker(kin, cfg_all);
   EXPECT_EQ(tracker.line_pace_mode(), kmpc::CartesianTracker::kDefaultLinePaceMode);
@@ -1192,9 +1205,9 @@ TEST(LinePath, PaceModeParseAndBrakeValidation) {
 
 TEST(LinePath, PaceModeAbCompareSameBrake) {
   const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
-  const kmpc::Vec18 q0 = cfg_all.q_pref;
+  const kmpc::Vec18 q0 = kmpc::test_fixture_q0();
   const kmpc::Vec3 p0 = kin.fk_pos(q0, kmpc::kEeFrameLeft);
   const auto posed = kin.fk(q0, kmpc::kEeFrameLeft);
   const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
@@ -1222,7 +1235,7 @@ TEST(LinePath, PaceModeAbCompareSameBrake) {
     bool arrived = false;
     for (int i = 0; i < 2500; ++i) {
       const auto step =
-          tracker.compute(q, cfg_all.q_pref, &goal, nullptr, &quat, nullptr);
+          tracker.compute(q, kmpc::test_fixture_q0(), &goal, nullptr, &quat, nullptr);
       if (tracker.line_refused()) {
         return out;
       }
@@ -1273,9 +1286,9 @@ TEST(LinePath, PaceModeAbCompareSameBrake) {
 
 TEST(LinePath, BrakeDistanceDoesNotChangeFreezeThreshold) {
   const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
-  kmpc::Vec18 q = cfg_all.q_pref;
+  kmpc::Vec18 q = kmpc::test_fixture_q0();
   const kmpc::Vec3 p0 = kin.fk_pos(q, kmpc::kEeFrameLeft);
   const auto posed = kin.fk(q, kmpc::kEeFrameLeft);
   const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
@@ -1293,7 +1306,7 @@ TEST(LinePath, BrakeDistanceDoesNotChangeFreezeThreshold) {
   bool arrived = false;
   for (int i = 0; i < 4000; ++i) {
     const auto step =
-        tracker.compute(q, cfg_all.q_pref, &goal, nullptr, &quat, nullptr);
+        tracker.compute(q, kmpc::test_fixture_q0(), &goal, nullptr, &quat, nullptr);
     ASSERT_FALSE(tracker.line_refused()) << tracker.line_reason();
     const double remain = tracker.last_line_path_remain_m();
     if (remain > 0.20 + 1e-9) {
@@ -1326,7 +1339,7 @@ TEST(LinePath, BrakeDistanceDoesNotChangeFreezeThreshold) {
 // and still reject an excess past the 0.005 rad window.
 TEST(LinePath, StartPitchAdmitWindow) {
   const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
   const double limit = cfg_all.params.torso_pitch_max_deg * kmpc::kPi / 180.0;
   ASSERT_GT(limit, 0.0);
@@ -1340,13 +1353,13 @@ TEST(LinePath, StartPitchAdmitWindow) {
     kmpc::CartesianTracker tracker(kin, cfg_all);
     tracker.set_line_pitch_straighten_enable(false);
     tracker.set_line_pace(0.3, 0.8);
-    kmpc::Vec18 q = set_pitch(cfg_all.q_pref, -limit - 0.00108);
+    kmpc::Vec18 q = set_pitch(kmpc::test_fixture_q0(), -limit - 0.00108);
     const kmpc::Vec3 p0 = kin.fk_pos(q, kmpc::kEeFrameLeft);
     const auto posed = kin.fk(q, kmpc::kEeFrameLeft);
     const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
     const kmpc::Vec3 goal = p0 + kmpc::Vec3(0.05, 0.0, 0.0);
     ASSERT_TRUE(tracker.rearm_line(1));
-    tracker.compute(q, cfg_all.q_pref, &goal, nullptr, &quat, nullptr);
+    tracker.compute(q, kmpc::test_fixture_q0(), &goal, nullptr, &quat, nullptr);
     // Gate itself must accept this overshoot; later recovery may still fail.
     EXPECT_NE(tracker.line_reason(), "start_pitch_outside");
   }
@@ -1354,13 +1367,13 @@ TEST(LinePath, StartPitchAdmitWindow) {
     kmpc::CartesianTracker tracker(kin, cfg_all);
     tracker.set_line_pitch_straighten_enable(false);
     tracker.set_line_pace(0.3, 0.8);
-    kmpc::Vec18 q = set_pitch(cfg_all.q_pref, -limit - 0.008);
+    kmpc::Vec18 q = set_pitch(kmpc::test_fixture_q0(), -limit - 0.008);
     const kmpc::Vec3 p0 = kin.fk_pos(q, kmpc::kEeFrameLeft);
     const auto posed = kin.fk(q, kmpc::kEeFrameLeft);
     const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
     const kmpc::Vec3 goal = p0 + kmpc::Vec3(0.05, 0.0, 0.0);
     ASSERT_TRUE(tracker.rearm_line(1));
-    tracker.compute(q, cfg_all.q_pref, &goal, nullptr, &quat, nullptr);
+    tracker.compute(q, kmpc::test_fixture_q0(), &goal, nullptr, &quat, nullptr);
     EXPECT_TRUE(tracker.line_refused());
     EXPECT_EQ(tracker.line_reason(), "start_pitch_outside");
   }
@@ -1371,9 +1384,9 @@ TEST(LinePath, StartPitchAdmitWindow) {
 // Caps / excesses unchanged (2.54e-4, 6.13e-4). No old line_qp path.
 TEST(LinePath, PitchRecoveryOutsideFirstQpDoesNotRefuse) {
   const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
-  kmpc::WholeBodyGuards guards(cfg_all.params, cfg_all.q_pref[kmpc::kIdxYaw]);
+  kmpc::WholeBodyGuards guards(cfg_all.params, kmpc::test_fixture_q0()[kmpc::kIdxYaw]);
   const auto policy = kmpc::policy_from_config(cfg_all);
   const double limit = policy.torso_pitch_max_rad;
   ASSERT_GT(limit, 0.0);
@@ -1448,8 +1461,6 @@ TEST(LinePath, PitchRecoveryOutsideFirstQpDoesNotRefuse) {
     bool arrived = false;
     const double dur = std::max(planned.package.time_law.duration_s, 1.0);
     for (int i = 0; i < static_cast<int>(dur / 0.02) + 100; ++i) {
-      const double t =
-          std::min(static_cast<double>(i) * 0.02, dur);
       const auto tick = follower.step(q, 0.02);
       ASSERT_NE(tick.action, kmpc::FollowerAction::ProtectStop)
           << "excess=" << excess << " i=" << i << " " << tick.reason;
@@ -1469,9 +1480,9 @@ TEST(LinePath, PitchRecoveryOutsideFirstQpDoesNotRefuse) {
 // hard box within ~1.6 s. Caps unchanged; no old Mode-B line_qp.
 TEST(LinePath, NewUnifiedModeBPitchRecoveryPullsIntoHardBox) {
   const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
-  kmpc::WholeBodyGuards guards(cfg_all.params, cfg_all.q_pref[kmpc::kIdxYaw]);
+  kmpc::WholeBodyGuards guards(cfg_all.params, kmpc::test_fixture_q0()[kmpc::kIdxYaw]);
   const auto policy = kmpc::policy_from_config(cfg_all);
   const double limit = policy.torso_pitch_max_rad;
   ASSERT_GT(limit, 0.0);
@@ -1513,19 +1524,19 @@ TEST(LinePath, NewUnifiedModeBPitchRecoveryPullsIntoHardBox) {
 
 TEST(LinePath, CommitPendingClearedOnRearmAndNotAutoConfirmed) {
   const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
   kmpc::CartesianTracker tracker(kin, cfg_all);
   tracker.set_line_commit_requires_stream(true);
   tracker.set_line_pace(0.3, 0.0);
   ASSERT_TRUE(tracker.rearm_line(1));
-  kmpc::Vec18 q = cfg_all.q_pref;
+  kmpc::Vec18 q = kmpc::test_fixture_q0();
   const kmpc::Vec3 p0 = kin.fk_pos(q, kmpc::kEeFrameLeft);
   const auto posed = kin.fk(q, kmpc::kEeFrameLeft);
   const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
   const kmpc::Vec3 goal = p0 + kmpc::Vec3(0.12, 0.0, 0.0);
   const auto step =
-      tracker.compute(q, cfg_all.q_pref, &goal, nullptr, &quat, nullptr);
+      tracker.compute(q, kmpc::test_fixture_q0(), &goal, nullptr, &quat, nullptr);
   ASSERT_FALSE(tracker.line_refused()) << tracker.line_reason();
   ASSERT_TRUE(tracker.line_commit_pending());
   EXPECT_GT(step.dq.cwiseAbs().maxCoeff(), 0.0);
@@ -1537,19 +1548,19 @@ TEST(LinePath, CommitPendingClearedOnRearmAndNotAutoConfirmed) {
 
 TEST(LinePath, PartialCommitAdvancesProgProportionally) {
   const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
   kmpc::CartesianTracker tracker(kin, cfg_all);
   tracker.set_line_commit_requires_stream(true);
   tracker.set_line_pace(0.3, 0.0);
   ASSERT_TRUE(tracker.rearm_line(1));
-  kmpc::Vec18 q = cfg_all.q_pref;
+  kmpc::Vec18 q = kmpc::test_fixture_q0();
   const kmpc::Vec3 p0 = kin.fk_pos(q, kmpc::kEeFrameLeft);
   const auto posed = kin.fk(q, kmpc::kEeFrameLeft);
   const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
   const kmpc::Vec3 goal = p0 + kmpc::Vec3(0.15, 0.0, 0.0);
   ASSERT_FALSE(
-      tracker.compute(q, cfg_all.q_pref, &goal, nullptr, &quat, nullptr)
+      tracker.compute(q, kmpc::test_fixture_q0(), &goal, nullptr, &quat, nullptr)
           .dq.hasNaN());
   ASSERT_TRUE(tracker.line_commit_pending());
   const double old_prog = tracker.line_commit_old_prog();
@@ -1574,7 +1585,7 @@ TEST(LinePath, PartialCommitAdvancesProgProportionally) {
   // Continuous second partial admit must keep advancing prog, not stick at 0.
   tracker.set_line_reference(accepted);
   ASSERT_FALSE(
-      tracker.compute(accepted, cfg_all.q_pref, &goal, nullptr, &quat, nullptr)
+      tracker.compute(accepted, kmpc::test_fixture_q0(), &goal, nullptr, &quat, nullptr)
           .dq.hasNaN());
   if (tracker.line_commit_pending()) {
     const double prog_before = tracker.line_progress();
@@ -1591,19 +1602,19 @@ TEST(LinePath, PartialCommitAdvancesProgProportionally) {
 
 TEST(LinePath, CommitAbortRestoresThenNewGenerationIsClean) {
   const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
   kmpc::CartesianTracker tracker(kin, cfg_all);
   tracker.set_line_commit_requires_stream(true);
   tracker.set_line_pace(0.3, 0.0);
   ASSERT_TRUE(tracker.rearm_line(1));
-  kmpc::Vec18 q = cfg_all.q_pref;
+  kmpc::Vec18 q = kmpc::test_fixture_q0();
   const kmpc::Vec3 p0 = kin.fk_pos(q, kmpc::kEeFrameLeft);
   const auto posed = kin.fk(q, kmpc::kEeFrameLeft);
   const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
   const kmpc::Vec3 goal = p0 + kmpc::Vec3(0.10, 0.0, 0.0);
   ASSERT_FALSE(
-      tracker.compute(q, cfg_all.q_pref, &goal, nullptr, &quat, nullptr)
+      tracker.compute(q, kmpc::test_fixture_q0(), &goal, nullptr, &quat, nullptr)
           .dq.hasNaN());
   ASSERT_TRUE(tracker.line_commit_pending());
   tracker.abort_line_stream_commit();
@@ -1617,7 +1628,7 @@ TEST(LinePath, CommitAbortRestoresThenNewGenerationIsClean) {
 
 TEST(LinePath, QpFollowModeBAndCExecuteAndRejectFarReference) {
   const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
   auto make_goal = [&](const kmpc::Vec18& q, kmpc::Vec3* goal, kmpc::Vec4* quat) {
     const kmpc::Vec3 p0 = kin.fk_pos(q, kmpc::kEeFrameLeft);
@@ -1631,11 +1642,11 @@ TEST(LinePath, QpFollowModeBAndCExecuteAndRejectFarReference) {
     tracker.set_line_qp_follow_mode(kmpc::LineQpFollowMode::B);
     tracker.set_line_pace(0.25, 0.0);
     ASSERT_TRUE(tracker.rearm_line(1));
-    kmpc::Vec18 q = cfg_all.q_pref;
+    kmpc::Vec18 q = kmpc::test_fixture_q0();
     kmpc::Vec3 goal = kmpc::Vec3::Zero();
     kmpc::Vec4 quat = kmpc::Vec4(0, 0, 0, 1);
     make_goal(q, &goal, &quat);
-    tracker.compute(q, cfg_all.q_pref, &goal, nullptr, &quat, nullptr);
+    tracker.compute(q, kmpc::test_fixture_q0(), &goal, nullptr, &quat, nullptr);
     EXPECT_FALSE(tracker.line_refused()) << tracker.line_reason();
     EXPECT_TRUE(tracker.line_active());
   }
@@ -1644,11 +1655,11 @@ TEST(LinePath, QpFollowModeBAndCExecuteAndRejectFarReference) {
     tracker.set_line_qp_follow_mode(kmpc::LineQpFollowMode::C);
     tracker.set_line_pace(0.25, 0.0);
     ASSERT_TRUE(tracker.rearm_line(1));
-    kmpc::Vec18 q = cfg_all.q_pref;
+    kmpc::Vec18 q = kmpc::test_fixture_q0();
     kmpc::Vec3 goal = kmpc::Vec3::Zero();
     kmpc::Vec4 quat = kmpc::Vec4(0, 0, 0, 1);
     make_goal(q, &goal, &quat);
-    tracker.compute(q, cfg_all.q_pref, &goal, nullptr, &quat, nullptr);
+    tracker.compute(q, kmpc::test_fixture_q0(), &goal, nullptr, &quat, nullptr);
     EXPECT_FALSE(tracker.line_refused()) << tracker.line_reason();
     EXPECT_TRUE(tracker.line_active());
   }
@@ -1660,11 +1671,11 @@ TEST(LinePath, QpFollowModeBAndCExecuteAndRejectFarReference) {
     tracker.set_line_commit_requires_stream(true);
     tracker.set_line_pace(0.25, 0.0);
     ASSERT_TRUE(tracker.rearm_line(1));
-    kmpc::Vec18 q = cfg_all.q_pref;
+    kmpc::Vec18 q = kmpc::test_fixture_q0();
     kmpc::Vec3 goal = kmpc::Vec3::Zero();
     kmpc::Vec4 quat = kmpc::Vec4(0, 0, 0, 1);
     make_goal(q, &goal, &quat);
-    tracker.compute(q, cfg_all.q_pref, &goal, nullptr, &quat, nullptr);
+    tracker.compute(q, kmpc::test_fixture_q0(), &goal, nullptr, &quat, nullptr);
     ASSERT_FALSE(tracker.line_refused()) << tracker.line_reason();
     ASSERT_TRUE(tracker.line_commit_pending());
     ASSERT_TRUE(tracker.confirm_line_stream_commit(tracker.line_cmd(), 1.0));
@@ -1672,7 +1683,7 @@ TEST(LinePath, QpFollowModeBAndCExecuteAndRejectFarReference) {
     kmpc::Vec18 bad = q;
     bad[5] += 0.25;
     tracker.set_line_reference(bad);
-    tracker.compute(q, cfg_all.q_pref, &goal, nullptr, &quat, nullptr);
+    tracker.compute(q, kmpc::test_fixture_q0(), &goal, nullptr, &quat, nullptr);
     EXPECT_TRUE(tracker.line_refused());
     EXPECT_TRUE(tracker.line_reason().find("qp_") != std::string::npos)
         << tracker.line_reason();

@@ -9,6 +9,7 @@
 #include <gtest/gtest.h>
 
 #include "kmpc/config.hpp"
+#include "kmpc/test_fixture.hpp"
 #include "kmpc/fast_trajectory_optimizer.hpp"
 #include "kmpc/trajectory_cost.hpp"
 #include "kmpc/constraint_policy.hpp"
@@ -53,7 +54,7 @@ kmpc::TrajectoryPackage make_hold_package(const kmpc::Vec18& q0,
   return pkg;
 }
 
-kmpc::Vec18 home_q(const kmpc::Config& config) { return config.q_pref; }
+kmpc::Vec18 home_q() { return kmpc::test_fixture_q0(); }
 
 double tip_time_s(const kmpc::TrajectoryPackage& pkg) {
   return kmpc::time_at_sample_index(pkg,
@@ -64,8 +65,8 @@ double tip_time_s(const kmpc::TrajectoryPackage& pkg) {
 
 TEST(ExecChain50250, SampleAtProvidesFiniteDerivatives) {
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
-  kmpc::Vec18 q0 = home_q(config);
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
+  kmpc::Vec18 q0 = home_q();
   kmpc::Vec18 q1 = q0;
   q1[4] += 0.05;
   kmpc::TrajectoryPackage pkg;
@@ -86,13 +87,13 @@ TEST(ExecChain50250, SampleAtProvidesFiniteDerivatives) {
 
 TEST(ExecChain50250, SupervisorRejectsCommandAsMeasProxy) {
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
-  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
+  kmpc::WholeBodyGuards guards(config.params, kmpc::test_fixture_q0()[kmpc::kIdxYaw]);
   auto policy = kmpc::policy_from_config(config);
   kmpc::SafetySupervisor sup(kin, &guards, policy);
-  const kmpc::Vec18 q = home_q(config);
+  const kmpc::Vec18 q = home_q();
   sup.seed(q);
   kmpc::SafetySupervisorInput in;
   in.q_cmd = q;
@@ -108,13 +109,13 @@ TEST(ExecChain50250, SupervisorRejectsCommandAsMeasProxy) {
 
 TEST(ExecChain50250, StepUsesInternalLastSendNotCallerPrev) {
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
-  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
+  kmpc::WholeBodyGuards guards(config.params, kmpc::test_fixture_q0()[kmpc::kIdxYaw]);
   auto policy = kmpc::policy_from_config(config);
   kmpc::SafetySupervisor sup(kin, &guards, policy);
-  kmpc::Vec18 q = home_q(config);
+  kmpc::Vec18 q = home_q();
   sup.seed(q);
   double t = 1.0;
   // First accept.
@@ -150,10 +151,10 @@ TEST(ExecChain50250, StepUsesInternalLastSendNotCallerPrev) {
 
 TEST(PitchRecoveryThroughSupervisor, Excess254And613) {
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
-  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
+  kmpc::WholeBodyGuards guards(config.params, kmpc::test_fixture_q0()[kmpc::kIdxYaw]);
   auto policy = kmpc::policy_from_config(config);
   const double limit = policy.torso_pitch_max_rad;
   ASSERT_GT(limit, 0.0);
@@ -161,7 +162,7 @@ TEST(PitchRecoveryThroughSupervisor, Excess254And613) {
   for (const double excess : {2.54e-4, 6.13e-4}) {
     kmpc::TrajectoryFollower follower(kin, &guards, policy);
     kmpc::SafetySupervisor sup(kin, &guards, policy);
-    kmpc::Vec18 q = home_q(config);
+    kmpc::Vec18 q = home_q();
     const double want = -limit - excess;
     const double d = want - (q[0] + q[1] + q[2]);
     q[0] += d / 3.0;
@@ -234,12 +235,12 @@ TEST(MotionTaskDigest, IncludesQuatAndStopAck) {
 
 TEST(StageAckGate, BlocksUntilMatchingAck) {
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
-  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
+  kmpc::WholeBodyGuards guards(config.params, kmpc::test_fixture_q0()[kmpc::kIdxYaw]);
   auto policy = kmpc::policy_from_config(config);
-  kmpc::Vec18 q0 = home_q(config);
+  kmpc::Vec18 q0 = home_q();
   kmpc::Vec18 q1 = q0;
   q1[4] += 0.02;
   kmpc::TrajectoryPackage pkg = make_hold_package(q0, 9);
@@ -275,12 +276,12 @@ TEST(StageAckGate, BlocksUntilMatchingAck) {
 TEST(StageAckGate, TipWaitFiveSecondsBlocksLiftOn250Hz) {
   // Real 50/250 linkage: TIP stop → WaitAck → wall clock +5s → no LIFT samples.
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
-  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
+  kmpc::WholeBodyGuards guards(config.params, kmpc::test_fixture_q0()[kmpc::kIdxYaw]);
   auto policy = kmpc::policy_from_config(config);
-  kmpc::Vec18 q0 = home_q(config);
+  kmpc::Vec18 q0 = home_q();
   kmpc::Vec18 q_tip = q0;
   q_tip[4] += 0.02;  // TIP approach
   kmpc::Vec18 q_lift = q_tip;
@@ -353,12 +354,12 @@ TEST(StageAckGate, TipWaitFiveSecondsBlocksLiftOn250Hz) {
 
 TEST(CertificatePolicy, NoContinuousFlagFromSamplingAndNo2xStep) {
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
-  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
+  kmpc::WholeBodyGuards guards(config.params, kmpc::test_fixture_q0()[kmpc::kIdxYaw]);
   auto policy = kmpc::policy_from_config(config);
-  kmpc::Vec18 q0 = home_q(config);
+  kmpc::Vec18 q0 = home_q();
   kmpc::Vec18 q1 = q0;
   q1[4] += 0.01;
   kmpc::MotionTask task;
@@ -388,12 +389,12 @@ TEST(CertificatePolicy, NoContinuousFlagFromSamplingAndNo2xStep) {
 
 TEST(StageAckGate, AckFailErrorTimeoutAndPoseDrift) {
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
-  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
+  kmpc::WholeBodyGuards guards(config.params, kmpc::test_fixture_q0()[kmpc::kIdxYaw]);
   auto policy = kmpc::policy_from_config(config);
-  kmpc::Vec18 q0 = home_q(config);
+  kmpc::Vec18 q0 = home_q();
   kmpc::Vec18 q1 = q0;
   q1[4] += 0.02;
   kmpc::Vec18 q_lift = q1;
@@ -486,12 +487,12 @@ TEST(StageAckGate, AckFailErrorTimeoutAndPoseDrift) {
 TEST(ExecChain50250, SendSequenceStatsReport250Hz) {
   // Gate E: 250 Hz Hermite send sequence stats (dq/ddq/jerk/fold/pause).
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
-  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
+  kmpc::WholeBodyGuards guards(config.params, kmpc::test_fixture_q0()[kmpc::kIdxYaw]);
   auto policy = kmpc::policy_from_config(config);
-  kmpc::Vec18 q0 = home_q(config);
+  kmpc::Vec18 q0 = home_q();
   kmpc::Vec18 q1 = q0;
   q1[4] += 0.03;
   kmpc::TrajectoryPackage pkg = make_hold_package(q0, 7);
@@ -570,12 +571,12 @@ TEST(ExecChain50250, SendSequenceStatsReport250Hz) {
 TEST(GateA50250Matrix, DelayFirstTickReversalSwitchAndFeedbackLag) {
   // A: scheduling delay / first tick / reversal / task switch / feedback lag.
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
-  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
+  kmpc::WholeBodyGuards guards(config.params, kmpc::test_fixture_q0()[kmpc::kIdxYaw]);
   auto policy = kmpc::policy_from_config(config);
-  kmpc::Vec18 q0 = home_q(config);
+  kmpc::Vec18 q0 = home_q();
   kmpc::Vec18 q1 = q0;
   q1[4] += 0.03;
   kmpc::Vec18 q2 = q0;
@@ -707,12 +708,12 @@ TEST(P0Barrier250Hz, TipBetween50HzCyclesNeverEmitsLift) {
   // TIP barrier sits between two 50 Hz ticks; 250 Hz runs many samples in the
   // gap. Without independent clamp, wall extrapolation would enter LIFT.
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
-  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
+  kmpc::WholeBodyGuards guards(config.params, kmpc::test_fixture_q0()[kmpc::kIdxYaw]);
   auto policy = kmpc::policy_from_config(config);
-  kmpc::Vec18 q0 = home_q(config);
+  kmpc::Vec18 q0 = home_q();
   kmpc::Vec18 q_tip = q0;
   q_tip[4] += 0.02;
   kmpc::Vec18 q_lift = q_tip;
@@ -789,12 +790,12 @@ TEST(P0Barrier250Hz, TipBetween50HzCyclesNeverEmitsLift) {
 
 TEST(P0StageSettle, EarlyAckWhileMovingAndTipDriftReject) {
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
-  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
+  kmpc::WholeBodyGuards guards(config.params, kmpc::test_fixture_q0()[kmpc::kIdxYaw]);
   auto policy = kmpc::policy_from_config(config);
-  kmpc::Vec18 q0 = home_q(config);
+  kmpc::Vec18 q0 = home_q();
   kmpc::Vec18 q_tip = q0;
   q_tip[4] += 0.02;
   kmpc::Vec18 q_lift = q_tip;
@@ -913,12 +914,12 @@ TEST(P0StageSettle, EarlyAckWhileMovingAndTipDriftReject) {
 // TIP settle must honor StageBoundary task TCP tol (3 mm), not a fixed 10 mm.
 TEST(P0StageSettle, TipTaskTolRejectsEightMmAndAcceptsStable) {
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
-  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
+  kmpc::WholeBodyGuards guards(config.params, kmpc::test_fixture_q0()[kmpc::kIdxYaw]);
   auto policy = kmpc::policy_from_config(config);
-  kmpc::Vec18 q0 = home_q(config);
+  kmpc::Vec18 q0 = home_q();
   kmpc::Vec18 q_tip = q0;
   q_tip[4] += 0.02;
   kmpc::Vec18 q_lift = q_tip;
@@ -1053,11 +1054,11 @@ TEST(R53Execution, ObserverJitterCannotReanchorSenderAndPauseNeverCatchesUp) {
 
 TEST(R53Execution, SenderTimedFollowerNeverAddsFeedbackOffset) {
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
   const auto policy = kmpc::policy_from_config(config);
-  const auto q0 = home_q(config);
+  const auto q0 = home_q();
   auto pkg = make_hold_package(q0, 7);
   pkg.samples.back()[kmpc::kSliceLeft.begin + 5] += 0.02;
   pkg.time_law.t_s = {0.0, 4.0};
@@ -1109,11 +1110,11 @@ TEST(R53Execution, SenderTimedFollowerNeverAddsFeedbackOffset) {
 
 TEST(R53Execution, HoldsAreRecordedAndUnsentCandidatesNeverEnterHistory) {
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
   const auto policy = kmpc::policy_from_config(config);
-  const auto q0 = home_q(config);
+  const auto q0 = home_q();
   kmpc::SafetySupervisor supervisor(kin, nullptr, policy);
   supervisor.seed(q0);
   supervisor.note_sent(q0, 10.0);
@@ -1143,10 +1144,10 @@ TEST(R53Execution, HoldsAreRecordedAndUnsentCandidatesNeverEnterHistory) {
 
 TEST(R53Execution, ShortFirstObserverAllowsAdmittedMeasurementDifference) {
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
-  const auto q0 = home_q(config);
+  const auto q0 = home_q();
   auto pkg = make_hold_package(q0, 7);
   kmpc::Vec18 measured = q0;
   measured[4] += 0.0005;
@@ -1159,10 +1160,10 @@ TEST(R53Execution, ShortFirstObserverAllowsAdmittedMeasurementDifference) {
 
 TEST(R53Execution, PassThroughStageCannotHideLaterAckBarrier) {
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
-  const auto q0 = home_q(config);
+  const auto q0 = home_q();
   auto pkg = make_hold_package(q0, 7);
   pkg.samples = {q0, q0, q0, q0};
   pkg.time_law.s = {0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0};
@@ -1194,11 +1195,11 @@ TEST(R53Execution, PassThroughStageCannotHideLaterAckBarrier) {
 
 TEST(R53Execution, CertifiedPitchRecoveryUsesCurveNotMeasuredStaircase) {
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
   const auto policy = kmpc::policy_from_config(config);
-  auto q0 = home_q(config);
+  auto q0 = home_q();
   q0[1] += -policy.torso_pitch_max_rad - 0.000254 - q0.head<3>().sum();
   auto pkg = make_hold_package(q0, 7);
   pkg.samples.back()[1] += 0.0005;
@@ -1232,10 +1233,11 @@ TEST(R53Execution, CertifiedPitchRecoveryUsesCurveNotMeasuredStaircase) {
 
 TEST(R53Execution, FieldLeftTwoStagesPassNominalSendingWithLaggedFeedback) {
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
-  kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
-                       "/Light-duty wheeled robot.urdf");
-  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
+  const std::string urdf =
+      std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf";
+  kmpc::Kinematics kin(urdf);
+  kmpc::WholeBodyGuards guards(config.params, kmpc::test_fixture_q0()[kmpc::kIdxYaw]);
   // Measured q at t=35.6358 in 20261116T071131Z; radians, URDF 18-axis order.
   kmpc::Vec18 q0;
   q0 << 0.6981290376366417, -0.8726553049333495, -0.17453825152161312,
@@ -1246,13 +1248,16 @@ TEST(R53Execution, FieldLeftTwoStagesPassNominalSendingWithLaggedFeedback) {
       1.2752249537908726, -0.2429148459303703, 0.013944844099872905;
   const auto policy = kmpc::policy_from_config(config, 0.3);
   auto weights = kmpc::load_trajectory_quality_weights(
-      cfg("trajectory_quality.yaml"), config.limits.dq_max, nullptr);
+      cfg("trajectory_quality.yaml"), policy.dq_max, nullptr);
   kmpc::MotionTask task;
   task.generation = 1794813127691249189ULL;
   task.q = q0; task.left = true; task.frame = std::string(kmpc::kEeFrameLeft);
   for (int i = 0; i < 2; ++i) {
     kmpc::TaskStage stage;
     stage.stage_id = i + 1;
+    // Field grasp contract: PTP to PREP, LIN approach to TIP.
+    stage.geometry =
+        i == 0 ? kmpc::TaskGeometry::Ptp : kmpc::TaskGeometry::Lin;
     stage.position = kmpc::Vec3(0.456071795, 0.272798503, i == 0 ? 0.715 : 0.565);
     stage.has_orientation = true;
     stage.quat = kmpc::tool_to_flange_quat_xyzw(
@@ -1261,6 +1266,7 @@ TEST(R53Execution, FieldLeftTwoStagesPassNominalSendingWithLaggedFeedback) {
                         : kmpc::StageStop::StopRequired;
     task.stages.push_back(stage);
   }
+  kmpc::seal_motion_task_identity(&task, urdf, false, policy);
   kmpc::RobotState state; state.q = q0; state.fresh = true;
   const auto plan = kmpc::FastTrajectoryOptimizer(kin, &guards).plan(
       task, state, policy, weights, kmpc::kPlannerBudgetMs);
@@ -1326,11 +1332,11 @@ TEST(R53Execution, FieldLeftTwoStagesPassNominalSendingWithLaggedFeedback) {
 
 TEST(R53Execution, NonAlignedAckStopAndRestartShareTheCertifiedSendGrid) {
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
   const auto policy = kmpc::policy_from_config(config, 0.3);
-  const auto q0 = home_q(config);
+  const auto q0 = home_q();
   auto pkg = make_hold_package(q0, 7);
   auto q1 = q0, q2 = q0;
   q1[11] += 0.03; q2[11] += 0.06;

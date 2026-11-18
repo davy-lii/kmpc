@@ -119,6 +119,7 @@ target_compile_definitions(kmpc_core PUBLIC
   KMPC_URDF_DIR="${CMAKE_CURRENT_SOURCE_DIR}/urdf"
   KMPC_GOLD_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/gold"
   KMPC_REPLAY_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/replay"
+  KMPC_TEST_FIXTURE_Q_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/q_start_sample.yaml"
 )
 
 function(kmpc_add_test name)
@@ -189,6 +190,8 @@ if(BUILD_TESTING)
   target_include_directories(test_alarm_resume PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/ros2")
   kmpc_add_test(test_v2_submit_gate tests/unit/test_v2_submit_gate.cpp)
   kmpc_add_test(test_hermite_pchip tests/unit/test_hermite_pchip.cpp)
+  kmpc_add_test(test_r54_field_quality tests/unit/test_r54_field_quality.cpp)
+  kmpc_add_test(test_j4_on_demand tests/unit/test_j4_on_demand.cpp)
   add_executable(replay_recent tests/replay/replay_recent.cpp)
   target_link_libraries(replay_recent PRIVATE kmpc_core)
   add_executable(probe_field_line tests/replay/probe_field_line.cpp)

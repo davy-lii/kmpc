@@ -16,6 +16,7 @@
 #endif
 
 #include "kmpc/config.hpp"
+#include "kmpc/test_fixture.hpp"
 #include "kmpc/fast_trajectory_optimizer.hpp"
 #include "kmpc/kinematics.hpp"
 #include "kmpc/motion_task.hpp"
@@ -104,14 +105,11 @@ int main(int argc, char** argv) {
   }
   (void)hard_deadline_explicit;
 
-  const auto config = kmpc::Config::load(
-      std::string(KMPC_CONFIG_DIR) + "/joint_limits.yaml",
-      std::string(KMPC_CONFIG_DIR) + "/q_pref.yaml",
-      std::string(KMPC_CONFIG_DIR) + "/kmpc_params.yaml");
+  const auto config = kmpc::Config::load(std::string(KMPC_CONFIG_DIR) + "/joint_limits.yaml", std::string(KMPC_CONFIG_DIR) + "/kmpc_params.yaml");
   const std::string urdf =
       std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf";
   kmpc::Kinematics kin(urdf);
-  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
+  kmpc::WholeBodyGuards guards(config.params, kmpc::test_fixture_q0()[kmpc::kIdxYaw]);
   const auto policy = kmpc::policy_from_config(config);
   std::string weight_why;
   auto weights = kmpc::load_trajectory_quality_weights(
@@ -121,7 +119,7 @@ int main(int argc, char** argv) {
     const double dq = std::max(config.limits.dq_max[j], 1e-3);
     weights.motion_scale[j] = 1.0 / dq;
   }
-  const kmpc::Vec18 q0 = config.q_pref;
+  const kmpc::Vec18 q0 = kmpc::test_fixture_q0();
   const kmpc::Vec3 p0 = kin.fk_pos(q0, kmpc::kEeFrameLeft);
   kmpc::FastTrajectoryOptimizer optimizer(kin, &guards);
 

@@ -2,7 +2,7 @@
 #include "node_cache.hpp"
 using namespace kmpc;using namespace kmpc::ros2io;
 TEST(LineSegment, AtomicGenerationTipAndArmReplacement) {
-  TaskReceiver rx(Vec18::Zero());CartesianTarget t;t.generation=100;t.xyz=Vec3(1,2,3);
+  TaskReceiver rx;CartesianTarget t;t.generation=100;t.xyz=Vec3(1,2,3);
   LineTarget tip;tip.xyz=Vec3(4,5,6);t.cascade=tip;
   ASSERT_TRUE(rx.on_segment(true,t));
   auto pair=rx.targets();ASSERT_TRUE(pair.first);EXPECT_FALSE(pair.second);
@@ -15,19 +15,19 @@ TEST(LineSegment, AtomicGenerationTipAndArmReplacement) {
   rx.clear_right();EXPECT_FALSE(rx.on_segment(false,t)); // old message cannot rearm after clear
 }
 TEST(LineSegment, LegacyUpdatesNeedClearForNewGeneration) {
-  TaskReceiver rx(Vec18::Zero());CartesianTarget t;rx.on_target_left(t);
+  TaskReceiver rx;CartesianTarget t;rx.on_target_left(t);
   auto first=rx.target(true)->generation;t.xyz[0]=.15;rx.on_target_left(t);
   EXPECT_EQ(first,rx.target(true)->generation);
   rx.clear_left();rx.on_target_left(t);EXPECT_GT(rx.target(true)->generation,first);
 }
 TEST(LineSegment, InvalidCoordinatesNeverReplaceTarget) {
-  TaskReceiver rx(Vec18::Zero());CartesianTarget t;t.generation=1;t.frame_id="camera";
+  TaskReceiver rx;CartesianTarget t;t.generation=1;t.frame_id="camera";
   EXPECT_FALSE(rx.on_segment(true,t));EXPECT_FALSE(rx.target(true));
   t.frame_id="base_link";t.xyz[0]=std::numeric_limits<double>::quiet_NaN();EXPECT_FALSE(rx.on_segment(true,t));
 }
 
 TEST(LineSegment, DelayedClearCannotEraseTheNextSegment) {
-  TaskReceiver rx(Vec18::Zero()); CartesianTarget t;t.generation=100;
+  TaskReceiver rx; CartesianTarget t;t.generation=100;
   ASSERT_TRUE(rx.on_segment(true,t));
   EXPECT_FALSE(rx.clear_segment(true,99));ASSERT_TRUE(rx.target(true));
   t.generation=101;ASSERT_TRUE(rx.on_segment(true,t));

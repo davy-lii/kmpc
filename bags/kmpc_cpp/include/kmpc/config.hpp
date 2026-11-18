@@ -94,15 +94,10 @@ struct KmpcParams {
 struct Config {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
   JointVelocityLimits limits;
-  Vec18 q_pref = Vec18::Zero();
-  std::string q_pref_station = "default";
   KmpcParams params;
 
-  static Config load(
-      const std::string& joint_limits_yaml,
-      const std::string& q_pref_yaml,
-      const std::string& kmpc_params_yaml,
-      const std::string& station = "default");
+  static Config load(const std::string& joint_limits_yaml,
+                     const std::string& kmpc_params_yaml);
 };
 
 // 腰锁只覆盖副本，禁止写 P / R，禁止改 joint_limits.yaml。

@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include "kmpc/config.hpp"
+#include "kmpc/test_fixture.hpp"
 #include "kmpc/kinematics.hpp"
 #include "kmpc/motion_evaluator.hpp"
 
@@ -20,8 +21,8 @@ std::string urdf() {
 
 TEST(MotionEvaluator, ComMatchesInertialAndDoesNotRunCrba) {
   const kmpc::Config config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
-  const kmpc::Vec18 q = config.q_pref;
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
+  const kmpc::Vec18 q = kmpc::test_fixture_q0();
   kmpc::Kinematics kin(urdf());
   kin.reset_kin_eval_stats();
 
@@ -59,10 +60,10 @@ TEST(MotionEvaluator, ComMatchesInertialAndDoesNotRunCrba) {
 
 TEST(MotionEvaluator, BundleReadsBodyLegComWithoutCrba) {
   const kmpc::Config config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(urdf());
   kmpc::Kinematics reference(urdf());
-  const kmpc::Vec18 q = config.q_pref;
+  const kmpc::Vec18 q = kmpc::test_fixture_q0();
   const auto full = reference.inertial_quantities(q);
 
   kin.reset_kin_eval_stats();

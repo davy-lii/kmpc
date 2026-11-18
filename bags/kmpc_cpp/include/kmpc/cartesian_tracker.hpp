@@ -1,7 +1,7 @@
 #pragma once
 // 对应 Python kmpc/cartesian_tracker.py；对照 09-04 §1 / §3。
 // compute 只编排：FK/J → 装配 P,g,A,b → ProxQP → ARRIVED。Safety / Planner 不进这里。
-// 腰锁只覆盖 dq_max。z_home / λ / q4_pref 钉构造期 HOME，不随运行 q_calib 热改。
+// 腰锁只覆盖 dq_max。z_start / λ / line_q_pref 在每任务 begin_task 时用实测初始化。
 
 #include <algorithm>
 #include <array>
@@ -75,6 +75,9 @@ class CartesianTracker {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
   CartesianTracker(Kinematics& kin, const Config& cfg);
 
+  void begin_task(const Vec18& q_start);
+  const Vec18& task_pose_ref() const { return line_q_pref_; }
+
   void set_upper_commands(const UpperCommand& cmd);
   void reset();
   void reset_warm();
@@ -112,7 +115,8 @@ class CartesianTracker {
   double last_com_work_xmax() const { return last_com_work_xmax_; }
   double last_com_slack_x() const { return last_com_slack_x_; }
   bool last_rise_hold() const { return torso_rise_hold_; }
-  double z_home() const { return z_home_; }
+  double z_start() const { return z_start_; }
+  double z_home() const { return z_start_; }
   double r_lambda() const { return r_lambda_; }
   QpStatus last_qp_status() const { return last_qp_status_; }
   int last_n_ineq() const { return last_n_ineq_; }
@@ -920,7 +924,7 @@ class CartesianTracker {
   double r_arm_ = 0.05;
   double r_lambda_ = 1.0;
   double q_yaw_pref_ = 0.0;
-  double z_home_ = 0.0;
+  double z_start_ = 0.0;
   double z_star_ = 0.0;
   bool deep_on_ = false;
   double last_e0_ = 0.0;

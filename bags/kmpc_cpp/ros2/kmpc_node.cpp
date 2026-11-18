@@ -14,6 +14,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -126,15 +127,42 @@ kmpc::ros2io::CartesianTarget from_pose(
   return t;
 }
 
-kmpc::TaskGeometry geometry_from_msg(uint8_t g) {
+std::optional<kmpc::TaskGeometry> geometry_from_msg(uint8_t g) {
   switch (g) {
     case kmpc_msgs::msg::MotionStage::PTP:
       return kmpc::TaskGeometry::Ptp;
     case kmpc_msgs::msg::MotionStage::FOLLOW_CURVE:
       return kmpc::TaskGeometry::FollowCurve;
     case kmpc_msgs::msg::MotionStage::LIN:
-    default:
       return kmpc::TaskGeometry::Lin;
+    default:
+      return std::nullopt;
+  }
+}
+
+std::optional<kmpc::TaskGeometry> geometry_from_name(const std::string& name) {
+  if (name == "lin" || name == "Lin" || name == "LIN") {
+    return kmpc::TaskGeometry::Lin;
+  }
+  if (name == "ptp" || name == "Ptp" || name == "PTP") {
+    return kmpc::TaskGeometry::Ptp;
+  }
+  if (name == "follow_curve" || name == "FollowCurve" ||
+      name == "FOLLOW_CURVE") {
+    return kmpc::TaskGeometry::FollowCurve;
+  }
+  return std::nullopt;
+}
+
+const char* geometry_name(kmpc::TaskGeometry g) {
+  switch (g) {
+    case kmpc::TaskGeometry::Ptp:
+      return "PTP";
+    case kmpc::TaskGeometry::FollowCurve:
+      return "FOLLOW_CURVE";
+    case kmpc::TaskGeometry::Lin:
+    default:
+      return "LIN";
   }
 }
 
@@ -156,7 +184,11 @@ std::optional<kmpc::MotionTask> motion_task_from_sequence(
   for (std::size_t i = 0; i < msg.stages.size(); ++i) {
     const auto& ms = msg.stages[i];
     kmpc::TaskStage st;
-    st.geometry = geometry_from_msg(ms.geometry);
+    const auto geo = geometry_from_msg(ms.geometry);
+    if (!geo) {
+      return std::nullopt;
+    }
+    st.geometry = *geo;
     st.position = kmpc::Vec3(ms.target.position.x, ms.target.position.y,
                              ms.target.position.z);
     st.quat = kmpc::Vec4(ms.target.orientation.x, ms.target.orientation.y,
@@ -174,7 +206,7 @@ std::optional<kmpc::MotionTask> motion_task_from_sequence(
 }
 
 std::optional<kmpc::Vec18> q_from_joint_state(
-    const sensor_msgs::msg::JointState& msg, const kmpc::Vec18& fallback) {
+    const sensor_msgs::msg::JointState& msg) {
   if (msg.position.empty()) {
     return std::nullopt;
   }
@@ -184,7 +216,7 @@ std::optional<kmpc::Vec18> q_from_joint_state(
     for (std::size_t i = 0; i < n; ++i) {
       named[msg.name[i]] = msg.position[i];
     }
-    return kmpc::ros2io::q_from_name_positions(named, fallback);
+    return kmpc::ros2io::q_from_name_positions(named);
   }
   if (static_cast<int>(msg.position.size()) != kmpc::kNDof) {
     return std::nullopt;
@@ -203,12 +235,16 @@ class KmpcNode : public rclcpp::Node {
   KmpcNode() : Node("kmpc_node") {
     declare_params();
     const std::string limits_file = str_or("joint_limits_file", default_config("joint_limits.yaml"));
-    const std::string q_pref_file = str_or("q_pref_file", default_config("q_pref.yaml"));
     const std::string params_file =
         str_or("kmpc_params_file", default_config("kmpc_params.yaml"));
-    const std::string station = str_or("q_pref_station", "default");
+    if (has_parameter("q_pref_file") || has_parameter("q_pref_station")) {
+      RCLCPP_WARN(
+          get_logger(),
+          "q_pref_file/q_pref_station are removed; start from measured "
+          "joint_states per task");
+    }
     check_joint_map(str_or("joint_map_file", default_config("joint_map.yaml")));
-    cfg_ = kmpc::Config::load(limits_file, q_pref_file, params_file, station);
+    cfg_ = kmpc::Config::load(limits_file, params_file);
 
     const bool require_xoip = bool_param("require_xoip", true);
 #ifndef KMPC_HAVE_XOIP
@@ -238,7 +274,7 @@ class KmpcNode : public rclcpp::Node {
     // planner!=unified_multistage_v2. V2 uses PlannerWorker instead.
     line_plan_kin_=std::make_unique<kmpc::Kinematics>(line_urdf_source_,
         line_urdf_xml_?kmpc::Kinematics::UrdfInput::Xml:kmpc::Kinematics::UrdfInput::Path);
-    stream_guards_=std::make_unique<kmpc::WholeBodyGuards>(cfg_.params,cfg_.q_pref[kmpc::kIdxYaw]);
+    stream_guards_=std::make_unique<kmpc::WholeBodyGuards>(cfg_.params, 0.0);
     tracker_ = std::make_unique<kmpc::CartesianTracker>(*kin_, cfg_);
     planner_ = std::make_unique<kmpc::UpperPlanner>(
         *kin_, cfg_.params.calib_tol_rad, cfg_.params.com_xmin,
@@ -249,10 +285,11 @@ class KmpcNode : public rclcpp::Node {
         cfg_.limits.q_min, cfg_.limits.q_max, cfg_.params.q_limit_margin);
     joint_tracker_ = std::make_unique<kmpc::ros2io::JointSpaceTracker>(
         *kin_, cfg_);
-    q_des_star_ = cfg_.q_pref;
+    q_des_star_.setZero();
+    q_des_star_valid_ = false;
 
-    task_ = std::make_unique<kmpc::ros2io::TaskReceiver>(cfg_.q_pref);
-    planner_rx_ = std::make_unique<kmpc::ros2io::PlannerReceiver>(cfg_.q_pref);
+    task_ = std::make_unique<kmpc::ros2io::TaskReceiver>();
+    planner_rx_ = std::make_unique<kmpc::ros2io::PlannerReceiver>();
     arbiter_ = std::make_unique<kmpc::ros2io::CommandArbiter>(
         bool_param("auto_enable", false));
     state_ = std::make_unique<kmpc::ros2io::StateAggregator>(
@@ -273,7 +310,7 @@ class KmpcNode : public rclcpp::Node {
         *kin_, &tracker_->guards(), motion_policy);
     safety_supervisor_ = std::make_unique<kmpc::SafetySupervisor>(
         *stream_kin_, stream_guards_.get(), motion_policy);
-    safety_supervisor_->seed(cfg_.q_pref);
+    safety_supervisor_->reset_session();
 
     {
       const std::string mode_text = str_or(
@@ -354,9 +391,26 @@ class KmpcNode : public rclcpp::Node {
     final_gate_limits_ = kmpc::make_final_gate_limits(cfg_);
     planner_name_ = str_or("planner", "unified_multistage_v2");
     use_v2_chain_ = (planner_name_ == "unified_multistage_v2");
+    {
+      const auto prep_g =
+          geometry_from_name(str_or("legacy_prep_geometry", "ptp"));
+      const auto tip_g =
+          geometry_from_name(str_or("legacy_tip_geometry", "lin"));
+      if (!prep_g || !tip_g) {
+        throw kmpc::ConfigError(
+            "legacy_prep_geometry/legacy_tip_geometry must be lin|ptp|"
+            "follow_curve");
+      }
+      legacy_prep_geometry_ = *prep_g;
+      legacy_tip_geometry_ = *tip_g;
+      RCLCPP_INFO(get_logger(),
+                  "legacy two-point geometry map: prep=%s tip=%s "
+                  "(typed MotionSequence unchanged)",
+                  geometry_name(legacy_prep_geometry_),
+                  geometry_name(legacy_tip_geometry_));
+    }
     line_pose_pref_enable_ = bool_param("line_pose_pref_enable", false);
     tracker_->set_line_pose_pref(line_pose_pref_enable_);
-    tracker_->set_line_pose_pref_q(cfg_.q_pref);
     // P0 path-layer isolation switches (scheme defaults).
     line_pitch_straighten_enable_ =
         bool_param("line_pitch_straighten_enable", true);
@@ -459,7 +513,7 @@ class KmpcNode : public rclcpp::Node {
     q_target_sub_ = create_subscription<sensor_msgs::msg::JointState>(
         str_or("q_target_topic", "/kmpc/q_target"), 10,
         [this](sensor_msgs::msg::JointState::ConstSharedPtr msg) {
-          const auto q = q_from_joint_state(*msg, cfg_.q_pref);
+          const auto q = q_from_joint_state(*msg);
           if (q.has_value()) {
             task_->on_q_target(*q);
           }
@@ -620,6 +674,13 @@ class KmpcNode : public rclcpp::Node {
           }
           v2_request_plan_ = false;
           v2_gate_.clear();
+          v2_pending_plan_valid_ = false;
+          v2_pending_identity_ok_ = false;
+          v2_adopt_waiting_ = false;
+          q_des_star_valid_ = false;
+          if (safety_supervisor_) {
+            safety_supervisor_->reset_session();
+          }
           publish_arrived(false);
           std::lock_guard<std::mutex> lock(stream_mu_);
           stream_clear_modes();
@@ -640,6 +701,9 @@ class KmpcNode : public rclcpp::Node {
             }
             v2_request_plan_ = false;
             v2_gate_.clear();
+            v2_pending_plan_valid_ = false;
+            v2_pending_identity_ok_ = false;
+            v2_adopt_waiting_ = false;
           }
           publish_arrived(false);
         });
@@ -658,6 +722,9 @@ class KmpcNode : public rclcpp::Node {
             }
             v2_request_plan_ = false;
             v2_gate_.clear();
+            v2_pending_plan_valid_ = false;
+            v2_pending_identity_ok_ = false;
+            v2_adopt_waiting_ = false;
           }
           publish_arrived(false);
         });
@@ -678,7 +745,7 @@ class KmpcNode : public rclcpp::Node {
     q_calib_sub_ = create_subscription<sensor_msgs::msg::JointState>(
         str_or("q_calib_topic", "/kmpc/q_calib"), 10,
         [this](sensor_msgs::msg::JointState::ConstSharedPtr msg) {
-          const auto q = q_from_joint_state(*msg, cfg_.q_pref);
+          const auto q = q_from_joint_state(*msg);
           if (q.has_value()) {
             planner_rx_->on_q_calib(*q);
           }
@@ -804,14 +871,24 @@ class KmpcNode : public rclcpp::Node {
       // Real measurement cache for 250 Hz SafetySupervisor (never use cmd).
       std::lock_guard<std::mutex> lock(stream_mu_);
       v2_meas_q_ = q;
-      // Prefer local receive time for freshness; keep source stamp if present.
+      // Receive = node ROS now. Collection = header only when present — never
+      // copy receive into source.
       v2_meas_stamp_s_ = now().seconds();
       if (has_stamp) {
         v2_meas_source_stamp_s_ =
             static_cast<double>(msg->header.stamp.sec) +
             1e-9 * static_cast<double>(msg->header.stamp.nanosec);
+        v2_meas_has_source_ = true;
+      } else {
+        v2_meas_source_stamp_s_ = std::numeric_limits<double>::quiet_NaN();
+        v2_meas_has_source_ = false;
       }
       v2_meas_valid_ = missing.empty() && q.allFinite();
+      if (v2_meas_valid_) {
+        v2_meas_ring_.push(q, v2_meas_stamp_s_,
+                           v2_meas_has_source_ ? v2_meas_source_stamp_s_
+                                               : std::numeric_limits<double>::quiet_NaN());
+      }
     }
     if (line_diag_enable_ && tracker_) {
       tracker_->line_diag_push_feedback(
@@ -820,9 +897,18 @@ class KmpcNode : public rclcpp::Node {
                        : -1.0);
     }
     if (!missing.empty()) {
+      // Incomplete joint_states must not form a valid 18-axis V2 measurement
+      // (v2_meas_valid_=false above). Log names + age of last complete set.
+      std::string names;
+      for (std::size_t i = 0; i < missing.size() && i < 6; ++i) {
+        if (i) names += ",";
+        names += missing[i];
+      }
+      if (missing.size() > 6) names += ",...";
       RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 5000,
-          "/joint_states missing %zu MPC joints", missing.size());
+          "/joint_states missing %zu MPC joints [%s] (v2_meas rejected)",
+          missing.size(), names.c_str());
     }
   }
 
@@ -911,7 +997,38 @@ class KmpcNode : public rclcpp::Node {
       return false;
     }
     if (stream_hold_) {
-      *q_out = stream_q_hold_;
+      // Hold must not bypass the same last-send contract. Re-sync to the last
+      // successful publish (r55: stale meas/follower hold caused a reverse jump
+      // that published before the recovery attempt was rejected).
+      if (safety_supervisor_->has_last_send()) {
+        stream_q_hold_ = safety_supervisor_->q_last_send();
+      }
+      kmpc::Vec18 q_hold = stream_q_hold_;
+      if (v2_meas_valid_) {
+        kmpc::SafetySupervisorInput in;
+        in.q_cmd = q_hold;
+        in.q_prev = q_hold;
+        in.q_plan = q_hold;
+        in.q_meas = v2_meas_q_;
+        in.has_meas = true;
+        in.meas_timestamp_s = v2_meas_stamp_s_;
+        in.now_s = now().seconds();
+        in.cmd_timestamp_s = in.now_s;
+        in.send_timestamp_s = stream_send_stamp_s_;
+        in.dt = interp_dt_;
+        in.has_follow = false;
+        in.package = nullptr;
+        const kmpc::SafetyDecision dec = safety_supervisor_->check(in, false);
+        if (!dec.accept) {
+          q_hold = safety_supervisor_->has_last_send()
+                       ? safety_supervisor_->q_last_send()
+                       : (dec.q_send.allFinite() ? dec.q_send : q_hold);
+          stream_q_hold_ = q_hold;
+        } else {
+          q_hold = dec.q_send;
+        }
+      }
+      *q_out = q_hold;
     } else if (stream_v2_) {
       // V2_CHAIN 250 Hz: copy complete slot, sample at send time; Supervisor
       // owns q_last_send. Never treat 50 Hz q_follow as the next 4 ms command.
@@ -935,8 +1052,24 @@ class KmpcNode : public rclcpp::Node {
             slot.barrier_pending && !slot.barrier_released, slot.barrier_t_s);
         if (slot.timeline_frozen) {
           // Stage barrier / WaitAck: do not advance into the next stage.
+          // Approach freeze_q under dq_max*dt — never snap (r55 reverse jump).
           q_plan = slot.freeze_q.allFinite() ? slot.freeze_q : slot.q_follow_hint;
-          q_cmd = q_plan;
+          if (!q_plan.allFinite()) {
+            q_plan = safety_supervisor_->has_last_send()
+                         ? safety_supervisor_->q_last_send()
+                         : interpolator_.q_ref();
+          }
+          if (safety_supervisor_->has_last_send()) {
+            q_cmd = step_bound_toward(safety_supervisor_->q_last_send(), q_plan,
+                                      interp_dt_);
+            // Intermediate approach frames are not the snap target; keep tube
+            // relative to the authorized command, not an unreachable freeze_q.
+            if ((q_cmd - q_plan).cwiseAbs().maxCoeff() > 1e-12) {
+              q_plan = q_cmd;
+            }
+          } else {
+            q_cmd = q_plan;
+          }
         } else {
           // Sample the single sender clock, clamped to the next unreleased
           // TIP/STOP barrier. 50 Hz never replaces the clock or adds offsets.
@@ -954,12 +1087,18 @@ class KmpcNode : public rclcpp::Node {
           q_plan = samp.q;
           q_cmd = samp.q;
           // At an unreleased STOP/ACK barrier time, prefer the certified
-          // barrier sample (no wall-clock jump past the tip).
+          // barrier sample but still step-bound from last send.
           if (slot.barrier_pending && !slot.barrier_released &&
               slot.barrier_q.allFinite() &&
               t_s + 1e-12 >= slot.barrier_t_s) {
-            q_plan = slot.barrier_q;
-            q_cmd = slot.barrier_q;
+            if (safety_supervisor_->has_last_send()) {
+              q_cmd = step_bound_toward(safety_supervisor_->q_last_send(),
+                                        slot.barrier_q, interp_dt_);
+              q_plan = q_cmd;
+            } else {
+              q_plan = slot.barrier_q;
+              q_cmd = slot.barrier_q;
+            }
           }
         }
         kmpc::SafetySupervisorInput in;
@@ -968,7 +1107,9 @@ class KmpcNode : public rclcpp::Node {
         in.q_meas = v2_meas_q_;
         in.has_meas = true;
         in.q_follow = slot.q_follow_hint;
-        in.has_follow = slot.q_follow_hint.allFinite();
+        // Follow hint is observational only while frozen/barrier settling —
+        // do not reject a step-bounded approach as follow_mismatch.
+        in.has_follow = slot.q_follow_hint.allFinite() && !slot.timeline_frozen;
         in.q_plan = q_plan;
         in.dt = interp_dt_;
         in.cmd_timestamp_s = now_s;
@@ -992,10 +1133,10 @@ class KmpcNode : public rclcpp::Node {
               get_logger(), *get_clock(), 1000,
               "kmpc v2 safety reject reason=%s gen=%llu path_id=%u "
               "joint=%d dt=%.9f actual=%.9g limit=%.9g v=%.9g a=%.9g "
-              "exec_t=%.9f q_cmd=%.9g q_last=%.9g",
+              "exec_t=%.9f now_ros=%.5f q_cmd=%.9g q_last=%.9g",
               dec.reason, static_cast<unsigned long long>(slot.generation),
               slot.path_id, dec.joint, dec.dt_s, dec.actual, dec.limit,
-              dec.velocity, dec.acceleration, exec_t,
+              dec.velocity, dec.acceleration, exec_t, now_s,
               dec.joint >= 0 ? q_cmd[dec.joint] : 0.0,
               dec.joint >= 0 ? safety_supervisor_->q_last_send()[dec.joint] : 0.0);
           latch_v2_fault(dec.reason, dec.q_send.allFinite() ? dec.q_send
@@ -1198,6 +1339,47 @@ class KmpcNode : public rclcpp::Node {
     stream_clear_modes();
   }
 
+  bool begin_task_from_measured(uint64_t generation, const char* why) {
+    kmpc::Vec18 q_start;
+  {
+      std::lock_guard<std::mutex> lock(stream_mu_);
+      if (!v2_meas_valid_) {
+        return false;
+      }
+      q_start = v2_meas_q_;
+      v2_pending_plan_valid_ = false;
+      v2_pending_identity_ok_ = false;
+      v2_adopt_waiting_ = false;
+      stream_v2_ = false;
+      stream_clear_modes();
+      publish_v2_slot_inactive();
+    }
+    if (follower_) {
+      follower_->reset();
+    }
+    if (planner_worker_) {
+      planner_worker_->clear_pending_and_result();
+    }
+    if (safety_supervisor_) {
+      safety_supervisor_->reset_session();
+      safety_supervisor_->set_start_anchor(q_start);
+    }
+    reset_interpolator_to(q_start);
+    tracker_->begin_task(q_start);
+    joint_tracker_->begin_task(q_start);
+    if (stream_guards_) {
+      stream_guards_->set_yaw_pref(q_start[kmpc::kIdxYaw]);
+    }
+    q_des_star_ = q_start;
+    q_des_star_valid_ = true;
+    v2_task_send_gen_ = generation;
+    RCLCPP_INFO(
+        get_logger(), "kmpc begin_task gen=%llu why=%s q_start=%s",
+        static_cast<unsigned long long>(generation), why,
+        kmpc::format_vec18_compact(q_start).c_str());
+    return true;
+  }
+
   void stream_clear_modes() {
     stream_hold_ = false;
     stream_fixed_ = false;
@@ -1211,21 +1393,45 @@ class KmpcNode : public rclcpp::Node {
     interpolator_.clear_q_star();
   }
 
+  // Bound per-joint |to-from| by dq_max*dt so freeze/hold switches cannot snap.
+  kmpc::Vec18 step_bound_toward(const kmpc::Vec18& from, const kmpc::Vec18& to,
+                                double dt) const {
+    const kmpc::Vec18 dq_max = tracker_->effective_dq_max();
+    kmpc::Vec18 out = to;
+    const double dt_use = std::max(dt, 1e-4);
+    for (int j = 0; j < kmpc::kNDof; ++j) {
+      const double lim = std::max(dq_max[j], 1e-6) * dt_use;
+      const double d = to[j] - from[j];
+      if (std::abs(d) > lim) {
+        out[j] = from[j] + std::copysign(lim, d);
+      }
+    }
+    return out;
+  }
+
   void stream_enter_hold(const kmpc::Vec18& q) {
     if (!q.allFinite()) {
       return;
     }
+    // Sender owns the published position. A 50 Hz measured/follower reference
+    // can lag the last 250 Hz send — never hold that older pose (r55 J1 reverse
+    // jump). Prefer last successful publish whenever it exists.
+    // This is a position hold at the last safe send; decelerating stop belongs
+    // on the certified time law before the barrier, not in enter_hold.
+    const kmpc::Vec18 hold_q = safety_supervisor_->has_last_send()
+                                   ? safety_supervisor_->q_last_send()
+                                   : q;
     stream_hold_ = true;
     stream_fixed_ = true;
     stream_line_ = false;
     stream_chord_pending_ = false;
-    stream_q_hold_ = q;
-    interpolator_.reset(q);
-    stream_raw_ref_=q;line_smoother_.reset(q);
+    stream_q_hold_ = hold_q;
+    interpolator_.reset(hold_q);
+    stream_raw_ref_=hold_q;line_smoother_.reset(hold_q);
     interpolator_.set_stop_at_goal(true);
-    interpolator_.set_goal(q);
+    interpolator_.set_goal(hold_q);
     interpolator_.clear_segment();
-    safety_->seed(q);
+    safety_->seed(hold_q);
     // Keep envelope extrema across pause/hold so resume cannot reset fold budget.
     // Clear only when leaving the line contract entirely via stream_clear_modes.
   }
@@ -1623,9 +1829,11 @@ class KmpcNode : public rclcpp::Node {
     tracker_->set_upper_commands(result.command);
     const bool calibrating =
         result.command.tracking_state == kmpc::TrackingState::Calibrating;
-    kmpc::Vec18 q_pref_cart = cfg_.q_pref;
+    kmpc::Vec18 q_task_ref = q0;
     if (calibrating && result.command.has_q_calib) {
-      q_pref_cart = result.command.q_calib;
+      q_task_ref = result.command.q_calib;
+    } else if (q_des_star_valid_) {
+      q_task_ref = q_des_star_;
     }
     const kmpc::Vec3* use_l = calibrating ? nullptr : xyz_l;
     const kmpc::Vec3* use_r = calibrating ? nullptr : xyz_r;
@@ -1713,20 +1921,30 @@ class KmpcNode : public rclcpp::Node {
         mt.generation = target.generation;
         mt.left = is_left;
         kmpc::TaskStage st;
-        st.geometry = kmpc::TaskGeometry::Lin;
+        // Two-point cascade: prep/tip from explicit legacy_* params.
+        // Single-point PoseArray stays LIN (do not free-path an unknown insert).
+        st.geometry = target.cascade ? legacy_prep_geometry_
+                                     : kmpc::TaskGeometry::Lin;
         st.position = target.xyz;
         st.quat = target.quat_xyzw;
         st.has_orientation =
             !kmpc::quat_is_identity_xyzw(&target.quat_xyzw);
         st.stage_id = 0;
+        // Cascade fallback: prep continuous → tip stop. ACK comes only from
+        // MotionSequence (motion_task_from_sequence); never invent auto-ACK.
+        st.stop = target.cascade ? kmpc::StageStop::Continuous
+                                 : kmpc::StageStop::StopRequired;
+        st.wait_for_external_ack = false;
         mt.stages.push_back(st);
         if (target.cascade) {
           kmpc::TaskStage tip;
-          tip.geometry = kmpc::TaskGeometry::Lin;
+          tip.geometry = legacy_tip_geometry_;
           tip.position = target.cascade->xyz;
           tip.quat = target.cascade->quat_xyzw;
           tip.has_orientation = target.cascade->ori_on;
           tip.stage_id = 1;
+          tip.stop = kmpc::StageStop::StopRequired;
+          tip.wait_for_external_ack = false;
           mt.stages.push_back(tip);
         }
       }
@@ -1757,14 +1975,28 @@ class KmpcNode : public rclcpp::Node {
       const auto gate_dec = v2_gate_.on_tick(req_id, follower_->has_package(),
                                              explicit_req);
       if (gate_dec.submit) {
+        if (gate_dec.invalidate_old &&
+            !begin_task_from_measured(mt.generation, gate_dec.reason)) {
+          RCLCPP_WARN_THROTTLE(
+              get_logger(), *get_clock(), 1000,
+              "kmpc v2 submit wait meas gen=%llu",
+              static_cast<unsigned long long>(mt.generation));
+          return;
+        }
+        kmpc::Vec18 q_plan = q0;
+        {
+          std::lock_guard<std::mutex> lock(stream_mu_);
+          if (v2_meas_valid_) {
+            q_plan = v2_meas_q_;
+          }
+        }
         kmpc::RobotState st;
-        st.q = q0;
+        st.q = q_plan;
         st.dq_known = false;
-        st.fresh = true;
+        st.fresh = v2_meas_valid_;
         st.timestamp_s = now().seconds();
         if (gate_dec.invalidate_old && follower_) {
           follower_->request_brake();
-          planner_worker_->clear_pending_and_result();
         }
         planner_worker_->submit_snapshot(mt, st, v2_policy,
                                          planner_worker_->default_weights(),
@@ -1773,88 +2005,278 @@ class KmpcNode : public rclcpp::Node {
         ++line_plan_builds_;
         {
           std::lock_guard<std::mutex> lock(stream_mu_);
-          stream_enter_hold(q0);
+          v2_plan_start_ = kmpc::PlanStartSnapshot{};
+          v2_plan_start_.q_plan_start = q_plan;
+          v2_plan_start_.generation = mt.generation;
+          v2_plan_start_.submit_ros_s = now().seconds();
+          v2_plan_start_.stamp_s = v2_plan_start_.submit_ros_s;
+          if (v2_meas_valid_) {
+            v2_plan_start_.q_meas_start = v2_meas_q_;
+            v2_plan_start_.has_meas_start = true;
+            v2_plan_start_.meas_recv_s = v2_meas_stamp_s_;
+            v2_plan_start_.has_meas_recv = true;
+            if (v2_meas_has_source_) {
+              v2_plan_start_.meas_source_s = v2_meas_source_stamp_s_;
+              v2_plan_start_.has_meas_source = true;
+            }
+          }
+          v2_plan_start_.has_cmd_start = false;
+          v2_pending_plan_valid_ = false;
+          v2_pending_identity_ok_ = false;
+          v2_adopt_waiting_ = false;
           stream_v2_ = false;
           publish_v2_slot_inactive();
         }
-        RCLCPP_INFO(
-            get_logger(),
-            "kmpc v2 submit gen=%llu digest=%llu left=%d stages=%zu reason=%s "
-            "budget_ms=%.0f perf_stat_ms=%.0f submits=%llu",
-            static_cast<unsigned long long>(mt.generation),
-            static_cast<unsigned long long>(digest), is_left ? 1 : 0,
-            mt.stages.size(), gate_dec.reason, kmpc::kPlannerBudgetMs,
-            kmpc::kPlannerPerfStatMs,
-            static_cast<unsigned long long>(v2_gate_.counters().submits));
+        {
+          std::string submit_diag;
+          {
+            std::lock_guard<std::mutex> lock(stream_mu_);
+            std::ostringstream os;
+            os << std::fixed << std::setprecision(5)
+               << "submit_ros=" << v2_plan_start_.submit_ros_s
+               << " submit_clock=ros_time"
+               << " meas_src="
+               << (v2_plan_start_.has_meas_source
+                       ? std::to_string(v2_plan_start_.meas_source_s)
+                       : "unknown")
+               << " meas_src_clock="
+               << (v2_plan_start_.has_meas_source ? "joint_states.header"
+                                                  : "unknown")
+               << " meas_recv="
+               << (v2_plan_start_.has_meas_recv
+                       ? std::to_string(v2_plan_start_.meas_recv_s)
+                       : "unknown")
+               << " meas_recv_clock=ros_time"
+               << " q_plan_start=["
+               << kmpc::format_vec18_compact(v2_plan_start_.q_plan_start) << "]";
+            if (v2_plan_start_.has_meas_start) {
+              os << " q_meas_plan=["
+                 << kmpc::format_vec18_compact(v2_plan_start_.q_meas_start)
+                 << "]";
+            }
+            if (v2_plan_start_.has_cmd_start) {
+              os << " q_cmd_submit=["
+                 << kmpc::format_vec18_compact(v2_plan_start_.q_cmd_start)
+                 << "]";
+            }
+            // Pre-submit 200 ms range from cache (non-blocking; may be
+            // data_insufficient).
+            const auto pre = kmpc::summarize_feedback_windows(
+                v2_meas_ring_, v2_plan_start_.submit_ros_s,
+                v2_plan_start_.submit_ros_s, v2_plan_start_.q_meas_start,
+                v2_plan_start_.has_meas_start);
+            os << " pre200_ok=" << (pre.pre_ok ? 1 : 0)
+               << " pre200_why=" << pre.pre_reason
+               << " pre200_n=" << pre.pre_samples
+               << " pre200_worst_j=" << pre.pre_worst_joint
+               << " pre200_worst_range=" << pre.pre_worst_range_rad;
+            if (pre.pre_ok) {
+              os << " pre200_range=["
+                 << kmpc::format_vec18_compact(pre.pre_range_rad) << "]";
+            }
+            submit_diag = os.str();
+          }
+          RCLCPP_INFO(
+              get_logger(),
+              "kmpc v2 submit gen=%llu digest=%llu left=%d stages=%zu reason=%s "
+              "budget_ms=%.0f perf_stat_ms=%.0f submits=%llu diag=%s",
+              static_cast<unsigned long long>(mt.generation),
+              static_cast<unsigned long long>(digest), is_left ? 1 : 0,
+              mt.stages.size(), gate_dec.reason, kmpc::kPlannerBudgetMs,
+              kmpc::kPlannerPerfStatMs,
+              static_cast<unsigned long long>(v2_gate_.counters().submits),
+              submit_diag.c_str());
+        }
         publish_cmd(q0, kmpc::Vec18::Zero(), 0.0, true);
         return;
       }
-      kmpc::FastPlanResult plan;
-      if (gate_dec.poll_worker && planner_worker_->try_take(plan)) {
-        const uint64_t plan_digest = plan.task_digest;
-        const bool package_fields_ok =
-            plan.package.task_digest == plan_digest &&
-            plan.package.generation == mt.generation &&
-            plan.package.model_digest != 0 && plan.limits_digest != 0 &&
-            plan.package.samples.size() >= 2;
-        const auto take = v2_gate_.on_worker_result(
-            req_id, plan.generation, plan_digest, plan.submit_seq, plan.ok,
-            package_fields_ok);
-        if (!take.adopt) {
-          RCLCPP_ERROR(
+      // Pull worker result into a pending adopt buffer so unstable feedback can
+      // wait up to 1s without blocking the 250 Hz send thread.
+      if (gate_dec.poll_worker && !v2_pending_plan_valid_) {
+        kmpc::FastPlanResult plan;
+        if (planner_worker_->try_take(plan)) {
+          const uint64_t plan_digest = plan.task_digest;
+          const bool package_fields_ok =
+              plan.package.task_digest == plan_digest &&
+              plan.package.generation == mt.generation &&
+              plan.package.model_digest != 0 && plan.limits_digest != 0 &&
+              plan.package.samples.size() >= 2;
+          const auto take = v2_gate_.on_worker_result(
+              req_id, plan.generation, plan_digest, plan.submit_seq, plan.ok,
+              package_fields_ok);
+          if (!take.adopt) {
+            RCLCPP_ERROR(
+                get_logger(),
+                "kmpc v2 plan reject gen=%llu reason=%s reject=%s seq=%llu "
+                "seed_ms=%.3f sqp_ms=%.3f densify_ms=%.3f time_ms=%.3f "
+                "cert_ms=%.3f total_ms=%.3f over_10ms=%d deadline=%d "
+                "cands=%d chosen_seed=%d rejects=%llu digest=%s",
+                static_cast<unsigned long long>(mt.generation),
+                plan.ok ? "stale_or_mismatch" : plan.reason.c_str(),
+                take.reject_reason,
+                static_cast<unsigned long long>(plan.submit_seq),
+                plan.seed_ik_ms, plan.sqp_ms, plan.densify_ms, plan.time_law_ms,
+                plan.certify_ms, plan.total_ms,
+                (plan.total_ms > kmpc::kPlannerPerfStatMs) ? 1 : 0,
+                plan.deadline_hit ? 1 : 0, plan.candidates_tried,
+                plan.chosen_seed,
+                static_cast<unsigned long long>(v2_gate_.counters().rejects),
+                plan.candidate_digest.c_str());
+            v2_gate_.note_plan_failed(take.reject_reason);
+            follower_->hold_at(q0);
+            {
+              std::lock_guard<std::mutex> lock(stream_mu_);
+              stream_enter_hold(q0);
+              stream_v2_ = false;
+              publish_v2_slot_inactive();
+            }
+            publish_cmd(q0, kmpc::Vec18::Zero(), 0.0, true);
+            return;
+          }
+          v2_pending_plan_ = std::move(plan);
+          v2_pending_plan_valid_ = true;
+          v2_pending_identity_ok_ = true;
+          v2_adopt_wait_t0_s_ = now().seconds();
+          v2_adopt_waiting_ = false;
+        }
+      }
+      if (v2_pending_plan_valid_ && v2_pending_identity_ok_) {
+        kmpc::FastPlanResult& plan = v2_pending_plan_;
+        const double now_s = now().seconds();
+        kmpc::Vec18 q_meas_now = q0;
+        bool meas_ok = false;
+        // Freshness for adopt gate uses receive clock (same as now_s).
+        double meas_recv = std::numeric_limits<double>::quiet_NaN();
+        double meas_source = std::numeric_limits<double>::quiet_NaN();
+        bool has_meas_source = false;
+        bool has_meas_recv = false;
+        kmpc::Vec18 q_cmd_now = q0;
+        bool has_cmd = false;
+        kmpc::FeedbackRing18 ring_copy;
+        kmpc::PlanStartSnapshot start_snap;
+        {
+          std::lock_guard<std::mutex> lock(stream_mu_);
+          ring_copy = v2_meas_ring_;
+          start_snap = v2_plan_start_;
+          if (v2_meas_valid_) {
+            q_meas_now = v2_meas_q_;
+            meas_ok = true;
+            meas_recv = v2_meas_stamp_s_;
+            has_meas_recv = true;
+            if (v2_meas_has_source_) {
+              meas_source = v2_meas_source_stamp_s_;
+              has_meas_source = true;
+            }
+          }
+          if (safety_supervisor_ && safety_supervisor_->has_last_send()) {
+            q_cmd_now = safety_supervisor_->q_last_send();
+            has_cmd = true;
+          }
+        }
+        // Stability/freshness keyed on receive time — never substitute source.
+        const kmpc::FastAdoptDecision fad = kmpc::evaluate_fast_adopt(
+            plan.package, start_snap, q_meas_now, meas_ok, meas_recv, q_cmd_now,
+            has_cmd, ring_copy, now_s, hold_deadband_,
+            tracker_->effective_dq_max(), interp_dt_);
+        const kmpc::FeedbackWindowStats win = kmpc::summarize_feedback_windows(
+            ring_copy, start_snap.submit_ros_s, now_s, start_snap.q_meas_start,
+            start_snap.has_meas_start);
+        const double elapsed_s =
+            std::isfinite(start_snap.submit_ros_s)
+                ? (now_s - start_snap.submit_ros_s)
+                : plan.total_ms * 1e-3;
+
+        auto log_adopt_event = [&](const char* result, const char* why_extra) {
+          const std::string diag = kmpc::format_plan_adopt_diag(
+              start_snap, now_s, meas_source, has_meas_source, meas_recv,
+              has_meas_recv, q_meas_now, meas_ok, q_cmd_now, has_cmd, win,
+              result, why_extra, elapsed_s);
+          RCLCPP_INFO(
               get_logger(),
-              "kmpc v2 plan reject gen=%llu reason=%s reject=%s seq=%llu "
+              "kmpc v2 adopt_event gen=%llu result=%s why=%s plan_dJ=%d "
+              "plan_d=%.5f meas_vs_plan=%.5f meas_vs_cmd=%.5f cmd_vs_plan=%.5f "
               "seed_ms=%.3f sqp_ms=%.3f densify_ms=%.3f time_ms=%.3f "
-              "cert_ms=%.3f total_ms=%.3f over_10ms=%d deadline=%d "
-              "rejects=%llu",
-              static_cast<unsigned long long>(mt.generation),
-              plan.ok ? "stale_or_mismatch" : plan.reason.c_str(),
-              take.reject_reason,
-              static_cast<unsigned long long>(plan.submit_seq),
-              plan.seed_ik_ms, plan.sqp_ms, plan.densify_ms, plan.time_law_ms,
-              plan.certify_ms, plan.total_ms,
-              (plan.total_ms > kmpc::kPlannerPerfStatMs) ? 1 : 0,
-              plan.deadline_hit ? 1 : 0,
-              static_cast<unsigned long long>(v2_gate_.counters().rejects));
-          v2_gate_.note_plan_failed(take.reject_reason);
-          follower_->hold_at(q0);
+              "cert_ms=%.3f total_ms=%.3f cands=%d chosen_seed=%d "
+              "main_attempt=%d retry_count=%d "
+              "cand_digest=%s diag=%s",
+              static_cast<unsigned long long>(plan.package.generation), result,
+              why_extra, fad.worst_plan_delta_joint, fad.worst_plan_delta_rad,
+              fad.meas_vs_plan_start_rad, fad.meas_vs_cmd_rad,
+              fad.cmd_vs_plan_start_rad, plan.seed_ik_ms, plan.sqp_ms,
+              plan.densify_ms, plan.time_law_ms, plan.certify_ms, plan.total_ms,
+              plan.candidates_tried, plan.chosen_seed, plan.main_attempt_count,
+              plan.retry_count, plan.candidate_digest.c_str(), diag.c_str());
+        };
+
+        if (fad.wait_for_stable) {
+          if (!v2_adopt_waiting_) {
+            v2_adopt_waiting_ = true;
+            v2_adopt_wait_t0_s_ = now_s;
+            // First wait only — full 18-axis dump once, not every tick.
+            log_adopt_event("wait", fad.reason);
+          }
+          if ((now_s - v2_adopt_wait_t0_s_) < kmpc::kAdoptStableWaitMaxS) {
+            RCLCPP_WARN_THROTTLE(
+                get_logger(), *get_clock(), 1000,
+                "kmpc v2 adopt wait stable gen=%llu why=%s waited=%.3f",
+                static_cast<unsigned long long>(plan.package.generation),
+                fad.reason, now_s - v2_adopt_wait_t0_s_);
+            return;
+          }
+          log_adopt_event("fail", fad.reason);
+          v2_pending_plan_valid_ = false;
+          v2_adopt_waiting_ = false;
+          ++line_plan_discards_;
+          v2_gate_.note_adopt_failed(fad.reason);
           {
             std::lock_guard<std::mutex> lock(stream_mu_);
             stream_enter_hold(q0);
             stream_v2_ = false;
             publish_v2_slot_inactive();
           }
-          // No per-tick auto replan; wait for new identity or explicit replan.
-          publish_cmd(q0, kmpc::Vec18::Zero(), 0.0, true);
           return;
         }
+
+        if (!fad.ok) {
+          log_adopt_event(fad.request_replan ? "replan" : "fail", fad.reason);
+          v2_pending_plan_valid_ = false;
+          v2_adopt_waiting_ = false;
+          ++line_plan_discards_;
+          v2_gate_.note_adopt_failed(fad.reason);
+          if (fad.request_replan) {
+            reset_interpolator_to(q_meas_now);
+            if (safety_supervisor_) {
+              safety_supervisor_->set_start_anchor(q_meas_now);
+            }
+            v2_gate_.request_replan();
+            v2_request_plan_ = true;
+          }
+          {
+            std::lock_guard<std::mutex> lock(stream_mu_);
+            stream_v2_ = false;
+            publish_v2_slot_inactive();
+          }
+          return;
+        }
+
         std::string why;
-        const kmpc::Vec18 q_meas_adopt =
-            (q_meas && q_meas->allFinite()) ? *q_meas : q0;
-        if (!follower_->adopt(plan.package, q_meas_adopt, kmpc::Vec18::Zero(),
-                              false, 1e-3, 0.5, &why)) {
-          RCLCPP_WARN(
-              get_logger(),
-              "kmpc v2 adopt rejected gen=%llu why=%s seed_ms=%.3f sqp_ms=%.3f "
-              "densify_ms=%.3f time_ms=%.3f cert_ms=%.3f total_ms=%.3f "
-              "over_10ms=%d rejects=%llu",
-              static_cast<unsigned long long>(plan.package.generation),
-              why.c_str(), plan.seed_ik_ms, plan.sqp_ms, plan.densify_ms,
-              plan.time_law_ms, plan.certify_ms, plan.total_ms,
-              (plan.total_ms > kmpc::kPlannerPerfStatMs) ? 1 : 0,
-              static_cast<unsigned long long>(
-                  v2_gate_.counters().rejects + 1));
+        if (!follower_->adopt(plan.package, q_meas_now, kmpc::Vec18::Zero(),
+                              false, kmpc::kAdoptStartQTolRad, 0.5, &why)) {
+          log_adopt_event("fail", why.c_str());
+          v2_pending_plan_valid_ = false;
+          v2_adopt_waiting_ = false;
           ++line_plan_discards_;
           v2_gate_.note_adopt_failed(why.c_str());
           {
             std::lock_guard<std::mutex> lock(stream_mu_);
-            stream_enter_hold(q0);
+            stream_enter_hold(fad.q_continuity);
             stream_v2_ = false;
             publish_v2_slot_inactive();
           }
-          publish_cmd(q0, kmpc::Vec18::Zero(), 0.0, true);
           return;
         }
+        v2_pending_plan_valid_ = false;
+        v2_adopt_waiting_ = false;
         v2_gate_.note_adopted(req_id, plan.submit_seq, plan.package.path_id);
         v2_follow_t0_ = now().seconds();
         v2_safety_arrived_.flag.store(false, std::memory_order_release);
@@ -1862,17 +2284,16 @@ class KmpcNode : public rclcpp::Node {
         v2_safety_arrived_.path_id.store(0, std::memory_order_relaxed);
         {
           std::lock_guard<std::mutex> lock(stream_mu_);
-          reset_interpolator_to(q_meas_adopt);
+          // Keep output continuity; do not snap interpolator to raw feedback.
+          reset_interpolator_to(plan.package.start_q);
           stream_v2_ = true;
           stream_v2_package_ = plan.package;
-          stream_v2_q_follow_ = q_meas_adopt;
-          stream_v2_q_plan_ = q_meas_adopt;
-          stream_v2_q_ref_ = q_meas_adopt;
+          stream_v2_q_follow_ = plan.package.start_q;
+          stream_v2_q_plan_ = plan.package.start_q;
+          stream_v2_q_ref_ = plan.package.start_q;
           stream_v2_claim_arrived_ = false;
           stream_goal_gen_ = plan.package.generation;
           stream_line_gen_ = static_cast<int>(plan.package.path_id);
-          // Send history is independent of path identity. Pending hold sends
-          // already brought its velocity/acceleration to zero.
           v2_exec_.adopt(plan.package.generation, v2_gate_.active().digest,
                          plan.package.path_id, steady_seconds());
           v2_observer_stamp_s_ = steady_seconds();
@@ -1880,9 +2301,7 @@ class KmpcNode : public rclcpp::Node {
           slot.active = true;
           slot.package = plan.package;
           slot.timeline_frozen = false;
-          slot.freeze_q = q_meas_adopt;
-          // Seed next unreleased barrier so 250 Hz clamps before first 50 Hz
-          // tick observes the tip (TIP may sit between 50 Hz cycles).
+          slot.freeze_q = fad.q_continuity;
           for (const auto& b : plan.package.stage_boundaries) {
             if (b.sample_index == 0) {
               continue;
@@ -1906,22 +2325,21 @@ class KmpcNode : public rclcpp::Node {
           slot.generation = plan.package.generation;
           slot.path_id = plan.package.path_id;
           slot.task_digest = v2_gate_.active().digest;
-          slot.q_follow_hint = q_meas_adopt;
+          slot.q_follow_hint = fad.q_continuity;
           publish_v2_slot(slot);
         }
+        log_adopt_event(fad.fast_path ? "adopt_fast" : "adopt", "ok");
         RCLCPP_INFO(
             get_logger(),
             "kmpc v2 adopt planner=%s path_id=%u gen=%llu digest=%llu "
-            "samples=%zu dur=%.3f seq=%llu seed_ms=%.3f sqp_ms=%.3f "
-            "densify_ms=%.3f time_ms=%.3f cert_ms=%.3f total_ms=%.3f "
-            "over_10ms=%d deadline=%d quality=%s adopts=%llu",
+            "samples=%zu dur=%.3f seq=%llu over_10ms=%d deadline=%d "
+            "quality=%s adopts=%llu",
             plan.package.planner.c_str(), plan.package.path_id,
             static_cast<unsigned long long>(plan.package.generation),
             static_cast<unsigned long long>(v2_gate_.active().digest),
             plan.package.samples.size(), plan.package.time_law.duration_s,
-            static_cast<unsigned long long>(plan.submit_seq), plan.seed_ik_ms,
-            plan.sqp_ms, plan.densify_ms, plan.time_law_ms, plan.certify_ms,
-            plan.total_ms, (plan.total_ms > kmpc::kPlannerPerfStatMs) ? 1 : 0,
+            static_cast<unsigned long long>(plan.submit_seq),
+            (plan.total_ms > kmpc::kPlannerPerfStatMs) ? 1 : 0,
             plan.deadline_hit ? 1 : 0,
             planner_worker_->quality_load_note().c_str(),
             static_cast<unsigned long long>(v2_gate_.counters().adopts));
@@ -2170,7 +2588,7 @@ class KmpcNode : public rclcpp::Node {
         const int qp_max_iter=line_qp_max_iter_;
         const auto qp_follow_mode=line_qp_follow_mode_;
         const auto chain_profile=line_chain_profile_;
-        const kmpc::Vec18 q_pref=cfg_.q_pref;
+        const kmpc::Vec18 q_pref = tracker_->task_pose_ref();
         const auto line_cache=tracker_->last_line_cache();
         const auto successor_plan=tracker_->successor_plan();
         const uint64_t run_id=run_id_;
@@ -2247,7 +2665,7 @@ class KmpcNode : public rclcpp::Node {
         // Do not bump stream_tick_id here: 250 Hz may still be emitting the
         // previous accepted segment. stream_on_line binds tick on confirm.
         const kmpc::TrackerStep step = tracker_->compute(
-            q0, q_pref_cart, use_l, use_r, use_ql, use_qr,
+            q0, q_task_ref, use_l, use_r, use_ql, use_qr,
             kmpc::kEeFrameLeft, kmpc::kEeFrameRight);
         last_ee_err_ = step.ee_error;
         dq = step.dq;
@@ -2347,7 +2765,7 @@ class KmpcNode : public rclcpp::Node {
           const kmpc::Vec18 q_out =
               kmpc::ros2io::apply_dq_scale(q0, q_cmd, dq_scale_);
           const kmpc::Vec18 q_star = use_cart
-              ? (calibrating ? q_pref_cart : q_out)
+              ? (calibrating ? q_task_ref : q_out)
               : q_des_star_;
           stream_on_qp(q_out, q_star, use_cart);
           if (stream_hold_) {
@@ -2863,8 +3281,6 @@ class KmpcNode : public rclcpp::Node {
     add("config_snapshot_path", config_snapshot_path_, "path",
         config_snapshot_path_.empty() ? "node_default" : "ros_override", "empty_or_writable",
         true);
-    add("q_pref_station", str_or("q_pref_station", "default"), "name",
-        str_or("q_pref_file", default_config("q_pref.yaml")), "nonempty", true);
     add("sdk_servo_msg",
 #ifdef KMPC_HAVE_XOIP
         "xoip_ros2/MultiJointServoCommand",
@@ -3401,6 +3817,8 @@ class KmpcNode : public rclcpp::Node {
   std::unique_ptr<kmpc::SafetySupervisor> safety_supervisor_;
   std::string planner_name_ = "unified_multistage_v2";
   bool use_v2_chain_ = true;
+  kmpc::TaskGeometry legacy_prep_geometry_ = kmpc::TaskGeometry::Ptp;
+  kmpc::TaskGeometry legacy_tip_geometry_ = kmpc::TaskGeometry::Lin;
   bool v2_request_plan_ = false;
   kmpc::V2SubmitGate v2_gate_{};
   double v2_follow_t0_ = 0.0;
@@ -3422,7 +3840,15 @@ class KmpcNode : public rclcpp::Node {
   kmpc::Vec18 v2_meas_q_ = kmpc::Vec18::Zero();
   double v2_meas_stamp_s_ = 0.0;
   double v2_meas_source_stamp_s_ = 0.0;
+  bool v2_meas_has_source_ = false;
   bool v2_meas_valid_ = false;
+  kmpc::FeedbackRing18 v2_meas_ring_{};
+  kmpc::PlanStartSnapshot v2_plan_start_{};
+  bool v2_pending_plan_valid_ = false;
+  bool v2_pending_identity_ok_ = false;
+  kmpc::FastPlanResult v2_pending_plan_{};
+  double v2_adopt_wait_t0_s_ = 0.0;
+  bool v2_adopt_waiting_ = false;
   rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr left_segment_sub_,right_segment_sub_;
   rclcpp::Subscription<kmpc_msgs::msg::MotionSequence>::SharedPtr motion_sequence_sub_;
   rclcpp::Subscription<kmpc_msgs::msg::StageAck>::SharedPtr stage_ack_sub_;
@@ -3530,6 +3956,8 @@ class KmpcNode : public rclcpp::Node {
   bool cart_frame_warned_ = false;
   bool last_use_cart_ = false;
   kmpc::Vec18 q_des_star_ = kmpc::Vec18::Zero();
+  bool q_des_star_valid_ = false;
+  uint64_t v2_task_send_gen_ = 0;
   kmpc::QDesFlags last_qdes_flags_{};
 
   rclcpp::TimerBase::SharedPtr timer_;

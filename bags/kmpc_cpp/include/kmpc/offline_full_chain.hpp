@@ -21,6 +21,7 @@
 
 #include "kmpc/cartesian_tracker.hpp"
 #include "kmpc/config.hpp"
+#include "kmpc/test_fixture.hpp"
 #include "kmpc/constraint_policy.hpp"
 #include "kmpc/fast_trajectory_optimizer.hpp"
 #include "kmpc/kinematics.hpp"
@@ -748,7 +749,7 @@ inline ChainRunResult run_offline_full_chain(
       rec.s_dot = tracker.line_rate();
       std::snprintf(rec.note, sizeof(rec.note), "wait_chord_queue");
     } else {
-      (void)tracker.compute(q_meas, cfg.q_pref, L, R, qL, qR);
+      (void)tracker.compute(q_meas, kmpc::test_fixture_q0(), L, R, qL, qR);
       rec.plan_ran = tracker.line_active() || tracker.line_refused();
       rec.prog = tracker.line_progress();
       rec.s_dot = tracker.line_rate();

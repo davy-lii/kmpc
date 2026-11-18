@@ -6,6 +6,7 @@
 
 #include "kmpc/cartesian_tracker.hpp"
 #include "kmpc/config.hpp"
+#include "kmpc/test_fixture.hpp"
 #include "kmpc/unified_multistage_planner.hpp"
 
 namespace {
@@ -18,7 +19,7 @@ kmpc::UnifiedPlanRequest request_from(const kmpc::Config& config, const kmpc::Ve
                                       bool left, const kmpc::Vec3& goal) {
   kmpc::UnifiedPlanRequest req;
   req.q0 = q0;
-  req.q_neutral = config.q_pref;
+  req.q_neutral = kmpc::test_fixture_q0();
   req.dq_max = config.limits.dq_max;
   req.left = left;
   req.frame = left ? std::string(kmpc::kEeFrameLeft) : std::string(kmpc::kEeFrameRight);
@@ -53,10 +54,10 @@ void expect_certified(const kmpc::Kinematics& kin, const kmpc::WholeBodyGuards& 
 
 TEST(UnifiedPlanner, HorizontalVerticalAndDiagonalStayInsideHardBox) {
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
-  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
-  const kmpc::Vec18 q0 = config.q_pref;
+  kmpc::WholeBodyGuards guards(config.params, kmpc::test_fixture_q0()[kmpc::kIdxYaw]);
+  const kmpc::Vec18 q0 = kmpc::test_fixture_q0();
   const kmpc::Vec3 p0 = kin.fk_pos(q0, kmpc::kEeFrameRight);
   const kmpc::Vec3 goals[] = {
       p0 + kmpc::Vec3(0.06, 0.0, 0.0),
@@ -75,10 +76,10 @@ TEST(UnifiedPlanner, HorizontalVerticalAndDiagonalStayInsideHardBox) {
 
 TEST(UnifiedPlanner, KnownTipIsPlannedWithTheFirstGoal) {
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
-  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
-  const kmpc::Vec18 q0 = config.q_pref;
+  kmpc::WholeBodyGuards guards(config.params, kmpc::test_fixture_q0()[kmpc::kIdxYaw]);
+  const kmpc::Vec18 q0 = kmpc::test_fixture_q0();
   const kmpc::Vec3 p0 = kin.fk_pos(q0, kmpc::kEeFrameLeft);
   auto req = request_from(config, q0, true, p0 + kmpc::Vec3(0.05, 0.0, 0.0));
   req.has_next = true;
@@ -93,12 +94,12 @@ TEST(UnifiedPlanner, KnownTipIsPlannedWithTheFirstGoal) {
 
 TEST(UnifiedPlanner, StartPastHardBoxIsNotAPath) {
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
-  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
-  kmpc::Vec18 q0 = config.q_pref;
+  kmpc::WholeBodyGuards guards(config.params, kmpc::test_fixture_q0()[kmpc::kIdxYaw]);
+  kmpc::Vec18 q0 = kmpc::test_fixture_q0();
   q0[0] = config.limits.q_max[0] + 0.02;
-  const kmpc::Vec3 p0 = kin.fk_pos(config.q_pref, kmpc::kEeFrameRight);
+  const kmpc::Vec3 p0 = kin.fk_pos(kmpc::test_fixture_q0(), kmpc::kEeFrameRight);
   const auto req = request_from(config, q0, false, p0 + kmpc::Vec3(0.02, 0.0, 0.0));
   const auto plan = kmpc::plan_unified_multistage(kin, guards, req);
   EXPECT_FALSE(plan.ok);
@@ -108,10 +109,10 @@ TEST(UnifiedPlanner, StartPastHardBoxIsNotAPath) {
 TEST(UnifiedPlanner, SyntheticNearJ1WallDoesNotCrossHardMax) {
   // Not an r40 18-vector replay. q_pref with J1 moved to 0.01 rad inside 58°.
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
-  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
-  kmpc::Vec18 q0 = config.q_pref;
+  kmpc::WholeBodyGuards guards(config.params, kmpc::test_fixture_q0()[kmpc::kIdxYaw]);
+  kmpc::Vec18 q0 = kmpc::test_fixture_q0();
   q0[0] = config.limits.q_max[0] - 0.01;
   const kmpc::Vec3 p0 = kin.fk_pos(q0, kmpc::kEeFrameRight);
   const auto req = request_from(config, q0, false, p0 + kmpc::Vec3(0.0, 0.0, 0.04));
@@ -128,17 +129,17 @@ TEST(UnifiedPlanner, SyntheticNearJ1WallDoesNotCrossHardMax) {
 
 TEST(UnifiedPlanner, TrackerNamesUnifiedAndTimesTheBuild) {
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
   kmpc::CartesianTracker tracker(kin, config);
-  kmpc::Vec18 q = config.q_pref;
+  kmpc::Vec18 q = kmpc::test_fixture_q0();
   const kmpc::Vec3 p0 = kin.fk_pos(q, kmpc::kEeFrameLeft);
   const auto posed = kin.fk(q, kmpc::kEeFrameLeft);
   const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
   const kmpc::Vec3 goal = p0 + kmpc::Vec3(0.05, 0.0, 0.0);
   ASSERT_TRUE(tracker.rearm_line(1));
   const auto t0 = std::chrono::steady_clock::now();
-  tracker.compute(q, config.q_pref, &goal, nullptr, &quat, nullptr);
+  tracker.compute(q, kmpc::test_fixture_q0(), &goal, nullptr, &quat, nullptr);
   const double wall_ms = std::chrono::duration<double, std::milli>(
                              std::chrono::steady_clock::now() - t0)
                              .count();

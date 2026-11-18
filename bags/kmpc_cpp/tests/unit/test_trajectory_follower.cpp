@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 #include "kmpc/config.hpp"
+#include "kmpc/test_fixture.hpp"
 #include "kmpc/fast_trajectory_optimizer.hpp"
 #include "kmpc/kinematics.hpp"
 #include "kmpc/motion_task.hpp"
@@ -56,11 +57,11 @@ kmpc::TrajectoryPackage plan_short(const kmpc::Config& config,
 
 TEST(TrajectoryFollower, FollowsCertifiedNominalAndRecordsLayers) {
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
-  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
-  const kmpc::Vec18 q0 = config.q_pref;
+  kmpc::WholeBodyGuards guards(config.params, kmpc::test_fixture_q0()[kmpc::kIdxYaw]);
+  const kmpc::Vec18 q0 = kmpc::test_fixture_q0();
   const kmpc::Vec3 p0 = kin.fk_pos(q0, kmpc::kEeFrameRight);
   auto package =
       plan_short(config, kin, guards, q0, false, p0 + kmpc::Vec3(0.05, 0, 0));
@@ -100,24 +101,24 @@ TEST(TrajectoryFollower, FollowsCertifiedNominalAndRecordsLayers) {
 
 TEST(TrajectoryFollower, SafetySupervisorRejectsHardBoxWithoutClamp) {
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
-  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
+  kmpc::WholeBodyGuards guards(config.params, kmpc::test_fixture_q0()[kmpc::kIdxYaw]);
   const auto policy = kmpc::policy_from_config(config);
   kmpc::SafetySupervisor gate(kin, &guards, policy);
-  gate.seed(config.q_pref);
+  gate.seed(kmpc::test_fixture_q0());
 
   kmpc::SafetySupervisorInput in;
-  in.q_prev = config.q_pref;
-  in.q_meas = config.q_pref;
+  in.q_prev = kmpc::test_fixture_q0();
+  in.q_meas = kmpc::test_fixture_q0();
   in.has_meas = true;
   in.meas_timestamp_s = 1.0;
   in.now_s = 1.0;
-  in.q_follow = config.q_pref;
+  in.q_follow = kmpc::test_fixture_q0();
   in.has_follow = true;
-  in.q_plan = config.q_pref;
-  in.q_cmd = config.q_pref;
+  in.q_plan = kmpc::test_fixture_q0();
+  in.q_cmd = kmpc::test_fixture_q0();
   in.q_cmd[0] = policy.q_max[0] + 0.05;  // past J1 58°
   in.dt = 0.004;
   in.expected_generation = 0;
@@ -125,38 +126,38 @@ TEST(TrajectoryFollower, SafetySupervisorRejectsHardBoxWithoutClamp) {
   EXPECT_FALSE(bad.accept);
   EXPECT_FALSE(bad.arrived);
   EXPECT_STREQ(bad.reason, "safety_hard_box");
-  EXPECT_LT((bad.q_send - config.q_pref).cwiseAbs().maxCoeff(), 1e-12)
+  EXPECT_LT((bad.q_send - kmpc::test_fixture_q0()).cwiseAbs().maxCoeff(), 1e-12)
       << "must not silent-clamp to a new geometry";
 }
 
 TEST(TrajectoryFollower, SafetyNeverFakesArrived) {
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
-  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
+  kmpc::WholeBodyGuards guards(config.params, kmpc::test_fixture_q0()[kmpc::kIdxYaw]);
   kmpc::SafetySupervisor gate(kin, &guards, kmpc::policy_from_config(config));
-  gate.seed(config.q_pref);
+  gate.seed(kmpc::test_fixture_q0());
 
   kmpc::TrajectoryPackage pkg;
   pkg.generation = 3;
   pkg.certificate.passed = true;
   pkg.left = false;
-  pkg.samples.push_back(config.q_pref);
-  auto q_end = config.q_pref;
+  pkg.samples.push_back(kmpc::test_fixture_q0());
+  auto q_end = kmpc::test_fixture_q0();
   q_end[5] += 0.2;
   pkg.samples.push_back(q_end);
 
   kmpc::SafetySupervisorInput in;
-  in.q_prev = config.q_pref;
-  in.q_cmd = config.q_pref;
-  in.q_meas = config.q_pref;
+  in.q_prev = kmpc::test_fixture_q0();
+  in.q_cmd = kmpc::test_fixture_q0();
+  in.q_meas = kmpc::test_fixture_q0();
   in.has_meas = true;
   in.meas_timestamp_s = 1.0;
   in.now_s = 1.0;
-  in.q_follow = config.q_pref;
+  in.q_follow = kmpc::test_fixture_q0();
   in.has_follow = true;
-  in.q_plan = config.q_pref;
+  in.q_plan = kmpc::test_fixture_q0();
   in.dt = 0.004;
   in.claim_arrived = true;
   in.package = &pkg;

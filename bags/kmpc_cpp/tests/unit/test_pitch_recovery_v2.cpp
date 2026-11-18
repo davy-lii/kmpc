@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 #include "kmpc/config.hpp"
+#include "kmpc/test_fixture.hpp"
 #include "kmpc/constraint_policy.hpp"
 #include "kmpc/kinematics.hpp"
 #include "kmpc/trajectory_follower.hpp"
@@ -48,10 +49,10 @@ kmpc::Vec18 make_outside(double limit, double excess) {
 
 TEST(PitchRecoveryV2, ExcessNonIncreasingAndEntersHardBox) {
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
-  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
+  kmpc::WholeBodyGuards guards(config.params, kmpc::test_fixture_q0()[kmpc::kIdxYaw]);
   const auto policy = kmpc::policy_from_config(config);
   const double limit = policy.torso_pitch_max_rad;
   ASSERT_GT(limit, 0.0);
@@ -94,10 +95,10 @@ TEST(PitchRecoveryV2, ExcessNonIncreasingAndEntersHardBox) {
 
 TEST(PitchRecoveryV2, NearJ1WallStillRecoversWithoutWideningCap) {
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
-  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
+  kmpc::WholeBodyGuards guards(config.params, kmpc::test_fixture_q0()[kmpc::kIdxYaw]);
   const auto policy = kmpc::policy_from_config(config);
   const double limit = policy.torso_pitch_max_rad;
   kmpc::Vec18 q = make_outside(limit, 2.95e-4);

@@ -58,7 +58,7 @@ class CommandArbiter {
 class TaskReceiver {
  public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-  explicit TaskReceiver(const Vec18& q_pref) : q_pref_(q_pref) {}
+  TaskReceiver() = default;
 
   void on_mode(std::string_view mode) {
     if (!is_valid_mode(mode)) {
@@ -260,8 +260,7 @@ class TaskReceiver {
     return q_target_.has_value();
   }
 
-  // 没发过 /kmpc/q_target 时钉在 q0（原地），不再默认追 q_pref/HOME。
-  // 要回家就明确发 HOME 的 q_target。q_pref 仍给空闲臂偏置 / 标定用。
+  // 没发过 /kmpc/q_target 时钉在 q0（原地）；软偏置由本任务 begin_task 的实测参考提供。
   Vec18 q_des(const Vec18& q0) const {
     std::lock_guard<std::mutex> lock(mu_);
     return q_target_.has_value() ? *q_target_ : q0;
@@ -286,7 +285,9 @@ class TaskReceiver {
     mt.left = left;
     mt.frame = t.frame_id;
     StageTarget s0;
-    s0.geometry = TaskGeometry::Lin;
+    // Match kmpc_node legacy two-point defaults: prep=PTP, tip=LIN.
+    // Single-point stays LIN (unknown insert must not free-path).
+    s0.geometry = t.cascade ? TaskGeometry::Ptp : TaskGeometry::Lin;
     s0.position = t.xyz;
     s0.quat = t.quat_xyzw;
     // Legacy PoseArray: identity quat means unconstrained orientation.
@@ -324,7 +325,6 @@ class TaskReceiver {
 
   mutable std::mutex mu_;
   uint64_t generation_ = 0;
-  Vec18 q_pref_ = Vec18::Zero();
   std::optional<Vec18> q_target_;
   std::string mode_ = std::string(kModeSingleEe);
   std::optional<CartesianTarget> left_;
@@ -337,7 +337,7 @@ class TaskReceiver {
 class PlannerReceiver {
  public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-  explicit PlannerReceiver(const Vec18& q_pref) : q_pref_(q_pref) {}
+  PlannerReceiver() = default;
 
   bool last_com_reject() const {
     std::lock_guard<std::mutex> lock(mu_);
@@ -382,13 +382,16 @@ class PlannerReceiver {
     if (!state.has_value()) {
       return;
     }
-    const Vec18 q_target = q_calib.has_value() ? *q_calib : q_pref_;
     if (state != last_applied_state_) {
       if (*state == "CALIBRATING") {
-        const bool ok = planner.request_calibrate(q_target);
+        if (!q_calib.has_value()) {
+          last_com_reject_ = true;
+          return;
+        }
+        const bool ok = planner.request_calibrate(*q_calib);
         last_com_reject_ = !ok;
         if (ok) {
-          last_applied_q_calib_ = q_target;
+          last_applied_q_calib_ = *q_calib;
           last_applied_state_ = "CALIBRATING";
         }
       } else {
@@ -425,7 +428,6 @@ class PlannerReceiver {
 
  private:
   mutable std::mutex mu_;
-  Vec18 q_pref_ = Vec18::Zero();
   bool waist_locked_ = false;
   std::optional<std::string> tracking_state_;
   std::optional<Vec18> q_calib_;
@@ -462,6 +464,12 @@ class StateAggregator {
                          std::chrono::steady_clock::now() - stamp_)
                          .count();
     if (age > timeout_sec_) {
+      return std::nullopt;
+    }
+    if (!last_missing_.empty()) {
+      return std::nullopt;
+    }
+    if (!q_.allFinite()) {
       return std::nullopt;
     }
     return q_;
@@ -506,14 +514,16 @@ class StateAggregator {
   std::vector<std::string> last_missing_;
 };
 
-inline Vec18 q_from_name_positions(
-    const std::unordered_map<std::string, double>& named, const Vec18& fallback) {
-  Vec18 q = fallback;
+inline std::optional<Vec18> q_from_name_positions(
+    const std::unordered_map<std::string, double>& named) {
+  Vec18 q = Vec18::Zero();
   for (int i = 0; i < kNDof; ++i) {
-    const auto it = named.find(std::string(kJointNames[static_cast<std::size_t>(i)]));
-    if (it != named.end()) {
-      q[i] = it->second;
+    const auto it =
+        named.find(std::string(kJointNames[static_cast<std::size_t>(i)]));
+    if (it == named.end() || !std::isfinite(it->second)) {
+      return std::nullopt;
     }
+    q[i] = it->second;
   }
   return q;
 }

@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 
 #include "kmpc/config.hpp"
+#include "kmpc/test_fixture.hpp"
 #include "kmpc/kinematics.hpp"
 #include "kmpc/motion_evaluator.hpp"
 #include "kmpc/trajectory_cost.hpp"
@@ -43,17 +44,17 @@ struct PostureSample {
 
 TEST(BodyPostureCost, SameTcpMultiplePosturesDoesNotPreferDominatedForwardSquat) {
   const auto config = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
-  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
+  kmpc::WholeBodyGuards guards(config.params, kmpc::test_fixture_q0()[kmpc::kIdxYaw]);
   const auto policy = kmpc::policy_from_config(config);
   auto weights = kmpc::default_cost_weights(config.limits.dq_max);
   weights.calibrated = true;
 
   const bool left = false;
   const auto frame = std::string(kmpc::kEeFrameRight);
-  const kmpc::Vec18 q_home = config.q_pref;
+  const kmpc::Vec18 q_home = kmpc::test_fixture_q0();
   const kmpc::Vec3 tcp_task =
       kin.fk_pos(q_home, frame) + kmpc::Vec3(0.04, 0.0, -0.06);
 
@@ -106,7 +107,7 @@ TEST(BodyPostureCost, SameTcpMultiplePosturesDoesNotPreferDominatedForwardSquat)
       continue;
     }
     // Score the motion into the posture from home so body_forward sees Δ(Bx-Lx).
-    s.cost = kmpc::evaluate_path_cost(path_from_to(q_home, s.q), config.q_pref,
+    s.cost = kmpc::evaluate_path_cost(path_from_to(q_home, s.q), kmpc::test_fixture_q0(),
                                       policy, weights, kin, left, &guards);
     samples.push_back(s);
   }
@@ -178,7 +179,7 @@ TEST(BodyPostureCost, SameTcpMultiplePosturesDoesNotPreferDominatedForwardSquat)
   EXPECT_FALSE(plan.report.find("height_switch=0") == std::string::npos);
   // Soft check: planner body_forward feature should not explode vs samples.
   const auto plan_cost = kmpc::evaluate_path_cost(
-      plan.package.samples, config.q_pref, policy, weights, kin, left, &guards);
+      plan.package.samples, kmpc::test_fixture_q0(), policy, weights, kin, left, &guards);
   double best_sample = samples.front().cost.total;
   for (const auto& s : samples) {
     best_sample = std::min(best_sample, s.cost.total);

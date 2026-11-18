@@ -11,6 +11,7 @@
 
 #include "kmpc/cartesian_tracker.hpp"
 #include "kmpc/config.hpp"
+#include "kmpc/test_fixture.hpp"
 #include "kmpc/kinematics.hpp"
 #include "kmpc/line_contract.hpp"
 #include "kmpc/tracker_math.hpp"
@@ -184,7 +185,7 @@ TEST(GraspPlaceTargets, EightChainsPrepTipRetreatNoFold) {
   const kmpc::Vec18 q0 = q_from_deg(waist4, right7, left7);
 
   const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf");
 
   int fail = 0;
@@ -203,11 +204,11 @@ TEST(GraspPlaceTargets, EightChainsPrepTipRetreatNoFold) {
     kmpc::Vec18 q = q0;
 
     const std::string tag = v.name;
-    auto approach = play(tracker, &q, cfg_all.q_pref, gen++, v.left, prep, quat, &tip,
+    auto approach = play(tracker, &q, kmpc::test_fixture_q0(), gen++, v.left, prep, quat, &tip,
                          (tag + "_approach").c_str());
-    auto insert = play(tracker, &q, cfg_all.q_pref, gen++, v.left, tip, quat, nullptr,
+    auto insert = play(tracker, &q, kmpc::test_fixture_q0(), gen++, v.left, tip, quat, nullptr,
                        (tag + "_insert").c_str());
-    auto retreat = play(tracker, &q, cfg_all.q_pref, gen++, v.left, prep, quat, nullptr,
+    auto retreat = play(tracker, &q, kmpc::test_fixture_q0(), gen++, v.left, prep, quat, nullptr,
                         (tag + "_retreat").c_str());
 
     auto score = [&](const SegResult& r) {

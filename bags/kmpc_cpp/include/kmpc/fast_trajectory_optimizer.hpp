@@ -28,6 +28,9 @@ struct FastPlanResult {
   bool ok = false;
   std::string reason;
   std::string report;
+  // One-line attempt summary (task/posture/timings/fail/retry). Logged once per
+  // plan; not a 250 Hz stream. Legacy name candidate_digest kept for ROS adopt.
+  std::string candidate_digest;
   TrajectoryPackage package;
   TrajectoryCertificate certificate;
   int iterations = 0;
@@ -43,10 +46,17 @@ struct FastPlanResult {
   double total_ms = 0.0;
   double tcp_worst_m = 0.0;
   double min_hard_margin_rad = 0.0;
+  double min_work_margin_rad = 0.0;
   double body_dx_m = 0.0;
   double body_dz_m = 0.0;
   double body_minus_leg_dx_m = 0.0;
   double duration_s = 0.0;
+  int chosen_seed = -1;
+  // Legacy: equals main_attempt_count (1–2), not multi-posture candidates.
+  int candidates_tried = 0;
+  int main_attempt_count = 0;
+  int retry_count = 0;
+  std::string retry_reason;
   bool deadline_hit = false;
   bool software_limited = true;
   // PlannerWorker submit sequence that produced this result.

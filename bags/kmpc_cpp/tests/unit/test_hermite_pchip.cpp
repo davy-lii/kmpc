@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 #include "kmpc/config.hpp"
+#include "kmpc/test_fixture.hpp"
 #include "kmpc/constraint_policy.hpp"
 #include "kmpc/fast_trajectory_optimizer.hpp"
 #include "kmpc/kinematics.hpp"
@@ -106,12 +107,11 @@ TEST(HermitePchip, FieldLikePlanGateFollower250Hz) {
   // reachable when the first stage requests wait_for_external_ack.
   const auto config = kmpc::Config::load(
       std::string(KMPC_CONFIG_DIR) + "/joint_limits.yaml",
-      std::string(KMPC_CONFIG_DIR) + "/q_pref.yaml",
       std::string(KMPC_CONFIG_DIR) + "/kmpc_params.yaml");
   const std::string urdf =
       std::string(KMPC_URDF_DIR) + "/Light-duty wheeled robot.urdf";
   kmpc::Kinematics kin(urdf);
-  kmpc::WholeBodyGuards guards(config.params, config.q_pref[kmpc::kIdxYaw]);
+  kmpc::WholeBodyGuards guards(config.params, kmpc::test_fixture_q0()[kmpc::kIdxYaw]);
   auto policy = kmpc::policy_from_config(config);
   std::string weight_why;
   auto weights = kmpc::load_trajectory_quality_weights(
@@ -121,7 +121,7 @@ TEST(HermitePchip, FieldLikePlanGateFollower250Hz) {
     weights.motion_scale[j] = 1.0 / std::max(config.limits.dq_max[j], 1e-3);
   }
 
-  kmpc::Vec18 q0 = config.q_pref;
+  kmpc::Vec18 q0 = kmpc::test_fixture_q0();
   const kmpc::Vec3 p0 = kin.fk_pos(q0, kmpc::kEeFrameLeft);
   kmpc::MotionTask task;
   task.generation = 42;

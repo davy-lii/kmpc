@@ -101,15 +101,6 @@ JointVelocityLimits load_limits(const std::string& path) {
   return lim;
 }
 
-Vec18 load_q_pref(const std::string& path, const std::string& station) {
-  const YAML::Node root = YAML::LoadFile(path);
-  const YAML::Node stations = root["stations"];
-  if (!stations || !stations[station]) {
-    throw ConfigError("unknown q_pref station=" + station);
-  }
-  return read_vec18(stations[station]["q_pref"], "q_pref");
-}
-
 KmpcParams load_params(const std::string& path) {
   const YAML::Node root = YAML::LoadFile(path);
   YAML::Node p = root["kmpc_node"]["ros__parameters"];
@@ -196,15 +187,10 @@ KmpcParams load_params(const std::string& path) {
 
 }  // namespace
 
-Config Config::load(
-    const std::string& joint_limits_yaml,
-    const std::string& q_pref_yaml,
-    const std::string& kmpc_params_yaml,
-    const std::string& station) {
+Config Config::load(const std::string& joint_limits_yaml,
+                    const std::string& kmpc_params_yaml) {
   Config cfg;
   cfg.limits = load_limits(joint_limits_yaml);
-  cfg.q_pref = load_q_pref(q_pref_yaml, station);
-  cfg.q_pref_station = station;
   cfg.params = load_params(kmpc_params_yaml);
   return cfg;
 }

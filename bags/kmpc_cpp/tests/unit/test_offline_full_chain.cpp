@@ -141,10 +141,10 @@ kmpc::JointPath corner_samples() {
 
 TEST(OfflineFullChain, LegacyVsNewUnifiedBothMustComplete) {
   const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
-  kmpc::Vec18 q = cfg_all.q_pref;
+  kmpc::Vec18 q = kmpc::test_fixture_q0();
   const kmpc::Vec3 p0 = kin.fk_pos(q, kmpc::kEeFrameLeft);
   const auto posed = kin.fk(q, kmpc::kEeFrameLeft);
   const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
@@ -243,10 +243,10 @@ TEST(OfflineFullChain, LegacyVsNewUnifiedBothMustComplete) {
 void run_feedback_suite(kmpc::CartesianTracker::LineChainProfile profile,
                         const char* tag) {
   const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
-  kmpc::Vec18 q = cfg_all.q_pref;
+  kmpc::Vec18 q = kmpc::test_fixture_q0();
   const kmpc::Vec3 p0 = kin.fk_pos(q, kmpc::kEeFrameLeft);
   const auto posed = kin.fk(q, kmpc::kEeFrameLeft);
   const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
@@ -459,20 +459,20 @@ TEST(QpFailDumpWorker, BoundedQueueDropsAndJoins) {
 
 TEST(LinePath, PartialCommitWithDifferentStreamFromRecoversOrUnknown) {
   const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
   kmpc::CartesianTracker tracker(kin, cfg_all);
   tracker.set_line_commit_requires_stream(true);
   tracker.set_line_pace(0.3, 0.0);
   ASSERT_TRUE(tracker.rearm_line(1));
-  kmpc::Vec18 q = cfg_all.q_pref;
+  kmpc::Vec18 q = kmpc::test_fixture_q0();
   const kmpc::Vec3 p0 = kin.fk_pos(q, kmpc::kEeFrameLeft);
   const auto posed = kin.fk(q, kmpc::kEeFrameLeft);
   const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
   const kmpc::Vec3 goal = p0 + kmpc::Vec3(0.12, 0.0, 0.0);
   ASSERT_FALSE(
-      tracker.compute(q, cfg_all.q_pref, &goal, nullptr, &quat, nullptr)
+      tracker.compute(q, kmpc::test_fixture_q0(), &goal, nullptr, &quat, nullptr)
           .dq.hasNaN());
   ASSERT_TRUE(tracker.line_commit_pending());
   const kmpc::Vec18 proposed = tracker.line_cmd();
@@ -494,7 +494,7 @@ TEST(LinePath, PartialCommitWithDifferentStreamFromRecoversOrUnknown) {
 
 TEST(LinePath, QpModeBRejectsNamedHardRow) {
   const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
   kmpc::CartesianTracker tracker(kin, cfg_all);
@@ -502,12 +502,12 @@ TEST(LinePath, QpModeBRejectsNamedHardRow) {
   tracker.set_line_commit_requires_stream(true);
   tracker.set_line_pace(0.25, 0.0);
   ASSERT_TRUE(tracker.rearm_line(1));
-  kmpc::Vec18 q = cfg_all.q_pref;
+  kmpc::Vec18 q = kmpc::test_fixture_q0();
   const kmpc::Vec3 p0 = kin.fk_pos(q, kmpc::kEeFrameLeft);
   const auto posed = kin.fk(q, kmpc::kEeFrameLeft);
   const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
   const kmpc::Vec3 goal = p0 + kmpc::Vec3(0.08, 0.0, 0.0);
-  tracker.compute(q, cfg_all.q_pref, &goal, nullptr, &quat, nullptr);
+  tracker.compute(q, kmpc::test_fixture_q0(), &goal, nullptr, &quat, nullptr);
   ASSERT_FALSE(tracker.line_refused()) << tracker.line_reason();
   ASSERT_TRUE(tracker.line_commit_pending());
   ASSERT_TRUE(tracker.confirm_line_stream_commit(tracker.line_cmd(), 1.0));
@@ -515,7 +515,7 @@ TEST(LinePath, QpModeBRejectsNamedHardRow) {
   kmpc::Vec18 bad = q;
   bad[11] += 0.30;
   tracker.set_line_reference(bad);
-  tracker.compute(q, cfg_all.q_pref, &goal, nullptr, &quat, nullptr);
+  tracker.compute(q, kmpc::test_fixture_q0(), &goal, nullptr, &quat, nullptr);
   ASSERT_TRUE(tracker.line_refused());
   const auto& fail = tracker.last_line_qp_fail();
   ASSERT_TRUE(tracker.line_reason().find("qp_") != std::string::npos)
@@ -529,31 +529,31 @@ TEST(LinePath, QpModeBRejectsNamedHardRow) {
 
 TEST(LinePath, ProposeDoesNotFreezeBeforeConfirm) {
   const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
   kmpc::CartesianTracker tracker(kin, cfg_all);
   tracker.set_line_commit_requires_stream(true);
   tracker.set_line_pace(0.5, 0.0);
   ASSERT_TRUE(tracker.rearm_line(1));
-  kmpc::Vec18 q = cfg_all.q_pref;
+  kmpc::Vec18 q = kmpc::test_fixture_q0();
   const kmpc::Vec3 p0 = kin.fk_pos(q, kmpc::kEeFrameLeft);
   const auto posed = kin.fk(q, kmpc::kEeFrameLeft);
   const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
   const kmpc::Vec3 goal = p0 + kmpc::Vec3(0.18, 0.0, 0.0);
-  tracker.compute(q, cfg_all.q_pref, &goal, nullptr, &quat, nullptr);
+  tracker.compute(q, kmpc::test_fixture_q0(), &goal, nullptr, &quat, nullptr);
   ASSERT_FALSE(tracker.line_refused()) << tracker.line_reason();
   ASSERT_TRUE(tracker.line_commit_pending());
   EXPECT_FALSE(tracker.line_frozen())
       << "frozen must wait for accepted confirm";
-  tracker.compute(q, cfg_all.q_pref, &goal, nullptr, &quat, nullptr);
+  tracker.compute(q, kmpc::test_fixture_q0(), &goal, nullptr, &quat, nullptr);
   EXPECT_FALSE(tracker.line_frozen())
       << "stale propose must not latch freeze across ticks";
 }
 
 TEST(LinePath, LegacyProfilePreservesPaceAndQpModes) {
   const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
   kmpc::CartesianTracker tracker(kin, cfg_all);
@@ -753,10 +753,10 @@ TEST(LinePath, WorkerHermiteRealFkAdoptQpFinalGate) {
   // Artificial corner construction belongs in a separate test — never fall
   // back here (would green-wash a near-linear prepare).
   const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
-  kmpc::Vec18 q = cfg_all.q_pref;
+  kmpc::Vec18 q = kmpc::test_fixture_q0();
   const auto posed = kin.fk(q, kmpc::kEeFrameLeft);
   const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
   const kmpc::Vec3 p0 = posed.col(3).head<3>();
@@ -860,10 +860,10 @@ TEST(LinePath, ArtificialHermiteCornerAdoptAndVerify) {
   // Separate from prepare_line hard gate: constructs an on-tube corner, runs
   // production FK Hermite verify, adopts, checks interp handoff only.
   const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
-  kmpc::Vec18 q = cfg_all.q_pref;
+  kmpc::Vec18 q = kmpc::test_fixture_q0();
   const auto posed = kin.fk(q, kmpc::kEeFrameLeft);
   const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
   const kmpc::Vec3 goal =
@@ -908,10 +908,10 @@ TEST(LinePath, ArtificialHermiteCornerAdoptAndVerify) {
 
 TEST(LinePath, HermitePchipIdenticalKnotsStayOnTube) {
   const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
-  kmpc::Vec18 q = cfg_all.q_pref;
+  kmpc::Vec18 q = kmpc::test_fixture_q0();
   const auto posed = kin.fk(q, kmpc::kEeFrameLeft);
   const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
   const kmpc::Vec3 goal =
@@ -949,10 +949,10 @@ TEST(LinePath, StaleGenerationPlanMustNotAdopt) {
   // Does not cover ROS future/mutex timing or waist_locked/q_seed drift alone
   // beyond the shared predicate fields.
   const auto cfg_all = kmpc::Config::load(
-      cfg("joint_limits.yaml"), cfg("q_pref.yaml"), cfg("kmpc_params.yaml"));
+      cfg("joint_limits.yaml"), cfg("kmpc_params.yaml"));
   kmpc::Kinematics kin(std::string(KMPC_URDF_DIR) +
                        "/Light-duty wheeled robot.urdf");
-  kmpc::Vec18 q = cfg_all.q_pref;
+  kmpc::Vec18 q = kmpc::test_fixture_q0();
   const auto posed = kin.fk(q, kmpc::kEeFrameLeft);
   const kmpc::Vec4 quat = kmpc::rot_to_quat_xyzw(posed.block<3, 3>(0, 0));
   const kmpc::Vec3 goal =

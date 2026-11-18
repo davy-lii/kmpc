@@ -17,7 +17,7 @@ CartesianTracker::CartesianTracker(Kinematics& kin, const Config& cfg)
       limits_(cfg.limits),
       constraints_(limits_, cfg.params.dt),
       params_(cfg.params),
-      guards_(cfg.params, cfg.q_pref[kIdxYaw]) {
+      guards_(cfg.params, 0.0) {
   if (params_.n_horizon < 2) {
     throw std::invalid_argument("CartesianTracker needs n_horizon >= 2 (36-DoF QP)");
   }
@@ -85,13 +85,24 @@ CartesianTracker::CartesianTracker(Kinematics& kin, const Config& cfg)
   qo_(1, 1) = q_offset_y_;
   qo_(2, 2) = q_offset_;
 
-  const Vec18 q_cal = cfg.q_pref;
-  q_yaw_pref_ = q_cal[kIdxYaw];
-  line_q_pref_ = q_cal;
-  r_lambda_ = kin_.inertia_lambda(q_cal, r_arm_);
-  z_home_ = kin_.fk_pos(q_cal, kEeFrameLeft)[2];
-  z_star_ = z_home_;
+  q_yaw_pref_ = 0.0;
+  line_q_pref_.setZero();
+  r_lambda_ = kin_.inertia_lambda(Vec18::Zero(), r_arm_);
+  z_start_ = 0.0;
+  z_star_ = z_start_;
   upper_ = default_upper_command();
+}
+
+void CartesianTracker::begin_task(const Vec18& q_start) {
+  if (!q_start.allFinite()) {
+    return;
+  }
+  q_yaw_pref_ = q_start[kIdxYaw];
+  line_q_pref_ = q_start;
+  guards_.set_yaw_pref(q_yaw_pref_);
+  r_lambda_ = kin_.inertia_lambda(q_start, r_arm_);
+  z_start_ = kin_.fk_pos(q_start, kEeFrameLeft)[2];
+  z_star_ = z_start_;
 }
 
 void CartesianTracker::set_upper_commands(const UpperCommand& cmd) {
@@ -137,7 +148,7 @@ void CartesianTracker::reset() {
   e_ori_prev_right_.setZero();
   e0_hist_clear();
   e0_prev_ = 0.0;
-  z_star_ = z_home_;
+  z_star_ = z_start_;
   deep_on_ = false;
   upper_ = default_upper_command();
   tracking_state_prev_ = TrackingState::Tracking;
@@ -794,7 +805,7 @@ bool CartesianTracker::is_deep_drop(double e_z) {
 }
 
 void CartesianTracker::refresh_deep_drop(double e_z, double z_star) {
-  const double z_deep = z_home_ - torso_drop_m_;
+  const double z_deep = z_start_ - torso_drop_m_;
   if (e_z > 0.0 || z_star > z_deep + kDeepExitM) {
     deep_on_ = false;
   } else if (z_star < z_deep && e_z < 0.0) {

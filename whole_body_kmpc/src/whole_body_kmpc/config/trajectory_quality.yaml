@@ -10,14 +10,25 @@ trajectory_quality:
     body_forward: 1.0
     neutral: 0.1
     joint_limit: 1.0
-    pitch_comfort: 0.5
+    # Mild deviation from start pitch; hard/near-barrier terms handle ±32°.
+    pitch_comfort: 0.4
     com_margin: 0.5
     arm_manip: 0.25
+    j4_twist: 0.0
+    foldback: 1.0
+    wrist_foldback: 2.5
+    # Starting GN wrist span weight (not calibrated); ranking still in PathQualityMetrics.
+    wrist_span: 1.0
+    height_coop: 0.85
+    pitch_near_barrier: 1.4
   normalization:
     # Softplus length for unnecessary forward arch (Body_x - Leg_x).
     body_forward_len_m: 0.05
     # Pitch comfort scale; hard pitch box remains ±32°.
     pitch_scale_rad: 0.5585053606381855  # 32 deg
+    height_coop_len_m: 0.08
+    # Soft wrist peak-to-peak (offline J7 gate 0.50 rad).
+    wrist_span_soft_rad: 0.45
   features:
     - move          # ∫ Σ (q_s / vmax)^2 ds
     - smooth        # accel / jerk discrete approx (+ optional TV excess diagnostic)
@@ -27,3 +38,8 @@ trajectory_quality:
     - pitch_comfort # ∫ (pitch / pitch_scale)^2 + near-barrier
     - com_margin    # prefer distance to CoM XY work rectangle
     - arm_manip     # arm singularity / extreme elbow-wrist preference
+    - j4_twist      # mean (q4-q0)^2 along the path (mild helper, not peak-only)
+    - foldback      # travel beyond net displacement (wrist weighted)
+    - wrist_span    # softplus on J6/J7 peak-to-peak (catches overshoot)
+    - height_coop   # Body_Link drop vs task TCP drop (continuous, no height switch)
+    - pitch_near_barrier  # softplus near ±pitch_scale

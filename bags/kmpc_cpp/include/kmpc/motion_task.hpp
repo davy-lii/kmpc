@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "kmpc/constraint_policy.hpp"
 #include "kmpc/types.hpp"
 
 namespace kmpc {
@@ -28,12 +29,35 @@ struct TaskStage {
   bool has_orientation = false;
   Vec4 quat = Vec4(0.0, 0.0, 0.0, 1.0);
   // Endpoint / line tolerance asked by the task. Not the old 0.20 m hard tube.
-  double position_tol_m = 0.003;
+  double position_tol_m = kDefaultTaskPositionTolM;
   double orientation_tol_rad = 0.05;
   StageStop stop = StageStop::Continuous;
   bool wait_for_external_ack = false;
   uint32_t stage_id = 0;
 };
+
+// Vertical descent intent for pitch-margin / z-squat (PREP→LIN: net q0→goal
+// can be ~0 while a LIN segment still drops).
+inline double task_stages_tcp_dz_m(
+    double tcp_start_z,
+    const std::vector<TaskStage, Eigen::aligned_allocator<TaskStage>>& stages) {
+  if (stages.empty() || !std::isfinite(tcp_start_z)) {
+    return 0.0;
+  }
+  double seg_worst = 0.0;
+  double prev_z = tcp_start_z;
+  for (const TaskStage& st : stages) {
+    if (st.position.allFinite()) {
+      const double dz = st.position.z() - prev_z;
+      if (st.geometry == TaskGeometry::Lin) {
+        seg_worst = std::min(seg_worst, dz);
+      }
+      prev_z = st.position.z();
+    }
+  }
+  const double net = stages.back().position.z() - tcp_start_z;
+  return std::min(seg_worst, net);
+}
 
 struct MotionTask {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW

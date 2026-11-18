@@ -69,7 +69,14 @@ class SafetySupervisor {
   SafetySupervisor(const Kinematics& kin, const WholeBodyGuards* guards,
                    MotionConstraintPolicy policy);
 
+  // Offline/tests: mark q as sent history in one step.
   void seed(const Vec18& q_safe);
+  // New task session: drop publish history; optional anchor for the first packet
+  // only (not counted as last_send until note_sent succeeds).
+  void reset_session();
+  void set_start_anchor(const Vec18& q_start);
+  bool has_start_anchor() const { return has_start_anchor_; }
+  const Vec18& start_anchor() const { return start_anchor_; }
   void set_freshness_s(double s) { freshness_s_ = std::max(s, 1e-3); }
   void set_tcp_tube_m(double m) { tcp_tube_m_ = std::max(m, 1e-4); }
   void set_track_err_m(double m) { track_err_m_ = std::max(m, 1e-4); }
@@ -92,7 +99,9 @@ class SafetySupervisor {
   const WholeBodyGuards* guards_;
   MotionConstraintPolicy policy_;
   Vec18 last_safe_ = Vec18::Zero();
+  Vec18 start_anchor_ = Vec18::Zero();
   Vec18 q_last_send_ = Vec18::Zero();
+  bool has_start_anchor_ = false;
   Vec18 last_vel_ = Vec18::Zero();
   Vec18 last_acc_ = Vec18::Zero();
   double t_last_send_s_ = -1.0;

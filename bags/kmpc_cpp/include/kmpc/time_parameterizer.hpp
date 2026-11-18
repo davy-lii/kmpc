@@ -15,8 +15,9 @@ namespace kmpc {
 class TimeParameterizer {
  public:
   // samples: certified geometric curve. policy: dq/ddq/dddq caps.
-  // stage_boundaries: stop_required entries force zero rate at that sample.
-  // Result: s monotone nondecreasing in [0,1], t_s monotone nondecreasing.
+  // stage_boundaries: stop_required / wait_ack entries force zero rate.
+  // Scales by measured Hermite@250Hz over-limit ratios (not blind 1.25×).
+  // Result.ok=false when the final check still exceeds caps.
   TimeLawTable compute(
       const JointCurve& samples, const MotionConstraintPolicy& policy,
       const std::vector<StageBoundary>& stage_boundaries) const;

@@ -33,7 +33,7 @@ bool would_nail_after_resume(const TaskReceiver& task) {
 // 20261109T014739Z: alarm cleared >2s, enable + segment same tick, first
 // on_timer must keep the segment and must not take the empty-servo nail path.
 TEST(AlarmResume, FreshEnableSegmentSurvivesResume) {
-  TaskReceiver task(Vec18::Zero());
+  TaskReceiver task;
   const uint64_t alarm_block_generation = task.generation();  // latched at alarm
   ASSERT_EQ(alarm_block_generation, 0u);
 
@@ -53,7 +53,7 @@ TEST(AlarmResume, FreshEnableSegmentSurvivesResume) {
 }
 
 TEST(AlarmResume, PreAlarmSegmentDroppedOnResume) {
-  TaskReceiver task(Vec18::Zero());
+  TaskReceiver task;
   ASSERT_TRUE(task.on_segment(true, make_left_approach(100)));
   const uint64_t alarm_block_generation = task.generation();
   EXPECT_EQ(alarm_block_generation, 100u);
@@ -70,7 +70,7 @@ TEST(AlarmResume, PreAlarmSegmentDroppedOnResume) {
 }
 
 TEST(AlarmResume, ClearBeforeSegmentStillAllowsInstall) {
-  TaskReceiver task(Vec18::Zero());
+  TaskReceiver task;
   ASSERT_TRUE(task.on_segment(true, make_left_approach(50)));
   const uint64_t alarm_block_generation = task.generation();
 

@@ -96,7 +96,8 @@ UnifiedPlanResult plan_unified_multistage(
   task.frame = req.frame;
   task.stages.resize(nstage);
   TaskStage& s0 = task.stages[0];
-  s0.geometry = TaskGeometry::Lin;
+  // Cascade PREP→TIP mirrors legacy two-point: PTP then LIN. Lone goal stays LIN.
+  s0.geometry = req.has_next ? TaskGeometry::Ptp : TaskGeometry::Lin;
   s0.position = req.goal.xyz;
   s0.has_orientation = req.goal.ori_on;
   s0.quat = req.goal.quat;

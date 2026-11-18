@@ -40,6 +40,33 @@ void SafetySupervisor::seed(const Vec18& q_safe) {
   has_vel_ = false;
   has_acc_ = false;
   t_last_send_s_ = -1.0;
+  start_anchor_ = q_safe;
+  has_start_anchor_ = has_safe_;
+}
+
+void SafetySupervisor::reset_session() {
+  last_safe_.setZero();
+  q_last_send_.setZero();
+  start_anchor_.setZero();
+  last_vel_.setZero();
+  last_acc_.setZero();
+  has_safe_ = false;
+  has_last_send_ = false;
+  has_start_anchor_ = false;
+  has_vel_ = false;
+  has_acc_ = false;
+  t_last_send_s_ = -1.0;
+}
+
+void SafetySupervisor::set_start_anchor(const Vec18& q_start) {
+  if (!q_start.allFinite()) {
+    has_start_anchor_ = false;
+    return;
+  }
+  start_anchor_ = q_start;
+  has_start_anchor_ = true;
+  last_safe_ = q_start;
+  has_safe_ = true;
 }
 
 SafetyDecision SafetySupervisor::check(const SafetySupervisorInput& in,
