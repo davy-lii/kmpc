@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <iomanip>
 #include <numeric>
 #include <sstream>
@@ -815,20 +816,31 @@ class V2Solver {
     const char* tag = (attempt_idx == 0) ? "main" : "retry";
 
     JointCurve trial = layout;
-    const bool use_warm =
+    bool use_warm =
         warm_continue_gn && warm_knots != nullptr &&
         warm_knots->size() == layout.size();
+    if (attempt_idx > 0 && retry_force_reseed_init()) {
+      use_warm = false;
+    }
     if (use_warm) {
       trial = *warm_knots;
       if (warm_kos != nullptr && !warm_kos->empty()) {
         knot_of_stage_ = *warm_kos;
       }
     }
+    gn_trace_tag_ = tag;
+    if (trace_gn() && attempt_idx > 0) {
+      std::fprintf(stderr, "v2gn retry_init cand=%s mode=%s\n", tag,
+                   use_warm ? "warm" : "reseed");
+    }
 
     const int iters0 = iterations_;
     const double t_seed0 = elapsed_ms();
     if (!use_warm) {
       seed_curve(&trial, *targets, SeedKind::Coordinated);
+    }
+    if (attempt_idx > 0) {
+      trace_fold_stages(tag, "retry_entry", trial);
     }
     enforce_j4_stage_contract(&trial);
     harmonize_oriented_wrists(&trial, *targets);
@@ -874,6 +886,7 @@ class V2Solver {
       harmonize_oriented_wrists(&trial, *targets);
     }
     cand->fold_gn = measure_fold_ruler(trial, left_);
+    trace_fold_stages(tag, "post_gn", trial);
     if (!accept_knots(trial, *targets, &accept_why, 0.0)) {
       refine_lin_mids(&trial, targets);
     }
@@ -885,6 +898,7 @@ class V2Solver {
     }
     polish_endpoints_only(&trial, *targets);
     cand->fold_ep = measure_fold_ruler(trial, left_);
+    trace_fold_stages(tag, "post_geom", trial);
     cand->sqp_ms = elapsed_ms() - t_sqp0;
     sqp_ms_ += cand->sqp_ms;
     cand->gn_iters = iterations_ - iters0;
@@ -916,6 +930,8 @@ class V2Solver {
         &cand->knot_of_stage);
     digest << " | " << tag << ":knots_ok"
            << " drop_frac=" << coordinated_drop_frac_
+           << (attempt_idx > 0 ? (use_warm ? " retry_init=warm" : " retry_init=reseed")
+                               : "")
            << " seed_ms=" << cand->seed_ms << " sqp_ms=" << cand->sqp_ms
            << " gn=" << cand->gn_iters << " qscore=" << cand->quality.score
            << " seed_j4pk_deg=" << (seed_j4_peak_rad * 180.0 / kPi)
@@ -1012,6 +1028,7 @@ class V2Solver {
     cand->densify_ms = elapsed_ms() - t_den0;
     densify_ms_ += elapsed_ms() - t_den0;
     cand->fold_den = measure_fold_ruler(samples, left_);
+    trace_fold_stages(tag, "post_densify", samples);
 
     const double t_law0 = elapsed_ms();
     const TimeParameterizer parameterizer;
@@ -2242,6 +2259,191 @@ class V2Solver {
     return kWPos * pos + cost.total;
   }
 
+  struct WorstBreakdown {
+    double worst = 0.0;
+    double stage_end_pos = 0.0;
+    double lin_knot_pos = 0.0;
+    double lin_span_mid = 0.0;
+    int stage_end_k = -1;
+    int stage_end_stage = -1;
+    int lin_knot_k = -1;
+    int lin_knot_stage = -1;
+    int lin_mid_k = -1;
+    int lin_mid_stage = -1;
+  };
+
+  WorstBreakdown worst_breakdown(const JointCurve& knots,
+                                 const std::vector<KnotTarget>& targets) const {
+    WorstBreakdown b;
+    const int K = static_cast<int>(knots.size());
+    for (int k = 1; k < K; ++k) {
+      const KnotTarget& tgt = targets[static_cast<std::size_t>(k)];
+      if (!tracks_cartesian_knot(tgt)) {
+        continue;
+      }
+      const auto pose = kin_.fk(knots[static_cast<std::size_t>(k)], frame_);
+      const Vec3 epv = tgt.p - pose.col(3).head<3>();
+      const double e = epv.norm();
+      if (tgt.stage_endpoint) {
+        if (e >= b.stage_end_pos) {
+          b.stage_end_pos = e;
+          b.stage_end_k = k;
+          b.stage_end_stage = tgt.stage_index;
+        }
+      } else if (tgt.geometry == TaskGeometry::Lin) {
+        if (e >= b.lin_knot_pos) {
+          b.lin_knot_pos = e;
+          b.lin_knot_k = k;
+          b.lin_knot_stage = tgt.stage_index;
+        }
+      }
+      if (k + 1 < K && tracks_cartesian_span(k)) {
+        const int sid = span_stage(k);
+        const Vec18 qmid = 0.5 * (knots[static_cast<std::size_t>(k)] +
+                                  knots[static_cast<std::size_t>(k + 1)]);
+        const double merr =
+            cross_track_to_stage(kin_.fk_pos(qmid, frame_), sid);
+        if (merr >= b.lin_span_mid) {
+          b.lin_span_mid = merr;
+          b.lin_mid_k = k;
+          b.lin_mid_stage = sid;
+        }
+      }
+    }
+    b.worst = std::max(b.stage_end_pos,
+                       std::max(b.lin_knot_pos, b.lin_span_mid));
+    return b;
+  }
+
+  static void worst_binding_label(const WorstBreakdown& t, const char** kind,
+                                  int* k, int* stage, double* v) {
+    const double w = t.worst;
+    const double eps = 1e-12;
+    if (t.stage_end_pos >= w - eps) {
+      *kind = "stage_end_pos";
+      *k = t.stage_end_k;
+      *stage = t.stage_end_stage;
+      *v = t.stage_end_pos;
+      return;
+    }
+    if (t.lin_knot_pos >= w - eps) {
+      *kind = "lin_knot_pos";
+      *k = t.lin_knot_k;
+      *stage = t.lin_knot_stage;
+      *v = t.lin_knot_pos;
+      return;
+    }
+    *kind = "lin_span_mid";
+    *k = t.lin_mid_k;
+    *stage = t.lin_mid_stage;
+    *v = t.lin_span_mid;
+  }
+
+  bool trial_geom_soft_ok(const JointCurve& knots,
+                          const std::vector<KnotTarget>& targets) const {
+    const int K = static_cast<int>(knots.size());
+    for (int k = 1; k < K; ++k) {
+      const KnotTarget& tgt = targets[static_cast<std::size_t>(k)];
+      const auto pose = kin_.fk(knots[static_cast<std::size_t>(k)], frame_);
+      const Vec3 pe = pose.col(3).head<3>();
+      const double err = (tgt.p - pe).norm();
+      if (tgt.stage_endpoint) {
+        if (err > tgt.tol) {
+          return false;
+        }
+        if (tgt.ori) {
+          const double oe = ori_error_xyzw(
+                                tgt.quat,
+                                rot_to_quat_xyzw(pose.block<3, 3>(0, 0)))
+                                .norm();
+          if (oe > tgt.ori_tol) {
+            return false;
+          }
+        }
+      } else if (tgt.geometry == TaskGeometry::Lin) {
+        const double ct = cross_track_to_stage(pe, tgt.stage_index);
+        if (ct > kDefaultLinRunwaySoftM) {
+          return false;
+        }
+      }
+      if (k + 1 < K && tracks_cartesian_span(k)) {
+        const int sid = span_stage(k);
+        const Vec18 qmid = 0.5 * (knots[static_cast<std::size_t>(k)] +
+                                  knots[static_cast<std::size_t>(k + 1)]);
+        const double merr =
+            cross_track_to_stage(kin_.fk_pos(qmid, frame_), sid);
+        if (merr > kDefaultLinRunwaySoftM) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  void trace_quality_backtrack(int iter, double base, double /*worst_base*/,
+                               double worst_lim,
+                               const WorstBreakdown& wb,
+                               const FoldRulerProbe& fold_cur,
+                               double alpha, const JointCurve& trial,
+                               const std::vector<KnotTarget>& targets,
+                               double cost) const {
+    if (!trace_gn()) {
+      return;
+    }
+    const FoldRulerProbe fold_t = measure_fold_ruler(trial, left_);
+    const double dj6 = fold_t.j6_rad - fold_cur.j6_rad;
+    const bool cost_ok = cost < base - 1e-10;
+    const WorstBreakdown wt = worst_breakdown(trial, targets);
+    const bool worst_ok = wt.worst <= worst_lim;
+    const bool split_attr =
+        (dj6 < -1e-9) && cost_ok && !worst_ok;
+    const char* kind_cur = "none";
+    const char* kind_trial = "none";
+    int k_cur = -1;
+    int st_cur = -1;
+    int k_trial = -1;
+    int st_trial = -1;
+    double v_cur = 0.0;
+    double v_trial = 0.0;
+    worst_binding_label(wb, &kind_cur, &k_cur, &st_cur, &v_cur);
+    worst_binding_label(wt, &kind_trial, &k_trial, &st_trial, &v_trial);
+    const bool geom_ok = split_attr ? trial_geom_soft_ok(trial, targets) : false;
+    std::fprintf(stderr,
+                 "v2gn bt cand=%s iter=%d alpha=%.2g j6f_cur=%.5g j6f_tr=%.5g "
+                 "dj6f=%.5g cost=%.6g base=%.6g cost_ok=%d worst_lim=%.5g "
+                 "worst_cur=%.5g worst_tr=%.5g worst_ok=%d bind_cur=%s k_cur=%d "
+                 "st_cur=%d v_cur=%.5g bind_tr=%s k_tr=%d st_tr=%d v_tr=%.5g "
+                 "worst_attr=%d geom_soft_ok=%d\n",
+                 gn_trace_tag_, iter, alpha, fold_cur.j6_rad, fold_t.j6_rad,
+                 dj6, cost, base, cost_ok ? 1 : 0, worst_lim, wb.worst, wt.worst,
+                 worst_ok ? 1 : 0, kind_cur, k_cur, st_cur, v_cur, kind_trial,
+                 k_trial, st_trial, v_trial, split_attr ? 1 : 0,
+                 geom_ok ? 1 : 0);
+  }
+
+  void trace_fold_stages(const char* cand, const char* phase,
+                         const JointCurve& knots) const {
+    if (!trace_gn() || knots.empty()) {
+      return;
+    }
+    const FoldRulerProbe fr = measure_fold_ruler(knots, left_);
+    const int j6 = arm_ + 5;
+    const int j4 = kIdxYaw;
+    const int j7 = arm_ + 6;
+    std::fprintf(stderr,
+                 "v2gn fold cand=%s phase=%s j4f_deg=%.3f j6f_deg=%.3f "
+                 "j7f_deg=%.3f\n",
+                 cand, phase, fr.j4_rad * 180.0 / kPi, fr.j6_rad * 180.0 / kPi,
+                 fr.j7_rad * 180.0 / kPi);
+    for (std::size_t k = 1; k < knots.size(); ++k) {
+      std::fprintf(stderr,
+                   "v2gn seam cand=%s phase=%s k=%zu j4_deg=%.3f j6_deg=%.3f "
+                   "j7_deg=%.3f\n",
+                   cand, phase, k, (knots[k][j4] - q0_[j4]) * 180.0 / kPi,
+                   knots[k][j6] * 180.0 / kPi, knots[k][j7] * 180.0 / kPi);
+    }
+  }
+
   void gauss_newton(JointCurve* knots, const std::vector<KnotTarget>& targets,
                     bool already_certified) {
     // Explicit feasibility vs quality: polish soft cost after hard-feasible,
@@ -2577,10 +2779,13 @@ class V2Solver {
       }
       double worst_base = 0.0;
       const double base = objective(*knots, targets, &worst_base);
+      const WorstBreakdown wb = worst_breakdown(*knots, targets);
       double tol_max = 0.0;
       for (const StageGeom& gs : stages_) {
         tol_max = std::max(tol_max, gs.tol);
       }
+      const double worst_lim = std::max(worst_base + 1e-9, 0.98 * tol_max);
+      const FoldRulerProbe fold_cur = measure_fold_ruler(*knots, left_);
       bool improved = false;
       double alpha_used = 0.0;
       for (double alpha : {1.0, 0.5, 0.25, 0.1, 0.05}) {
@@ -2588,8 +2793,11 @@ class V2Solver {
         apply_delta(&trial, dq, alpha);
         double worst_trial = 0.0;
         const double cost = objective(trial, targets, &worst_trial);
-        if (cost < base - 1e-10 &&
-            worst_trial <= std::max(worst_base + 1e-9, 0.98 * tol_max)) {
+        if (trace_gn()) {
+          trace_quality_backtrack(iter, base, worst_base, worst_lim, wb,
+                                  fold_cur, alpha, trial, targets, cost);
+        }
+        if (cost < base - 1e-10 && worst_trial <= worst_lim) {
           *knots = std::move(trial);
           improved = true;
           alpha_used = alpha;
@@ -2673,6 +2881,15 @@ class V2Solver {
   static bool trace_gn() {
     static const bool on = std::getenv("KMPC_V2_TRACE") != nullptr;
     return on;
+  }
+
+  static bool retry_force_reseed_init() {
+    const char* v = std::getenv("KMPC_RETRY_INIT");
+    if (v == nullptr) {
+      return false;
+    }
+    return std::strcmp(v, "reseed") == 0 || std::strcmp(v, "B") == 0 ||
+           std::strcmp(v, "b") == 0;
   }
 
   // Worst stage-endpoint excess over the task euclidean tol.
@@ -3173,6 +3390,7 @@ class V2Solver {
   static constexpr int kMaxLinBoostHold = 3;
   bool layout_dense_retry_ = false;
   std::string j4_hold_probe_;
+  const char* gn_trace_tag_ = "main";
 };
 
 }  // namespace
